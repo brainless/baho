@@ -1219,4 +1219,37 @@ ID,Name
             "success evidence must carry the matched column"
         );
     }
+
+    #[test]
+    fn filler_word_header_selects_in_pipeline() {
+        // "value" is both a filler token and a complete header phrase; the
+        // recognizer must treat it as the column span for `list value`.
+        let csv = "\
+ID,Value
+1,A
+2,B
+";
+        let file = write_temp_csv(csv);
+        let result = run_pipeline(file.path(), "list value");
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        let intent = result.intent.as_ref().unwrap();
+        assert_eq!(intent.operation, crate::intent::CanonicalOperation::Select);
+        assert_eq!(intent.column_display_name, "Value");
+
+        let plan = result.plan.as_ref().unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        assert!(matches!(plan.steps[0], PlanStep::Select { .. }));
+
+        let output = result.output.as_ref().unwrap();
+        let values: Vec<&str> = output
+            .rows
+            .iter()
+            .map(|r| match r.values.first().unwrap().as_ref().unwrap() {
+                Value::Text(s) => s.as_str(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert_eq!(values, vec!["A", "B"]);
+    }
 }

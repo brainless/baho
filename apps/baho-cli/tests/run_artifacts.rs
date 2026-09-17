@@ -158,7 +158,7 @@ fn run_records_the_request_and_input_identity() {
 
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    assert_eq!(plan["schema_version"], 2);
+    assert_eq!(plan["schema_version"], 3);
     assert_eq!(plan["plan"]["schema_version"], 1);
 
     assert_eq!(
@@ -297,10 +297,10 @@ fn select_only_run_writes_correct_plan() {
 
     let run = workspace.path().join(".baho/runs/000001");
 
-    // Plan artifact has schema_version 2
+    // Plan artifact has schema_version 3
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    assert_eq!(plan["schema_version"], 2);
+    assert_eq!(plan["schema_version"], 3);
 
     // Plan has exactly 1 step (select only)
     let steps = plan["plan"]["steps"].as_array().unwrap();

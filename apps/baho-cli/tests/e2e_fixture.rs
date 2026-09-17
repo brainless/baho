@@ -118,7 +118,7 @@ fn extract_unique_floor_plans_from_fixture() {
 
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    assert_eq!(plan["schema_version"], 2);
+    assert_eq!(plan["schema_version"], 3);
     let steps = plan["plan"]["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 3);
     assert_eq!(steps[0]["op"], "filter");
@@ -187,7 +187,7 @@ fn unsupported_intent_returns_failure() {
     // Refusal persists bounded recognition evidence in plan.json with no plan.
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    assert_eq!(plan["schema_version"], 2);
+    assert_eq!(plan["schema_version"], 3);
     assert!(
         plan.get("plan").is_none(),
         "refusal must not write a nested plan, got {:?}",
@@ -326,6 +326,18 @@ fn ambiguous_parse_writes_competing_parse_evidence() {
         rows.contains(&("Income".to_string(), 1.0)),
         "competing parses must include Income: {rows:?}"
     );
+    let income_row = competing
+        .iter()
+        .find(|c| c["column_display_name"].as_str() == Some("Income"))
+        .expect("competing parses must include Income");
+    assert_eq!(income_row["column_span"], serde_json::json!([2, 3]));
+    assert_eq!(income_row["modifier"], "unique");
+    let unique_income_row = competing
+        .iter()
+        .find(|c| c["column_display_name"].as_str() == Some("Unique Income"))
+        .expect("competing parses must include Unique Income");
+    assert_eq!(unique_income_row["column_span"], serde_json::json!([1, 3]));
+    assert!(unique_income_row["modifier"].is_null());
     assert!(plan.get("plan").is_none());
     assert!(!run.join("output/result.json").exists());
 }

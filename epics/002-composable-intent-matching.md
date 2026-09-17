@@ -145,10 +145,16 @@ Recognition proceeds by constructing complete candidate parses with non-overlapp
 token spans:
 
 1. recognize an initial action alias;
-2. consume only documented filler tokens around an optional modifier;
+2. consume only documented filler tokens around an optional modifier — a
+   review follow-up lets the column span begin at any position within the
+   leading filler run, so a header phrase that starts with a filler word
+   (e.g. `Value`) remains matchable, while skipped tokens before the span may
+   still be only fillers plus the optional modifier;
 3. identify a contiguous column span from the remaining unconsumed tokens;
 4. match that span against normalized column labels; and
-5. accept one parse only when it clears the match threshold and ambiguity margin.
+5. accept one parse only when it clears the ambiguity margin; the match
+   threshold sketched here proved inert (every match class scored above it)
+   and was removed in review follow-ups.
 
 A token may belong to exactly one semantic role. In particular, a token consumed as
 an action or modifier cannot also contribute to a column match. Filler tokens may be
@@ -286,7 +292,9 @@ Persists the selected parse and its bounded recognition evidence. Because this e
 adds token-role and candidate-parse evidence, `plan.json`'s plan-artifact wrapper
 must advance from schema version 1 to version 2. The nested plan remains plan IR
 schema version 1. Historical artifacts are not rewritten; a future reader must
-handle plan-artifact versions explicitly.
+handle plan-artifact versions explicitly. A review follow-up later advanced the
+plan-artifact wrapper to version 3, adding competing-parse token spans and
+modifier assignment to recognition evidence.
 
 ## Recognition evidence and diagnostics
 
@@ -299,7 +307,8 @@ Plan-artifact version 2 records enough bounded evidence to explain the decision:
 - the stable column ID and display name;
 - match class (`exact` or `terminal_s_variant`) and score;
 - canonical operation (`select` or `distinct`);
-- bounded competing parses when ambiguity causes refusal; and
+- bounded competing parses — each recorded with its column span and modifier
+  assignment — when ambiguity causes refusal; and
 - a stable refusal reason when no plan is produced.
 
 Evidence ordering is deterministic. It must not contain source rows, environment

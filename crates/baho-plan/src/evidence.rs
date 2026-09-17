@@ -79,6 +79,12 @@ pub struct CompetingParseEvidence {
     pub column_display_name: String,
     /// Score of the competing parse.
     pub score: f64,
+    /// Token span (start, end) of the competing parse's column phrase — end
+    /// is exclusive.
+    pub column_span: (usize, usize),
+    /// The surface modifier alias this parse consumed (e.g. "unique"), or
+    /// None when the parse reads those words as part of the column phrase.
+    pub modifier: Option<String>,
 }
 
 #[cfg(test)]
@@ -185,10 +191,14 @@ mod tests {
                 CompetingParseEvidence {
                     column_display_name: "Floor".into(),
                     score: 1.0,
+                    column_span: (1, 2),
+                    modifier: None,
                 },
                 CompetingParseEvidence {
                     column_display_name: "floor".into(),
                     score: 1.0,
+                    column_span: (1, 2),
+                    modifier: None,
                 },
             ],
         };

@@ -4,7 +4,7 @@ use baho_plan::evidence::{
     PromptToken, RecognitionEvidence,
 };
 use baho_plan::plan::{DistinctKeep, Expression, Plan, PlanSource, PlanStep};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +12,6 @@ use crate::error::IntentError;
 
 const FILLER_TOKENS: &[&str] = &["all", "the", "a", "an", "of", "from", "values", "value"];
 
-const MATCH_THRESHOLD: f64 = 0.5;
 const AMBIGUITY_MARGIN: f64 = 0.1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,19 +49,12 @@ impl MatchClass {
 
 #[derive(Debug, Clone)]
 struct IndexedToken {
-    #[allow(dead_code)]
-    index: usize,
     text: String,
-    #[allow(dead_code)]
-    start: usize,
 }
 
 #[derive(Debug, Clone)]
 struct CandidateParse {
-    #[allow(dead_code)]
-    action_span: (usize, usize),
     modifier: Option<CanonicalOperation>,
-    #[allow(dead_code)]
     modifier_span: Option<(usize, usize)>,
     column_span: (usize, usize),
     column: ColumnDefinition,
@@ -160,37 +152,38 @@ fn build_candidate_parses(
     }
 
     for modifier_pos in &modifier_positions {
-        let after_modifier = if let Some((idx, _)) = modifier_pos {
-            let mut p = idx + 1;
-            while p < tokens.len() && FILLER_TOKENS.contains(&tokens[p].text.as_str()) {
-                p += 1;
-            }
-            p
-        } else {
-            pos
+        let span_lo = match modifier_pos {
+            Some((idx, _)) => idx + 1,
+            None => action_end,
         };
 
-        if after_modifier >= tokens.len() {
-            continue;
-        }
+        // The column span starts anywhere within the leading filler run so a
+        // header phrase that begins with a filler word (e.g. a "Value"
+        // column) stays matchable. Tokens skipped before the span start may
+        // only be fillers plus the single optional modifier; the walk stops
+        // at the first non-filler so control words are never silently
+        // absorbed into the column phrase.
+        let mut span_start = span_lo;
+        while span_start < tokens.len() {
+            let span_end = tokens.len();
 
-        let span_start = after_modifier;
-        let span_end = tokens.len();
-
-        for col in columns {
-            if let Some(match_class) = match_column_span(tokens, span_start, span_end, col) {
-                let score = match_class.score();
-                if score >= MATCH_THRESHOLD {
+            for col in columns {
+                if let Some(match_class) = match_column_span(tokens, span_start, span_end, col) {
                     candidates.push(CandidateParse {
-                        action_span: (0, action_end),
                         modifier: modifier_pos.map(|(_, op)| op),
                         modifier_span: modifier_pos.map(|(idx, _)| (idx, idx + 1)),
                         column_span: (span_start, span_end),
                         column: col.clone(),
                         match_class,
-                        score,
+                        score: match_class.score(),
                     });
                 }
+            }
+
+            if FILLER_TOKENS.contains(&tokens[span_start].text.as_str()) {
+                span_start += 1;
+            } else {
+                break;
             }
         }
     }
@@ -216,9 +209,11 @@ fn column_ambiguous_candidates(tied: &[&CandidateParse]) -> Option<Vec<String>> 
 }
 
 /// The single column span shared by a tying group that resolves to more than
-/// one distinct column, if any.
+/// one distinct column, if any. When several spans qualify, the smallest
+/// `(start, end)` wins; BTreeMap iteration is ascending, so the choice is
+/// deterministic across invocations.
 fn ambiguous_span(tied: &[&CandidateParse]) -> Option<(usize, usize)> {
-    let mut by_span: HashMap<(usize, usize), Vec<&&CandidateParse>> = HashMap::new();
+    let mut by_span: BTreeMap<(usize, usize), Vec<&&CandidateParse>> = BTreeMap::new();
     for c in tied {
         by_span.entry(c.column_span).or_default().push(c);
     }
@@ -232,20 +227,25 @@ fn ambiguous_span(tied: &[&CandidateParse]) -> Option<(usize, usize)> {
 }
 
 /// Deterministically ordered bounded evidence for a set of tied candidates.
-fn competing_parse_evidence(tied: &[&CandidateParse]) -> Vec<CompetingParseEvidence> {
-    let mut seen: Vec<(String, f64)> = Vec::new();
+/// Rows collapse only when fully identical, so equally scored parses with
+/// distinct spans or modifier assignments stay separately visible.
+fn competing_parse_evidence(
+    tied: &[&CandidateParse],
+    tokens: &[IndexedToken],
+) -> Vec<CompetingParseEvidence> {
+    let mut seen: Vec<CompetingParseEvidence> = Vec::new();
     for c in tied {
-        let entry = (c.column.display_name.clone(), c.score);
+        let entry = CompetingParseEvidence {
+            column_display_name: c.column.display_name.clone(),
+            score: c.score,
+            column_span: c.column_span,
+            modifier: c.modifier_span.map(|(start, _)| tokens[start].text.clone()),
+        };
         if !seen.contains(&entry) {
             seen.push(entry);
         }
     }
-    seen.into_iter()
-        .map(|(column_display_name, score)| CompetingParseEvidence {
-            column_display_name,
-            score,
-        })
-        .collect()
+    seen
 }
 
 fn normalize_for_match(s: &str) -> String {
@@ -276,6 +276,28 @@ pub struct RecognizedIntent {
     pub evidence: RecognitionEvidence,
 }
 
+/// Refusal-shaped recognition evidence: everything a failed parse can report
+/// is the prompt tokens, the action seen so far, a stable refusal reason, and
+/// any tied parses that prevented a unique choice.
+fn refusal_evidence(
+    prompt_tokens: Vec<PromptToken>,
+    action: Option<ActionEvidence>,
+    refusal_reason: &str,
+    competing_parses: Vec<CompetingParseEvidence>,
+) -> RecognitionEvidence {
+    RecognitionEvidence {
+        prompt_tokens,
+        action,
+        modifier: None,
+        column_phrase: None,
+        matched_column: None,
+        match_class: None,
+        canonical_operation: None,
+        refusal_reason: Some(refusal_reason.to_string()),
+        competing_parses,
+    }
+}
+
 pub fn recognize_intent(
     prompt: &str,
     columns: &[ColumnDefinition],
@@ -288,39 +310,25 @@ pub fn recognize_intent(
     if raw_tokens.is_empty() {
         return Err(IntentError::Unsupported(
             "empty prompt".to_string(),
-            Some(RecognitionEvidence {
-                prompt_tokens: Vec::new(),
-                action: None,
-                modifier: None,
-                column_phrase: None,
-                matched_column: None,
-                match_class: None,
-                canonical_operation: None,
-                refusal_reason: Some("intent.unsupported".to_string()),
-                competing_parses: Vec::new(),
-            }),
+            Some(refusal_evidence(
+                Vec::new(),
+                None,
+                "intent.unsupported",
+                Vec::new(),
+            )),
         ));
     }
 
-    let mut offset = 0;
     let indexed_tokens: Vec<IndexedToken> = raw_tokens
-        .iter()
-        .enumerate()
-        .map(|(i, text)| {
-            let start = offset;
-            offset += text.len() + 1;
-            IndexedToken {
-                index: i,
-                text: text.clone(),
-                start,
-            }
-        })
+        .into_iter()
+        .map(|text| IndexedToken { text })
         .collect();
 
     let prompt_token_evidence: Vec<PromptToken> = indexed_tokens
         .iter()
-        .map(|t| PromptToken {
-            index: t.index,
+        .enumerate()
+        .map(|(index, t)| PromptToken {
+            index,
             text: t.text.clone(),
         })
         .collect();
@@ -328,17 +336,12 @@ pub fn recognize_intent(
     if resolve_action(&indexed_tokens[0].text).is_none() {
         return Err(IntentError::Unsupported(
             format!("expected action verb, got '{}'", indexed_tokens[0].text),
-            Some(RecognitionEvidence {
-                prompt_tokens: prompt_token_evidence,
-                action: None,
-                modifier: None,
-                column_phrase: None,
-                matched_column: None,
-                match_class: None,
-                canonical_operation: None,
-                refusal_reason: Some("intent.unsupported".to_string()),
-                competing_parses: Vec::new(),
-            }),
+            Some(refusal_evidence(
+                prompt_token_evidence,
+                None,
+                "intent.unsupported",
+                Vec::new(),
+            )),
         ));
     }
 
@@ -376,20 +379,12 @@ pub fn recognize_intent(
             .join(" ");
         return Err(IntentError::ColumnNotFound {
             prompt_term: term,
-            evidence: Some(RecognitionEvidence {
-                prompt_tokens: prompt_token_evidence,
-                action: Some(ActionEvidence {
-                    alias: indexed_tokens[0].text.clone(),
-                    span: (0, 1),
-                }),
-                modifier: None,
-                column_phrase: None,
-                matched_column: None,
-                match_class: None,
-                canonical_operation: None,
-                refusal_reason: Some("intent.column_not_found".to_string()),
-                competing_parses: Vec::new(),
-            }),
+            evidence: Some(refusal_evidence(
+                prompt_token_evidence,
+                action_evidence,
+                "intent.column_not_found",
+                Vec::new(),
+            )),
         });
     }
 
@@ -408,24 +403,16 @@ pub fn recognize_intent(
         .collect();
 
     if tied.len() > 1 {
-        let competing_parses = competing_parse_evidence(&tied);
+        let competing_parses = competing_parse_evidence(&tied, &indexed_tokens);
         if let Some(candidates) = column_ambiguous_candidates(&tied) {
             return Err(IntentError::ColumnAmbiguous {
                 candidates,
-                evidence: Some(RecognitionEvidence {
-                    prompt_tokens: prompt_token_evidence,
-                    action: Some(ActionEvidence {
-                        alias: indexed_tokens[0].text.clone(),
-                        span: (0, 1),
-                    }),
-                    modifier: None,
-                    column_phrase: None,
-                    matched_column: None,
-                    match_class: None,
-                    canonical_operation: None,
-                    refusal_reason: Some("intent.column_ambiguous".to_string()),
+                evidence: Some(refusal_evidence(
+                    prompt_token_evidence,
+                    action_evidence,
+                    "intent.column_ambiguous",
                     competing_parses,
-                }),
+                )),
             });
         }
         let candidate_descs: Vec<String> = tied
@@ -441,20 +428,12 @@ pub fn recognize_intent(
             .collect();
         return Err(IntentError::ParseAmbiguous {
             candidates: candidate_descs,
-            evidence: Some(RecognitionEvidence {
-                prompt_tokens: prompt_token_evidence,
-                action: Some(ActionEvidence {
-                    alias: indexed_tokens[0].text.clone(),
-                    span: (0, 1),
-                }),
-                modifier: None,
-                column_phrase: None,
-                matched_column: None,
-                match_class: None,
-                canonical_operation: None,
-                refusal_reason: Some("intent.parse_ambiguous".to_string()),
+            evidence: Some(refusal_evidence(
+                prompt_token_evidence,
+                action_evidence,
+                "intent.parse_ambiguous",
                 competing_parses,
-            }),
+            )),
         });
     }
 
@@ -616,6 +595,16 @@ mod tests {
         ]
     }
 
+    fn income_columns() -> Vec<ColumnDefinition> {
+        vec![ColumnDefinition {
+            id: "col-income".to_string(),
+            ordinal: 0,
+            source_header_raw: Some("Income".to_string()),
+            source_header_normalized: Some("income".to_string()),
+            display_name: "Income".to_string(),
+        }]
+    }
+
     #[test]
     fn extract_unique_floor_plans() {
         let cols = columns();
@@ -731,6 +720,53 @@ mod tests {
         assert_eq!(intent.column_display_name, "Income");
         let mc = intent.evidence.matched_column.as_ref().unwrap();
         assert!((mc.score - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn every_action_alias_maps_to_canonical_retrieval() {
+        let cols = income_columns();
+        for alias in [
+            "extract", "list", "show", "get", "find", "display", "return",
+        ] {
+            let intent = recognize_intent(&format!("{alias} income"), &cols)
+                .unwrap_or_else(|e| panic!("action alias '{alias}' failed: {e:?}"));
+            assert_eq!(intent.action, CanonicalAction::Retrieve, "alias {alias}");
+            assert_eq!(
+                intent.operation,
+                CanonicalOperation::Select,
+                "alias {alias}"
+            );
+            assert_eq!(intent.column_id, "col-income", "alias {alias}");
+            assert_eq!(
+                intent.evidence.canonical_operation.as_deref(),
+                Some("select"),
+                "alias {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_distinct_modifier_alias_sets_distinct_operation() {
+        let cols = income_columns();
+        for alias in ["unique", "distinct", "deduplicate", "deduplicated"] {
+            let intent = recognize_intent(&format!("list {alias} income"), &cols)
+                .unwrap_or_else(|e| panic!("modifier alias '{alias}' failed: {e:?}"));
+            assert_eq!(intent.action, CanonicalAction::Retrieve, "alias {alias}");
+            assert_eq!(
+                intent.operation,
+                CanonicalOperation::Distinct,
+                "alias {alias}"
+            );
+            assert_eq!(intent.column_id, "col-income", "alias {alias}");
+            assert_eq!(
+                intent.evidence.canonical_operation.as_deref(),
+                Some("distinct"),
+                "alias {alias}"
+            );
+            let modifier = intent.evidence.modifier.as_ref().unwrap();
+            assert_eq!(modifier.alias, alias, "alias {alias}");
+            assert_eq!(modifier.span, (1, 2), "alias {alias}");
+        }
     }
 
     #[test]
@@ -891,6 +927,77 @@ mod tests {
             }
             other => panic!("expected ColumnAmbiguous, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn multiple_qualifying_spans_report_smallest_span_deterministically() {
+        let cols = vec![
+            ColumnDefinition {
+                id: "col-income-a".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Income".to_string()),
+                source_header_normalized: Some("income".to_string()),
+                display_name: "Income".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-income-b".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("Income".to_string()),
+                source_header_normalized: Some("income".to_string()),
+                display_name: "Income".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-unique-income-a".to_string(),
+                ordinal: 2,
+                source_header_raw: Some("Unique Income".to_string()),
+                source_header_normalized: Some("unique income".to_string()),
+                display_name: "Unique Income".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-unique-income-b".to_string(),
+                ordinal: 3,
+                source_header_raw: Some("Unique Income".to_string()),
+                source_header_normalized: Some("unique income".to_string()),
+                display_name: "Unique Income".to_string(),
+            },
+        ];
+        // Two spans qualify: "unique income" (1, 3) matches both Unique Income
+        // columns and "income" (2, 3) matches both Income columns. Span
+        // selection previously depended on HashMap iteration order with a
+        // per-instance RandomState, so the reported candidates varied between
+        // calls in the same process. The smallest qualifying span now wins:
+        // "unique income" sorts first, and its two columns share a display
+        // name, which dedups the candidates list to one entry.
+        let mut expected: Option<(Vec<String>, Vec<(String, f64)>)> = None;
+        for _ in 0..25 {
+            let err = recognize_intent("list unique income", &cols).unwrap_err();
+            match err {
+                IntentError::ColumnAmbiguous {
+                    candidates,
+                    evidence,
+                } => {
+                    let ev = evidence.expect("column_ambiguous must carry evidence");
+                    let (reason, competing) = as_refusal(&ev);
+                    assert_eq!(reason.as_deref(), Some("intent.column_ambiguous"));
+                    assert_eq!(candidates, vec!["Unique Income".to_string()]);
+                    let rows: Vec<(String, f64)> = competing
+                        .iter()
+                        .map(|c| (c.column_display_name.clone(), c.score))
+                        .collect();
+                    let observed = (candidates, rows);
+                    if let Some(expected) = &expected {
+                        assert_eq!(
+                            expected, &observed,
+                            "repeated recognition must produce identical evidence"
+                        );
+                    } else {
+                        expected = Some(observed);
+                    }
+                }
+                other => panic!("expected ColumnAmbiguous, got {other:?}"),
+            }
+        }
+        assert!(expected.is_some());
     }
 
     #[test]
@@ -1102,5 +1209,99 @@ mod tests {
             }
             other => panic!("expected ParseAmbiguous, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn filler_word_header_is_selectable() {
+        let cols = vec![ColumnDefinition {
+            id: "col-value".to_string(),
+            ordinal: 0,
+            source_header_raw: Some("Value".to_string()),
+            source_header_normalized: Some("value".to_string()),
+            display_name: "Value".to_string(),
+        }];
+        // "value" is itself a filler token; the span must still be able to
+        // start on it rather than skipping past the whole filler run.
+        let intent = recognize_intent("list value", &cols).unwrap();
+        assert_eq!(intent.operation, CanonicalOperation::Select);
+        assert_eq!(intent.column_id, "col-value");
+        assert_eq!(intent.column_display_name, "Value");
+    }
+
+    #[test]
+    fn filler_word_header_after_filler_run_is_selectable() {
+        let cols = vec![ColumnDefinition {
+            id: "col-values".to_string(),
+            ordinal: 0,
+            source_header_raw: Some("Values".to_string()),
+            source_header_normalized: Some("values".to_string()),
+            display_name: "Values".to_string(),
+        }];
+        let intent = recognize_intent("get the values", &cols).unwrap();
+        assert_eq!(intent.operation, CanonicalOperation::Select);
+        assert_eq!(intent.column_id, "col-values");
+        let col_phrase = intent.evidence.column_phrase.as_ref().unwrap();
+        assert_eq!(col_phrase.tokens, vec!["values"]);
+        assert_eq!(col_phrase.span, (2, 3));
+    }
+
+    #[test]
+    fn filler_starting_header_phrases_are_parse_ambiguous() {
+        let cols = vec![
+            ColumnDefinition {
+                id: "col-values".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Values".to_string()),
+                source_header_normalized: Some("values".to_string()),
+                display_name: "Values".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-the-values".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("The Values".to_string()),
+                source_header_normalized: Some("the values".to_string()),
+                display_name: "The Values".to_string(),
+            },
+        ];
+        // Both "the values" and "values" exact-match distinct columns, so the
+        // two complete parses tie and recognition must refuse.
+        let err = recognize_intent("list the values", &cols).unwrap_err();
+        match err {
+            IntentError::ParseAmbiguous { evidence, .. } => {
+                let ev = evidence.expect("parse_ambiguous must carry evidence");
+                let rows: Vec<(&str, (usize, usize))> = ev
+                    .competing_parses
+                    .iter()
+                    .map(|c| (c.column_display_name.as_str(), c.column_span))
+                    .collect();
+                assert_eq!(rows, vec![("The Values", (1, 3)), ("Values", (2, 3))]);
+            }
+            other => panic!("expected ParseAmbiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mid_phrase_filler_header_matches_exactly() {
+        let cols = vec![ColumnDefinition {
+            id: "col-total-sales".to_string(),
+            ordinal: 0,
+            source_header_raw: Some("Total of Sales".to_string()),
+            source_header_normalized: Some("total of sales".to_string()),
+            display_name: "Total of Sales".to_string(),
+        }];
+        let intent = recognize_intent("list total of sales", &cols).unwrap();
+        assert_eq!(intent.operation, CanonicalOperation::Select);
+        assert_eq!(intent.column_id, "col-total-sales");
+        assert_eq!(intent.evidence.column_phrase.as_ref().unwrap().span, (1, 4));
+    }
+
+    #[test]
+    fn leading_fillers_without_modifier_still_resolve() {
+        let cols = columns();
+        let intent = recognize_intent("extract all the floor plans", &cols).unwrap();
+        assert_eq!(intent.operation, CanonicalOperation::Select);
+        assert_eq!(intent.column_id, "column-1");
+        assert_eq!(intent.column_display_name, "Floor Plan");
+        assert_eq!(intent.evidence.column_phrase.as_ref().unwrap().span, (3, 5));
     }
 }
