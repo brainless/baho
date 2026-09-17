@@ -292,6 +292,11 @@ fn record_reserved(
                 manifest.artifacts.push("input-profile.json".to_owned());
             }
 
+            if let Some(ref config) = core_result.parser_config {
+                write_json(&run_path.join("parser-config.json"), config)?;
+                manifest.artifacts.push("parser-config.json".to_owned());
+            }
+
             write_json(
                 &run_path.join("candidates.json"),
                 &serde_json::json!({
@@ -302,7 +307,11 @@ fn record_reserved(
             manifest.artifacts.push("candidates.json".to_owned());
 
             if let Some(ref plan) = core_result.plan {
-                write_json(&run_path.join("plan.json"), plan)?;
+                let plan_artifact = serde_json::json!({
+                    "plan": plan,
+                    "recognition_evidence": core_result.intent.as_ref().map(|i| &i.evidence),
+                });
+                write_json(&run_path.join("plan.json"), &plan_artifact)?;
                 manifest.artifacts.push("plan.json".to_owned());
             }
 

@@ -21,6 +21,9 @@ pub enum ExecutionError {
 
     #[error("empty input: {detail}")]
     EmptyInput { detail: String },
+
+    #[error("source revision mismatch: plan expects '{expected}', grid has '{actual}'")]
+    SourceRevisionMismatch { expected: String, actual: String },
 }
 
 #[cfg(test)]
@@ -74,5 +77,17 @@ mod tests {
             detail: "no data rows in table".to_string(),
         };
         assert_eq!(err.to_string(), "empty input: no data rows in table");
+    }
+
+    #[test]
+    fn display_source_revision_mismatch() {
+        let err = ExecutionError::SourceRevisionMismatch {
+            expected: "aaa".to_string(),
+            actual: "bbb".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "source revision mismatch: plan expects 'aaa', grid has 'bbb'"
+        );
     }
 }

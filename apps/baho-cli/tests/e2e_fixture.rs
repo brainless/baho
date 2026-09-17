@@ -52,6 +52,7 @@ fn extract_unique_floor_plans_from_fixture() {
         "events.jsonl",
         "diagnostics.json",
         "input-profile.json",
+        "parser-config.json",
         "candidates.json",
         "plan.json",
         "output/result.json",
@@ -115,11 +116,21 @@ fn extract_unique_floor_plans_from_fixture() {
 
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    let steps = plan["steps"].as_array().unwrap();
+    let steps = plan["plan"]["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 3);
     assert_eq!(steps[0]["op"], "filter");
     assert_eq!(steps[1]["op"], "select");
     assert_eq!(steps[2]["op"], "distinct");
+
+    let evidence = &plan["recognition_evidence"];
+    assert!(
+        evidence["prompt_tokens"].as_array().is_some(),
+        "plan must include recognition evidence"
+    );
+    assert!(
+        evidence["matched_column"].as_object().is_some(),
+        "plan must include matched column evidence"
+    );
 
     let result: Value =
         serde_json::from_slice(&fs::read(run.join("output/result.json")).expect("read result"))

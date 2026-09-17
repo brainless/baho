@@ -119,13 +119,22 @@ fn score_candidate(
     let gap = first_body.saturating_sub(header_idx + 1);
     let header_body_distance = 1.0 / (1.0 + gap as f64);
 
-    let body_row_count = (body_rows.len() as f64).ln_1p() / 10.0;
+    let remaining_rows = features.len().saturating_sub(header_idx);
+    let body_row_count = if remaining_rows > 0 {
+        body_rows.len() as f64 / remaining_rows as f64
+    } else {
+        0.0
+    };
 
-    let total = 0.25 * header_density
-        + 0.2 * body_width_stability
-        + 0.2 * body_shape_consistency
-        + 0.2 * header_body_distance
-        + 0.15 * body_row_count;
+    let first_nonblank = features.iter().position(|f| !f.is_blank).unwrap_or(0);
+    let header_position = 1.0 / (1.0 + header_idx.saturating_sub(first_nonblank) as f64);
+
+    let total = 0.22 * header_density
+        + 0.10 * body_width_stability
+        + 0.10 * body_shape_consistency
+        + 0.10 * header_body_distance
+        + 0.32 * body_row_count
+        + 0.16 * header_position;
 
     CandidateScore {
         total,
@@ -156,7 +165,19 @@ fn score_candidate(
             ScoreComponent {
                 name: "body_row_count".to_string(),
                 value: body_row_count,
-                evidence: Some(format!("{} data rows", body_rows.len())),
+                evidence: Some(format!(
+                    "{}/{} remaining rows",
+                    body_rows.len(),
+                    remaining_rows
+                )),
+            },
+            ScoreComponent {
+                name: "header_position".to_string(),
+                value: header_position,
+                evidence: Some(format!(
+                    "header idx {} (first nonblank idx {})",
+                    header_idx, first_nonblank
+                )),
             },
         ],
     }
@@ -374,5 +395,60 @@ mod tests {
         };
         let candidates = detect_candidates(&records, &features, &config);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn all_text_single_column_not_ambiguous() {
+        let records = vec![
+            make_record(0, &["Name"]),
+            make_record(1, &["Ada"]),
+            make_record(2, &["Bob"]),
+        ];
+        let features = features_from_records(&records);
+        let config = CandidateConfig::default();
+        let candidates = detect_candidates(&records, &features, &config);
+
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates[0].region.header_row, Some(0));
+        assert_eq!(candidates[0].region.body_start_row, 1);
+        assert_eq!(candidates[0].region.body_end_row, 2);
+
+        if candidates.len() >= 2 {
+            let gap = candidates[0].score.total - candidates[1].score.total;
+            assert!(
+                gap >= config.ambiguity_margin,
+                "score gap {} must be >= ambiguity margin {}",
+                gap,
+                config.ambiguity_margin
+            );
+        }
+    }
+
+    #[test]
+    fn all_text_multi_column_not_ambiguous() {
+        let records = vec![
+            make_record(0, &["Name", "City"]),
+            make_record(1, &["Ada", "London"]),
+            make_record(2, &["Bob", "Paris"]),
+            make_record(3, &["Eve", "Berlin"]),
+        ];
+        let features = features_from_records(&records);
+        let config = CandidateConfig::default();
+        let candidates = detect_candidates(&records, &features, &config);
+
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates[0].region.header_row, Some(0));
+        assert_eq!(candidates[0].region.body_start_row, 1);
+        assert_eq!(candidates[0].region.body_end_row, 3);
+
+        if candidates.len() >= 2 {
+            let gap = candidates[0].score.total - candidates[1].score.total;
+            assert!(
+                gap >= config.ambiguity_margin,
+                "score gap {} must be >= ambiguity margin {}",
+                gap,
+                config.ambiguity_margin
+            );
+        }
     }
 }

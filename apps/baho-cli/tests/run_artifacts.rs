@@ -38,6 +38,7 @@ fn run_records_the_request_and_input_identity() {
         "events.jsonl",
         "diagnostics.json",
         "input-profile.json",
+        "parser-config.json",
         "candidates.json",
         "plan.json",
         "output/result.json",
@@ -90,6 +91,33 @@ fn run_records_the_request_and_input_identity() {
         serde_json::from_slice(&fs::read(run.join("output/result.json")).expect("read result"))
             .expect("valid result JSON");
     assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+
+    let parser_config: Value = serde_json::from_slice(
+        &fs::read(run.join("parser-config.json")).expect("read parser-config"),
+    )
+    .expect("valid parser-config JSON");
+    assert_eq!(parser_config["schema_version"], 1);
+
+    let candidates: Value =
+        serde_json::from_slice(&fs::read(run.join("candidates.json")).expect("read candidates"))
+            .expect("valid candidates JSON");
+    let selected = candidates["selected"]
+        .as_object()
+        .expect("selected candidate");
+    let header_cells = selected["header"]["cells"]
+        .as_array()
+        .expect("header cells");
+    assert!(
+        !header_cells.is_empty(),
+        "selected candidate must have populated header cells"
+    );
+    let classifications = selected["body_row_classifications"]
+        .as_array()
+        .expect("classifications");
+    assert!(
+        !classifications.is_empty(),
+        "selected candidate must have populated classifications"
+    );
 }
 
 #[test]

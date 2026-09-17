@@ -41,6 +41,7 @@ pub struct CoreEvent {
 #[derive(Debug)]
 pub struct CoreResult {
     pub input_profile: Option<InputProfile>,
+    pub parser_config: Option<CandidateConfig>,
     pub candidates: Vec<TableCandidate>,
     pub selected_candidate: Option<TableCandidate>,
     pub intent: Option<RecognizedIntent>,
@@ -55,6 +56,7 @@ pub struct CoreResult {
 pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
     let mut result = CoreResult {
         input_profile: None,
+        parser_config: None,
         candidates: Vec::new(),
         selected_candidate: None,
         intent: None,
@@ -206,7 +208,11 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
     let classifications = classify_rows(&features, header_idx, &candidate_config);
     let data_row_indices: Vec<usize> = classifications
         .iter()
-        .filter(|c| matches!(c.kind, baho_model::candidate::RowKind::Data))
+        .filter(|c| {
+            matches!(c.kind, baho_model::candidate::RowKind::Data)
+                && c.source_row >= selected.region.body_start_row
+                && c.source_row <= selected.region.body_end_row
+        })
         .map(|c| c.source_row)
         .collect();
     push_event(
@@ -218,6 +224,21 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
             "total_classified": classifications.len(),
         }),
     );
+
+    // Update candidates with real header and classifications
+    let selected_id = selected.id.clone();
+    for candidate in result.candidates.iter_mut() {
+        if candidate.id == selected_id {
+            candidate.header = header_decision.clone();
+            candidate.body_row_classifications = classifications.clone();
+            candidate.selected = true;
+        }
+    }
+    if let Some(ref mut sel) = result.selected_candidate {
+        sel.header = header_decision.clone();
+        sel.body_row_classifications = classifications.clone();
+    }
+    result.parser_config = Some(candidate_config.clone());
 
     // Build column definitions from header
     let columns: Vec<baho_model::column::ColumnDefinition> = header_decision
@@ -351,6 +372,7 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
 
     let grid = GridInput {
         table_id: selected.id.clone(),
+        source_revision: doc.source.content_hash.clone(),
         columns: columns.clone(),
         rows: grid_rows,
         source_rows: data_row_indices.clone(),
@@ -560,5 +582,132 @@ Total,8 items,approximate,,,,,extra,notes,more,columns,here,and,here,here,foot1,
         // Blank separator rows did not terminate the table
         let selected = result.selected_candidate.as_ref().unwrap();
         assert!(selected.region.body_end_row > selected.region.body_start_row + 3);
+    }
+
+    #[test]
+    fn two_tables_only_selected_body_rows_used() {
+        // First table: header at row 3, data rows 4-11 (3 columns).
+        // 11 blank separator rows (",,,") force find_body_rows to break
+        // (blank_gap_lookahead=10). Trailing rows "x,," and "y,," have
+        // density 1/3 ≈ 0.33 which is below is_header_like threshold (0.5)
+        // so no second candidate is detected, but classify_rows still
+        // classifies them as Data (density >= 0.3, width-compatible).
+        // Without the body-bounds fix they'd be included in the output.
+        let csv = "\
+Report Title,,,,
+Generated: 2025-01-01,,,,
+,,,,
+Name,Value,Status
+Alice,100,Active
+Bob,200,Active
+Carol,300,Inactive
+Dave,400,Active
+Eve,500,Active
+Frank,600,Inactive
+George,700,Active
+Hannah,850,Inactive
+,,,
+,,,
+,,,
+,,,
+,,,
+,,,
+,,,
+,,,
+,,,
+,,,
+,,,
+x,,
+y,,
+";
+        let file = write_temp_csv(csv);
+        let result = run_pipeline(file.path(), "Extract all the unique names");
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+
+        let selected = result.selected_candidate.as_ref().unwrap();
+        assert_eq!(selected.region.body_start_row, 4);
+        assert_eq!(selected.region.body_end_row, 11);
+
+        let output = result.output.as_ref().unwrap();
+        let values: Vec<&str> = output
+            .rows
+            .iter()
+            .map(|r| match r.values.first().unwrap().as_ref().unwrap() {
+                Value::Text(s) => s.as_str(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                "Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "George", "Hannah"
+            ]
+        );
+    }
+
+    #[test]
+    fn candidates_have_populated_headers_and_classifications() {
+        let csv = "\
+Report Title,,,,
+Generated: 2025-01-01,,,,
+,,,,
+ID,Floor Plan,Color
+1,Type A,Red
+2,Type B,Blue
+3,Type A,Green
+4,Type C,Red
+,,,
+Total,4 items,approximate,extra,notes,more
+";
+        let file = write_temp_csv(csv);
+        let result = run_pipeline(file.path(), "Extract all the unique floor plans");
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+
+        // Parser config is populated
+        let config = result.parser_config.as_ref().unwrap();
+        assert_eq!(config.schema_version, 1);
+
+        // Selected candidate has populated header
+        let selected = result.selected_candidate.as_ref().unwrap();
+        assert!(
+            !selected.header.cells.is_empty(),
+            "selected candidate header cells must be populated"
+        );
+        assert!(
+            !selected.body_row_classifications.is_empty(),
+            "selected candidate classifications must be populated"
+        );
+
+        // The matching candidate in the candidates list is also updated
+        let matching = result
+            .candidates
+            .iter()
+            .find(|c| c.id == selected.id)
+            .unwrap();
+        assert!(
+            !matching.header.cells.is_empty(),
+            "candidate in list must have populated header cells"
+        );
+        assert!(
+            !matching.body_row_classifications.is_empty(),
+            "candidate in list must have populated classifications"
+        );
+        assert!(
+            matching.selected,
+            "matching candidate must be marked selected"
+        );
+
+        // Header cells contain the normalized "Floor Plan"
+        let floor_plan_cell = selected
+            .header
+            .cells
+            .iter()
+            .find(|c| c.normalized_text == "Floor Plan");
+        assert!(
+            floor_plan_cell.is_some(),
+            "header must contain normalized 'Floor Plan' cell"
+        );
     }
 }

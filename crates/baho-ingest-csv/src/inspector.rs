@@ -50,6 +50,8 @@ fn make_logical_record(index: usize, fields: Vec<String>) -> LogicalRecord {
     }
 }
 
+const MAX_BLANK_INDICES: usize = 10_000;
+
 /// Inspect a CSV file with bounded sampling.
 pub fn inspect_csv(
     path: &Path,
@@ -77,14 +79,67 @@ pub fn inspect_csv(
     let mut width_min = usize::MAX;
     let mut width_max = 0usize;
     let mut total_count = 0usize;
+    let mut valid_count = 0usize;
     let mut sampling_complete = true;
+    let mut blank_indices_capped = false;
 
     let max_samples = options.max_sample_records;
+    let max_field_size = options.max_field_size;
+
+    if let Some(ref encoding) = options.force_encoding {
+        if encoding.to_lowercase() != "utf-8" {
+            diagnostics.push(Diagnostic {
+                code: "csv.unsupported_encoding".to_string(),
+                severity: Severity::Warning,
+                stage: "ingest-csv".to_string(),
+                message: format!(
+                    "force_encoding is set to '{}' but only UTF-8 is currently supported",
+                    encoding
+                ),
+                location: None,
+            });
+        }
+    }
 
     for result in reader.records() {
         match result {
             Ok(record) => {
                 let fields: Vec<String> = record.iter().map(|s| s.to_string()).collect();
+
+                let field_too_large = fields.iter().enumerate().find_map(|(col, field)| {
+                    if field.len() > max_field_size {
+                        Some((col, field.len()))
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some((col, size)) = field_too_large {
+                    malformed_records.push(MalformedRecord {
+                        index: total_count,
+                        reason: format!(
+                            "field at column {} exceeds max_field_size ({} bytes > {} bytes)",
+                            col, size, max_field_size
+                        ),
+                    });
+                    diagnostics.push(Diagnostic {
+                        code: "csv.field_too_large".to_string(),
+                        severity: Severity::Warning,
+                        stage: "ingest-csv".to_string(),
+                        message: format!(
+                            "Record {}: field at column {} is {} bytes, exceeding the {} byte limit",
+                            total_count, col, size, max_field_size
+                        ),
+                        location: Some(DiagnosticLocation {
+                            row: Some(total_count),
+                            col: Some(col),
+                            cell: None,
+                        }),
+                    });
+                    total_count += 1;
+                    continue;
+                }
+
                 let width = fields.len();
                 if width < width_min {
                     width_min = width;
@@ -96,7 +151,12 @@ pub fn inspect_csv(
                 let rec = make_logical_record(total_count, fields);
 
                 if rec.is_blank {
-                    blank_record_indices.push(rec.index);
+                    if blank_record_indices.len() < MAX_BLANK_INDICES {
+                        blank_record_indices.push(rec.index);
+                    } else if !blank_indices_capped {
+                        blank_indices_capped = true;
+                        limits_reached.push("max_blank_record_indices".to_string());
+                    }
                 }
 
                 if sampled_records.len() < max_samples {
@@ -106,6 +166,7 @@ pub fn inspect_csv(
                 }
 
                 total_count += 1;
+                valid_count += 1;
             }
             Err(e) => {
                 let reason = e.to_string();
@@ -138,7 +199,7 @@ pub fn inspect_csv(
     }
 
     let logical_record_count = if sampling_complete {
-        Some(total_count)
+        Some(valid_count)
     } else {
         None
     };
@@ -235,5 +296,118 @@ mod tests {
         assert_eq!(result.width_min, 2);
         assert_eq!(result.width_max, 3);
         assert_eq!(result.logical_record_count, Some(3));
+    }
+
+    #[test]
+    fn field_too_large_rejects_record() {
+        let mut csv = String::from("a,b\n");
+        csv.push_str(&"x".repeat(200));
+        csv.push_str(",y\n");
+        csv.push_str("c,d\n");
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(csv.as_bytes()).unwrap();
+        let dialect = CsvDialect::default();
+        let options = InspectOptions {
+            max_sample_records: 100,
+            max_field_size: 100,
+            ..Default::default()
+        };
+        let result = inspect_csv(file.path(), &dialect, &options).unwrap();
+
+        assert_eq!(result.logical_record_count, Some(2));
+        assert_eq!(result.malformed_records.len(), 1);
+        assert_eq!(result.malformed_records[0].index, 1);
+        assert!(
+            result.malformed_records[0]
+                .reason
+                .contains("max_field_size")
+        );
+        assert_eq!(result.sampled_records.len(), 2);
+        assert_eq!(result.sampled_records[0].fields, vec!["a", "b"]);
+        assert_eq!(result.sampled_records[1].fields, vec!["c", "d"]);
+
+        let field_diag = result
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "csv.field_too_large");
+        assert!(field_diag.is_some());
+        let diag = field_diag.unwrap();
+        assert_eq!(diag.severity, Severity::Warning);
+        assert_eq!(diag.location.as_ref().unwrap().row, Some(1));
+        assert_eq!(diag.location.as_ref().unwrap().col, Some(0));
+    }
+
+    #[test]
+    fn blank_record_indices_capped() {
+        let mut csv = String::from("a,b\n");
+        for _ in 0..15_000 {
+            csv.push_str(",,\n");
+        }
+        csv.push_str("x,y\n");
+
+        let result = inspect_from_str(&csv, 20_000);
+        assert_eq!(result.blank_record_indices.len(), 10_000);
+        assert!(
+            result
+                .limits_reached
+                .contains(&"max_blank_record_indices".to_string())
+        );
+        assert_eq!(result.logical_record_count, Some(15_002));
+    }
+
+    #[test]
+    fn force_encoding_utf8_no_warning() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"a,b\n1,2\n").unwrap();
+        let dialect = CsvDialect::default();
+        let options = InspectOptions {
+            force_encoding: Some("utf-8".to_string()),
+            ..Default::default()
+        };
+        let result = inspect_csv(file.path(), &dialect, &options).unwrap();
+        let encoding_diag = result
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "csv.unsupported_encoding");
+        assert!(encoding_diag.is_none());
+    }
+
+    #[test]
+    fn force_encoding_non_utf8_warns() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"a,b\n1,2\n").unwrap();
+        let dialect = CsvDialect::default();
+        let options = InspectOptions {
+            force_encoding: Some("latin-1".to_string()),
+            ..Default::default()
+        };
+        let result = inspect_csv(file.path(), &dialect, &options).unwrap();
+        let encoding_diag = result
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "csv.unsupported_encoding");
+        assert!(encoding_diag.is_some());
+        let diag = encoding_diag.unwrap();
+        assert_eq!(diag.severity, Severity::Warning);
+        assert!(diag.message.contains("latin-1"));
+        assert!(diag.message.contains("UTF-8"));
+    }
+
+    #[test]
+    fn force_encoding_case_insensitive() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"a,b\n1,2\n").unwrap();
+        let dialect = CsvDialect::default();
+        let options = InspectOptions {
+            force_encoding: Some("UTF-8".to_string()),
+            ..Default::default()
+        };
+        let result = inspect_csv(file.path(), &dialect, &options).unwrap();
+        let encoding_diag = result
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "csv.unsupported_encoding");
+        assert!(encoding_diag.is_none());
     }
 }

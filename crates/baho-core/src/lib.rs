@@ -10,6 +10,7 @@ pub mod error;
 pub mod intent;
 pub mod orchestration;
 
+pub use baho_ingest_csv::CandidateConfig;
 pub use candidate_selection::select_candidate;
 pub use error::{CoreError, IntentError};
 pub use intent::{RecognizedIntent, recognize_intent};

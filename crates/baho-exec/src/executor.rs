@@ -11,6 +11,7 @@ use crate::error::ExecutionError;
 /// Grid data provided to the executor as input.
 pub struct GridInput {
     pub table_id: String,
+    pub source_revision: String,
     pub columns: Vec<ColumnDefinition>,
     pub rows: Vec<Vec<Option<Value>>>,
     pub source_rows: Vec<usize>,
@@ -30,6 +31,13 @@ pub fn execute_plan(plan: &Plan, grid: &GridInput) -> Result<ExecutionResult, Ex
     if plan.source.table_id != grid.table_id {
         return Err(ExecutionError::TableNotFound {
             table_id: plan.source.table_id.clone(),
+        });
+    }
+
+    if plan.source.revision != grid.source_revision {
+        return Err(ExecutionError::SourceRevisionMismatch {
+            expected: plan.source.revision.clone(),
+            actual: grid.source_revision.clone(),
         });
     }
 
@@ -306,6 +314,7 @@ mod tests {
     fn filter_removes_blank_rows() {
         let grid = GridInput {
             table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
             columns: grid_columns(),
             rows: vec![
                 vec![text("A"), text("Type A")],
@@ -340,6 +349,7 @@ mod tests {
     fn select_reorders_columns() {
         let grid = GridInput {
             table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
             columns: grid_columns(),
             rows: vec![vec![text("A"), text("B"), text("C")]],
             source_rows: vec![0],
@@ -366,6 +376,7 @@ mod tests {
     fn distinct_keeps_first_occurrence() {
         let grid = GridInput {
             table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
             columns: grid_columns(),
             rows: vec![
                 vec![text("A"), text("Type A")],
@@ -398,6 +409,7 @@ mod tests {
     fn full_pipeline_filter_select_distinct() {
         let grid = GridInput {
             table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
             columns: grid_columns(),
             rows: vec![
                 vec![text("X"), text("Type A")],
@@ -447,6 +459,7 @@ mod tests {
     fn blank_exclusion_covers_all_blank_types() {
         let grid = GridInput {
             table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
             columns: grid_columns(),
             rows: vec![
                 vec![text("valid"), text("A")],
@@ -478,6 +491,7 @@ mod tests {
     fn provenance_preserved_through_filter_and_distinct() {
         let grid = GridInput {
             table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
             columns: grid_columns(),
             rows: vec![
                 vec![text("A"), text("X")],
@@ -515,6 +529,7 @@ mod tests {
     fn empty_input_returns_empty_result() {
         let grid = GridInput {
             table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
             columns: grid_columns(),
             rows: vec![],
             source_rows: vec![],
@@ -541,6 +556,7 @@ mod tests {
     fn table_not_found_error() {
         let grid = GridInput {
             table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
             columns: grid_columns(),
             rows: vec![vec![text("A"), text("B")]],
             source_rows: vec![0],
@@ -566,6 +582,7 @@ mod tests {
     fn column_not_found_error() {
         let grid = GridInput {
             table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
             columns: grid_columns(),
             rows: vec![vec![text("A"), text("B")]],
             source_rows: vec![0],
@@ -584,6 +601,33 @@ mod tests {
         assert!(matches!(
             err,
             ExecutionError::ColumnNotFound { column_id } if column_id == "column-99"
+        ));
+    }
+
+    #[test]
+    fn source_revision_mismatch_error() {
+        let grid = GridInput {
+            table_id: "table-0".to_string(),
+            source_revision: "actual-hash".to_string(),
+            columns: grid_columns(),
+            rows: vec![vec![text("A"), text("B"), text("C")]],
+            source_rows: vec![0],
+        };
+        let plan = Plan {
+            schema_version: 1,
+            source: PlanSource {
+                revision: "different-hash".to_string(),
+                table_id: "table-0".to_string(),
+            },
+            steps: vec![PlanStep::Select {
+                columns: vec!["column-0".to_string()],
+            }],
+        };
+        let err = execute_plan(&plan, &grid).unwrap_err();
+        assert!(matches!(
+            err,
+            ExecutionError::SourceRevisionMismatch { expected, actual }
+                if expected == "different-hash" && actual == "actual-hash"
         ));
     }
 }

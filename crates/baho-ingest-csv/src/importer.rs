@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::BufReader;
 use std::path::Path;
 
 use baho_ingest::ImportedDocument;
@@ -50,7 +51,7 @@ impl FormatImporter for CsvImporter {
         path: &Path,
         options: &InspectOptions,
     ) -> Result<ImportedDocument, ImportError> {
-        let dialect = CsvDialect::default();
+        let dialect = CsvDialect::for_path(path);
         let inspection = inspect_csv(path, &dialect, options)?;
         let features = compute_row_features(&inspection.sampled_records);
 
@@ -85,8 +86,8 @@ impl FormatImporter for CsvImporter {
 
         all_diagnostics.extend(header_diag);
 
-        let rows: Vec<Row> = inspection
-            .sampled_records
+        let all_records = read_all_records(path, &dialect)?;
+        let rows: Vec<Row> = all_records
             .iter()
             .map(|rec| Row {
                 index: rec.index,
@@ -146,28 +147,68 @@ impl FormatImporter for CsvImporter {
 }
 
 fn compute_content_hash(path: &Path) -> Result<String, ImportError> {
+    use sha2::{Digest, Sha256};
     use std::io::Read;
+
     let mut file = fs::File::open(path).map_err(|source| ImportError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)
-        .map_err(|source| ImportError::Io {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| ImportError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-
-    let hash = format!("{:x}", md5_simple(&buf));
-    Ok(hash)
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn md5_simple(data: &[u8]) -> u128 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    hasher.finish() as u128
+/// Read all records from a CSV file for document construction.
+fn read_all_records(
+    path: &Path,
+    dialect: &CsvDialect,
+) -> Result<Vec<crate::inspector::LogicalRecord>, ImportError> {
+    let file = fs::File::open(path).map_err(|source| ImportError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(dialect.delimiter)
+        .quote(dialect.quote)
+        .escape(Some(dialect.quote_escape))
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(BufReader::new(file));
+
+    let mut records = Vec::new();
+    let mut index = 0usize;
+
+    for result in reader.records() {
+        match result {
+            Ok(record) => {
+                let fields: Vec<String> = record.iter().map(|s| s.to_string()).collect();
+                let is_blank = fields.iter().all(|f| f.trim().is_empty());
+                records.push(crate::inspector::LogicalRecord {
+                    index,
+                    fields,
+                    is_blank,
+                });
+                index += 1;
+            }
+            Err(_) => {
+                index += 1;
+            }
+        }
+    }
+
+    Ok(records)
 }
 
 #[cfg(test)]
@@ -229,5 +270,48 @@ mod tests {
     fn can_inspect_text_content() {
         let importer = CsvImporter;
         assert!(importer.can_inspect(Path::new("data"), b"name,age\nAlice,30"));
+    }
+
+    #[test]
+    fn imports_all_records_beyond_sample_limit() {
+        let mut csv = String::from("id,value\n");
+        for i in 0..1500 {
+            csv.push_str(&format!("{},v{}\n", i, i));
+        }
+        let result = import_from_str(&csv);
+
+        assert_eq!(result.document.sheets[0].rows.len(), 1501);
+        assert_eq!(result.document.sheets[0].rows[0].cells[0].raw_text, "id");
+        assert_eq!(result.document.sheets[0].rows[1].cells[0].raw_text, "0");
+        assert_eq!(
+            result.document.sheets[0].rows[1500].cells[0].raw_text,
+            "1499"
+        );
+        assert_eq!(
+            result.document.sheets[0].rows[1500].cells[1].raw_text,
+            "v1499"
+        );
+    }
+
+    fn import_tsv_from_str(tsv: &str) -> ImportedDocument {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.tsv");
+        std::fs::write(&path, tsv).unwrap();
+        let importer = CsvImporter;
+        let options = InspectOptions::default();
+        importer.import(&path, &options).unwrap()
+    }
+
+    #[test]
+    fn tsv_import_parses_tab_delimited() {
+        let tsv = "Name\tValue\nAlice\t100\nBob\t200\n";
+        let result = import_tsv_from_str(tsv);
+
+        assert_eq!(result.document.sheets[0].rows.len(), 3);
+        assert_eq!(result.document.sheets[0].rows[0].cells[0].raw_text, "Name");
+        assert_eq!(result.document.sheets[0].rows[0].cells[1].raw_text, "Value");
+        assert_eq!(result.document.sheets[0].rows[1].cells[0].raw_text, "Alice");
+        assert_eq!(result.document.sheets[0].rows[1].cells[1].raw_text, "100");
+        assert_eq!(result.input_profile.detected_delimiter, Some('\t'));
     }
 }
