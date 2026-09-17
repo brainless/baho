@@ -27,8 +27,8 @@ The first milestone is intentionally narrow. It includes:
 
 - A Rust workspace with a reusable core library and a small CLI.
 - CSV and delimiter-separated input only.
-- Inspection of file encoding, dialect, record widths, blank regions, and candidate table boundaries.
-- Extraction of a requested table into the common grid model.
+- Internal inspection of file encoding, dialect, record widths, blank regions, and candidate table boundaries.
+- Extraction of a requested table into the common grid model as part of fulfilling one user request.
 - Support for common irregularities such as preambles, footer notes, multiple tables, blank separators, repeated headers, multi-row headers, ragged rows, and summary tables.
 - Cell-, row-, table-, and document-level diagnostics.
 - Machine-readable and human-readable run artifacts.
@@ -38,43 +38,38 @@ The initial milestone does not include Excel, PDF, OCR, a GUI, a daemon, or an o
 
 ## 4. Initial CLI contract
 
-The intended shape is:
+The user-facing shape is:
 
 ```text
-baho inspect <INPUT>
-baho extract <INPUT> --intent <TEXT> [--output <PATH>]
+baho run <INPUT> --prompt <TEXT> [--output <PATH>]
 baho runs [--latest]
 ```
 
-Exact flags may evolve, but these concepts must remain distinct:
+`run` is the single document operation exposed to users. Inspection, candidate detection, schema construction, extraction, and materialization are internal stages of that operation. They remain distinct and observable in run artifacts, but users do not need to select a processing stage before describing the result they want.
 
-- `inspect` describes the physical structure and detected table candidates.
-- `extract` selects and parses a table according to explicit options and/or the user's stated intent.
-- `runs` locates previous diagnostic runs.
+`runs` locates previous diagnostic runs and does not create a run of its own. This prevents `runs --latest` from making itself the latest run.
 
-In the first milestone, `--intent` is recorded as development context. Baho must not pretend that it understood unconstrained language when no planner is configured. Any decision that affects extraction must be represented in structured parser configuration and recorded in the run artifacts.
+In the initial bootstrap, `--prompt` is recorded verbatim as development context in `intent.txt`. Successfully recording a request does not imply that the document was processed; the manifest and diagnostics state when processing is unavailable. Baho must not pretend that it understood unconstrained language when no planner is configured. Any future decision that affects extraction must be represented in structured parser configuration and recorded in the run artifacts.
 
 CLI stdout is for the requested result or a concise summary. Progress and diagnostics go to stderr and the run directory. A successful invocation prints the run ID and run path to stderr.
 
 ## 5. Run records and observability
 
-Every CLI invocation creates its own `.baho/runs/<run-id>/`. `.baho/` is local state and must be excluded from Git.
+Every `baho run` invocation that parses successfully creates its own `.baho/runs/<run-id>/`. Read-only administrative commands such as `baho runs` do not. `.baho/` is local state and must be excluded from Git.
 
 The run ID is a monotonically increasing count, rendered with leading zeroes for lexical ordering: `000001`, `000002`, and so on. The next invocation atomically reserves the next available number so concurrent invocations cannot share or overwrite a directory. Gaps are valid after interrupted or failed runs, and an existing run directory is never reused. “Latest run” means the greatest allocated run ID, not the directory with the newest modification time.
 
-The minimum run layout is:
+The bootstrap run layout is:
 
 ```text
 .baho/runs/<run-id>/
 ├── manifest.json
 ├── intent.txt
 ├── events.jsonl
-├── input-profile.json
-├── parser-config.json
-├── candidates.json
-├── diagnostics.json
-└── output/                 # Present when output was materialized
+└── diagnostics.json
 ```
+
+As processing stages are implemented, they add `input-profile.json`, `parser-config.json`, `candidates.json`, and `output/` when output is materialized. The manifest artifact index identifies exactly which artifacts a run produced; absent stages do not produce empty placeholder artifacts.
 
 `manifest.json` records:
 
@@ -123,13 +118,14 @@ crates/
 ├── baho-ingest-csv/     # CSV dialect analysis and grid extraction
 ├── baho-plan/           # Serializable, versioned operation-plan IR
 ├── baho-exec/           # Deterministic validation and execution
+├── baho-llm/            # Optional LLM provider configuration and transport adapters
 └── baho-core/           # Stable façade for CLI, GUI, and future daemon
 apps/
 ├── baho-cli/
 └── baho-gui/            # Added after the core workflow is established
 ```
 
-The boundaries are directional: applications depend on `baho-core`; `baho-core` coordinates lower-level crates; model and execution crates do not depend on a UI, windowing library, async runtime, CLI framework, or LLM provider.
+The boundaries are directional: applications depend on `baho-core`; `baho-core` coordinates lower-level crates; model and execution crates do not depend on a UI, windowing library, async runtime, CLI framework, or LLM provider. Optional provider dependencies and their async transport remain isolated in `baho-llm`; prompts and agent policy do not belong there.
 
 The GUI will use akar and its developer-driven synchronous frame loop. A future daemon must be able to use the same `baho-core` API without linking akar, wgpu, or winit.
 
@@ -169,4 +165,4 @@ The same source revision, parser configuration, and operation plan must produce 
 
 ## 12. Initial success criteria
 
-The CSV milestone is successful when the user can run `inspect` and `extract` on an unfamiliar CSV, give a coding agent the resulting run ID, and the agent can understand the request and parser decisions well enough to add a failing regression test and implement the improvement in the correct crate. Re-running the original command must make the behavioral change and its diagnostics evident.
+The CSV milestone is successful when the user can run `baho run` on an unfamiliar CSV, give a coding agent the resulting run ID, and the agent can understand the request and parser decisions well enough to add a failing regression test and implement the improvement in the correct crate. Re-running the original command must make the behavioral change and its diagnostics evident.

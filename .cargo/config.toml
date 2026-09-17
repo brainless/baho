@@ -1,0 +1,8 @@
+[unstable]
+codegen-backend = true
+
+[profile.dev]
+codegen-backend = "cranelift"
+
+[profile.test]
+codegen-backend = "cranelift"

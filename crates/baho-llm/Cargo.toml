@@ -1,0 +1,11 @@
+[package]
+name = "baho-llm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dotenvy = "0.15"
+llm-sdk = { path = "../../../llm-sdk" }
+thiserror = "2.0"

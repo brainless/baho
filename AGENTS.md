@@ -99,6 +99,7 @@ Keep dependencies directed and responsibilities narrow:
 | `baho-ingest-csv` | CSV dialect analysis, profiling, candidates, CSV extraction | Operation execution, CLI presentation |
 | `baho-plan` | Versioned plan and expression IR, structural validation | LLM calls, arbitrary code execution |
 | `baho-exec` | Typed validation and deterministic materialization | Parsing source formats, UI, providers |
+| `baho-llm` | LLM provider configuration and transport adapters | Agent prompts, planning policy, parsing, execution |
 | `baho-core` | Application façade and orchestration | CLI formatting, akar/winit rendering |
 | `baho-cli` | Arguments, terminal output, run artifact lifecycle | Parser algorithms and domain rules |
 | `baho-gui` | Akar frame loop and presentation | Domain logic duplicated from core |
@@ -133,6 +134,14 @@ Before relying on non-trivial behavior from a dependency:
 If a needed dependency is not cloned, tell the user which repository is missing and why its source is needed. Do not silently clone it, fetch an alternate copy, or substitute a different library merely because its source happens to be present. Registry documentation may help with orientation, but it does not replace notifying the user when local source inspection is required.
 
 The akar source is expected at `~/Projects/akar`. Before GUI work, read akar's own `AGENTS.md`, current development documentation, and the relevant examples. Akar is synchronous and developer-loop driven; do not impose an async runtime or a second event loop on it.
+
+## LLM integration
+
+The locally maintained LLM SDK source is expected at `~/Projects/llm-sdk` and is currently declared as a path dependency of `baho-llm`. Read its manifest, public exports, provider implementation, and relevant tests before changing the adapter. Do not edit the SDK checkout as part of a baho task.
+
+Keep provider transport and credential loading in `baho-llm`. Xiaomi with MiMo V2.5 Pro is the default provider/model pair until a product requirement changes it. Agent prompts, planning policy, document parsing, and deterministic execution do not belong in this crate.
+
+Read the Xiaomi credential from `XIAOMI_API_KEY`; a local `.env` may supply it. Never commit `.env`, API keys, authorization headers, or provider payloads containing secrets, and never write them to run artifacts. Tests must not make live provider calls by default.
 
 ## Testing and verification
 

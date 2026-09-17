@@ -1,0 +1,5 @@
+.baho/
+.env
+.env.*
+!.env.example
+/target/

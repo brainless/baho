@@ -1,0 +1,8 @@
+[workspace]
+members = ["apps/baho-cli", "crates/baho-llm"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
