@@ -118,7 +118,7 @@ fn extract_unique_floor_plans_from_fixture() {
 
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    assert_eq!(plan["schema_version"], 1);
+    assert_eq!(plan["schema_version"], 2);
     let steps = plan["plan"]["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 3);
     assert_eq!(steps[0]["op"], "filter");
@@ -133,6 +133,14 @@ fn extract_unique_floor_plans_from_fixture() {
     assert!(
         evidence["matched_column"].as_object().is_some(),
         "plan must include matched column evidence"
+    );
+    assert!(
+        evidence["action"].as_object().is_some(),
+        "plan must include action evidence"
+    );
+    assert!(
+        evidence["canonical_operation"].as_str().is_some(),
+        "plan must include canonical operation"
     );
 
     let result: Value =

@@ -664,4 +664,69 @@ mod tests {
                 if expected == "different-hash" && actual == "actual-hash"
         ));
     }
+
+    #[test]
+    fn select_only_preserves_blanks_and_duplicates() {
+        let grid = GridInput {
+            table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
+            source_sheet_index: 0,
+            columns: vec![ColumnDefinition {
+                id: "col-income".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Income".to_string()),
+                source_header_normalized: Some("income".to_string()),
+                display_name: "Income".to_string(),
+            }],
+            rows: vec![
+                vec![text("50000")],
+                vec![blank()],
+                vec![text("60000")],
+                vec![text("50000")],
+                vec![blank()],
+                vec![text("70000")],
+            ],
+            source_rows: vec![1, 2, 3, 4, 5, 6],
+        };
+        let plan = Plan {
+            schema_version: 1,
+            source: PlanSource {
+                revision: "hash".to_string(),
+                table_id: "table-0".to_string(),
+            },
+            steps: vec![PlanStep::Select {
+                columns: vec!["col-income".to_string()],
+            }],
+        };
+        let result = execute_plan(&plan, &grid).unwrap();
+
+        // All 6 rows preserved including blanks and duplicates
+        assert_eq!(result.rows_output, 6);
+        assert_eq!(result.rows_processed, 6);
+
+        // Values in source order
+        assert_eq!(result.view.rows[0].values[0], text("50000"));
+        assert_eq!(result.view.rows[1].values[0], blank());
+        assert_eq!(result.view.rows[2].values[0], text("60000"));
+        assert_eq!(result.view.rows[3].values[0], text("50000"));
+        assert_eq!(result.view.rows[4].values[0], blank());
+        assert_eq!(result.view.rows[5].values[0], text("70000"));
+
+        // Provenance is correct
+        assert_eq!(result.view.provenance[0].source_row, 1);
+        assert_eq!(result.view.provenance[1].source_row, 2);
+        assert_eq!(result.view.provenance[2].source_row, 3);
+        assert_eq!(result.view.provenance[3].source_row, 4);
+        assert_eq!(result.view.provenance[4].source_row, 5);
+        assert_eq!(result.view.provenance[5].source_row, 6);
+
+        // All provenance addresses point to column 0
+        assert!(
+            result
+                .view
+                .provenance
+                .iter()
+                .all(|p| p.source_addresses.len() == 1 && p.source_addresses[0].col == 0)
+        );
+    }
 }

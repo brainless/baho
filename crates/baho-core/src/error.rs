@@ -34,6 +34,6 @@ pub enum IntentError {
     #[error("ambiguous column match: {candidates:?}")]
     ColumnAmbiguous { candidates: Vec<String> },
 
-    #[error("no operation recognized in prompt")]
-    NoOperation,
+    #[error("ambiguous parse: {candidates:?}")]
+    ParseAmbiguous { candidates: Vec<String> },
 }

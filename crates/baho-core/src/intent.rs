@@ -1,136 +1,199 @@
 use baho_model::column::ColumnDefinition;
-use baho_plan::evidence::{MatchedColumn, RecognitionEvidence};
+use baho_plan::evidence::{
+    ActionEvidence, ColumnPhraseEvidence, MatchedColumn, ModifierEvidence, PromptToken,
+    RecognitionEvidence,
+};
+use baho_plan::plan::{DistinctKeep, Expression, Plan, PlanSource, PlanStep};
+use serde::{Deserialize, Serialize};
 
 use crate::error::IntentError;
 
-const ACTION_TOKENS: &[&str] = &["extract", "list", "show", "get", "find"];
-const OPERATION_TOKENS: &[&str] = &["unique", "distinct"];
 const FILLER_TOKENS: &[&str] = &["all", "the", "a", "an", "of", "from", "values", "value"];
 
 const MATCH_THRESHOLD: f64 = 0.5;
 const AMBIGUITY_MARGIN: f64 = 0.1;
 
-/// A recognized user intent.
-#[derive(Debug, Clone)]
-pub struct RecognizedIntent {
-    pub operation: String,
-    pub column_id: String,
-    pub column_display_name: String,
-    pub evidence: RecognitionEvidence,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CanonicalAction {
+    Retrieve,
 }
 
-/// Recognize a narrow intent from a prompt and available columns.
-pub fn recognize_intent(
-    prompt: &str,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CanonicalOperation {
+    Select,
+    Distinct,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchClass {
+    Exact,
+    TerminalSVariant,
+}
+
+impl MatchClass {
+    fn score(self) -> f64 {
+        match self {
+            MatchClass::Exact => 1.0,
+            MatchClass::TerminalSVariant => 0.9,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            MatchClass::Exact => "exact",
+            MatchClass::TerminalSVariant => "terminal_s_variant",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IndexedToken {
+    #[allow(dead_code)]
+    index: usize,
+    text: String,
+    #[allow(dead_code)]
+    start: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateParse {
+    #[allow(dead_code)]
+    action_span: (usize, usize),
+    modifier: Option<CanonicalOperation>,
+    #[allow(dead_code)]
+    modifier_span: Option<(usize, usize)>,
+    column_span: (usize, usize),
+    column: ColumnDefinition,
+    match_class: MatchClass,
+    score: f64,
+}
+
+fn resolve_action(token: &str) -> Option<CanonicalAction> {
+    match token {
+        "extract" | "list" | "show" | "get" | "find" | "display" | "return" => {
+            Some(CanonicalAction::Retrieve)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_modifier(token: &str) -> Option<CanonicalOperation> {
+    match token {
+        "unique" | "distinct" | "deduplicate" | "deduplicated" => {
+            Some(CanonicalOperation::Distinct)
+        }
+        _ => None,
+    }
+}
+
+fn tokens_match(a: &str, b: &str) -> Option<MatchClass> {
+    if a == b {
+        return Some(MatchClass::Exact);
+    }
+    if a.len() == b.len() + 1 && a.ends_with('s') && &a[..a.len() - 1] == b {
+        return Some(MatchClass::TerminalSVariant);
+    }
+    if b.len() == a.len() + 1 && b.ends_with('s') && &b[..b.len() - 1] == a {
+        return Some(MatchClass::TerminalSVariant);
+    }
+    None
+}
+
+fn match_column_span(
+    prompt_tokens: &[IndexedToken],
+    span_start: usize,
+    span_end: usize,
+    col: &ColumnDefinition,
+) -> Option<MatchClass> {
+    let normalized = normalize_for_match(&col.display_name);
+    let col_tokens: Vec<&str> = normalized.split_whitespace().collect();
+    if col_tokens.is_empty() {
+        return None;
+    }
+
+    let span_len = span_end - span_start;
+    if span_len != col_tokens.len() {
+        return None;
+    }
+
+    let mut worst_class = MatchClass::Exact;
+    for (i, col_token) in col_tokens.iter().enumerate() {
+        match tokens_match(&prompt_tokens[span_start + i].text, col_token) {
+            Some(cls) => {
+                if cls == MatchClass::TerminalSVariant {
+                    worst_class = MatchClass::TerminalSVariant;
+                }
+            }
+            None => return None,
+        }
+    }
+    Some(worst_class)
+}
+
+fn build_candidate_parses(
+    tokens: &[IndexedToken],
     columns: &[ColumnDefinition],
-) -> Result<RecognizedIntent, IntentError> {
-    let tokens: Vec<String> = prompt
-        .split_whitespace()
-        .map(|t| t.to_lowercase())
-        .collect();
+) -> Vec<CandidateParse> {
+    let mut candidates = Vec::new();
 
     if tokens.is_empty() {
-        return Err(IntentError::Unsupported("empty prompt".to_string()));
+        return candidates;
     }
 
-    let mut pos = 0;
-
-    // First token must be an action verb.
-    if pos >= tokens.len() || !ACTION_TOKENS.contains(&tokens[pos].as_str()) {
-        return Err(IntentError::Unsupported(format!(
-            "expected action verb, got '{}'",
-            tokens.get(pos).map(|s| s.as_str()).unwrap_or("")
-        )));
+    if resolve_action(&tokens[0].text).is_none() {
+        return candidates;
     }
-    pos += 1;
 
-    // Skip filler tokens.
-    while pos < tokens.len() && FILLER_TOKENS.contains(&tokens[pos].as_str()) {
+    let action_end = 1;
+
+    let mut modifier_positions: Vec<Option<(usize, CanonicalOperation)>> = vec![None];
+    let mut pos = action_end;
+    while pos < tokens.len() && FILLER_TOKENS.contains(&tokens[pos].text.as_str()) {
         pos += 1;
     }
-
-    // Next token must be an operation.
-    if pos >= tokens.len() || !OPERATION_TOKENS.contains(&tokens[pos].as_str()) {
-        return Err(IntentError::NoOperation);
-    }
-    let operation = "distinct".to_string();
-    pos += 1;
-
-    // Skip more filler tokens.
-    while pos < tokens.len() && FILLER_TOKENS.contains(&tokens[pos].as_str()) {
-        pos += 1;
+    if pos < tokens.len() {
+        if let Some(op) = resolve_modifier(&tokens[pos].text) {
+            modifier_positions.push(Some((pos, op)));
+        }
     }
 
-    // Remaining tokens form the column mention.
-    if pos >= tokens.len() {
-        return Err(IntentError::Unsupported(
-            "no column mention found".to_string(),
-        ));
-    }
-    let column_tokens: Vec<&str> = tokens[pos..].iter().map(|s| s.as_str()).collect();
+    for modifier_pos in &modifier_positions {
+        let after_modifier = if let Some((idx, _)) = modifier_pos {
+            let mut p = idx + 1;
+            while p < tokens.len() && FILLER_TOKENS.contains(&tokens[p].text.as_str()) {
+                p += 1;
+            }
+            p
+        } else {
+            pos
+        };
 
-    // Match against columns.
-    let mut scored: Vec<(f64, &ColumnDefinition)> = Vec::new();
-    for col in columns {
-        let normalized = normalize_for_match(&col.display_name);
-        let col_tokens: Vec<&str> = normalized.split_whitespace().collect();
-        if col_tokens.is_empty() {
+        if after_modifier >= tokens.len() {
             continue;
         }
-        let score = score_match(&column_tokens, &col_tokens);
-        if score >= MATCH_THRESHOLD {
-            scored.push((score, col));
+
+        let span_start = after_modifier;
+        let span_end = tokens.len();
+
+        for col in columns {
+            if let Some(match_class) = match_column_span(tokens, span_start, span_end, col) {
+                let score = match_class.score();
+                if score >= MATCH_THRESHOLD {
+                    candidates.push(CandidateParse {
+                        action_span: (0, action_end),
+                        modifier: modifier_pos.map(|(_, op)| op),
+                        modifier_span: modifier_pos.map(|(idx, _)| (idx, idx + 1)),
+                        column_span: (span_start, span_end),
+                        column: col.clone(),
+                        match_class,
+                        score,
+                    });
+                }
+            }
         }
     }
 
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    if scored.is_empty() {
-        let term = column_tokens.join(" ");
-        return Err(IntentError::ColumnNotFound { prompt_term: term });
-    }
-
-    // Check ambiguity: if top two are within margin, it's ambiguous.
-    if scored.len() >= 2 {
-        let top = scored[0].0;
-        let second = scored[1].0;
-        if (top - second).abs() < AMBIGUITY_MARGIN {
-            let candidates = vec![
-                scored[0].1.display_name.clone(),
-                scored[1].1.display_name.clone(),
-            ];
-            return Err(IntentError::ColumnAmbiguous { candidates });
-        }
-    }
-
-    let (best_score, best_col) = &scored[0];
-    let evidence_str = format!(
-        "token overlap: {}",
-        column_tokens
-            .iter()
-            .map(|t| format!("'{}'", t))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    let evidence = RecognitionEvidence {
-        prompt_tokens: tokens.clone(),
-        matched_column: Some(MatchedColumn {
-            column_id: best_col.id.clone(),
-            display_name: best_col.display_name.clone(),
-            score: *best_score,
-            evidence: evidence_str,
-        }),
-        operation: Some(operation.clone()),
-        refusal_reason: None,
-    };
-
-    Ok(RecognizedIntent {
-        operation,
-        column_id: best_col.id.clone(),
-        column_display_name: best_col.display_name.clone(),
-        evidence,
-    })
+    candidates
 }
 
 fn normalize_for_match(s: &str) -> String {
@@ -151,23 +214,225 @@ fn normalize_for_match(s: &str) -> String {
     result
 }
 
-fn singularize(s: &str) -> &str {
-    s.strip_suffix('s').unwrap_or(s)
+/// A recognized user intent.
+#[derive(Debug, Clone)]
+pub struct RecognizedIntent {
+    pub action: CanonicalAction,
+    pub operation: CanonicalOperation,
+    pub column_id: String,
+    pub column_display_name: String,
+    pub evidence: RecognitionEvidence,
 }
 
-fn score_match(prompt_tokens: &[&str], column_tokens: &[&str]) -> f64 {
-    let mut matches = 0usize;
-    for pt in prompt_tokens {
-        let pt_s = singularize(pt);
-        for ct in column_tokens {
-            let ct_s = singularize(ct);
-            if pt_s == ct_s {
-                matches += 1;
-                break;
-            }
-        }
+pub fn recognize_intent(
+    prompt: &str,
+    columns: &[ColumnDefinition],
+) -> Result<RecognizedIntent, IntentError> {
+    let raw_tokens: Vec<String> = prompt
+        .split_whitespace()
+        .map(|t| t.to_lowercase())
+        .collect();
+
+    if raw_tokens.is_empty() {
+        return Err(IntentError::Unsupported("empty prompt".to_string()));
     }
-    matches as f64 / column_tokens.len() as f64
+
+    let mut offset = 0;
+    let indexed_tokens: Vec<IndexedToken> = raw_tokens
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let start = offset;
+            offset += text.len() + 1;
+            IndexedToken {
+                index: i,
+                text: text.clone(),
+                start,
+            }
+        })
+        .collect();
+
+    let prompt_token_evidence: Vec<PromptToken> = indexed_tokens
+        .iter()
+        .map(|t| PromptToken {
+            index: t.index,
+            text: t.text.clone(),
+        })
+        .collect();
+
+    if resolve_action(&indexed_tokens[0].text).is_none() {
+        return Err(IntentError::Unsupported(format!(
+            "expected action verb, got '{}'",
+            indexed_tokens[0].text
+        )));
+    }
+
+    let action_evidence = Some(ActionEvidence {
+        alias: indexed_tokens[0].text.clone(),
+        span: (0, 1),
+    });
+
+    let candidates = build_candidate_parses(&indexed_tokens, columns);
+
+    if candidates.is_empty() {
+        let col_start = {
+            let mut p = 1;
+            while p < indexed_tokens.len()
+                && FILLER_TOKENS.contains(&indexed_tokens[p].text.as_str())
+            {
+                p += 1;
+            }
+            if p < indexed_tokens.len() {
+                if resolve_modifier(&indexed_tokens[p].text).is_some() {
+                    p += 1;
+                    while p < indexed_tokens.len()
+                        && FILLER_TOKENS.contains(&indexed_tokens[p].text.as_str())
+                    {
+                        p += 1;
+                    }
+                }
+            }
+            p
+        };
+        let term = indexed_tokens[col_start..]
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(IntentError::ColumnNotFound { prompt_term: term });
+    }
+
+    let mut sorted = candidates;
+    sorted.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.column.id.cmp(&b.column.id))
+    });
+
+    let top_score = sorted[0].score;
+    let tied: Vec<&CandidateParse> = sorted
+        .iter()
+        .filter(|c| (top_score - c.score).abs() < AMBIGUITY_MARGIN)
+        .collect();
+
+    if tied.len() > 1 {
+        let candidate_descs: Vec<String> = tied
+            .iter()
+            .map(|c| {
+                format!(
+                    "{} (score={}, match={})",
+                    c.column.display_name,
+                    c.score,
+                    c.match_class.label()
+                )
+            })
+            .collect();
+        return Err(IntentError::ParseAmbiguous {
+            candidates: candidate_descs,
+        });
+    }
+
+    let best = &sorted[0];
+    let action = CanonicalAction::Retrieve;
+    let operation = best.modifier.unwrap_or(CanonicalOperation::Select);
+
+    let modifier_evidence = best.modifier.map(|op| {
+        let alias = match op {
+            CanonicalOperation::Distinct => best
+                .modifier_span
+                .map(|(s, _e)| indexed_tokens[s].text.clone())
+                .unwrap_or_else(|| "distinct".to_string()),
+            CanonicalOperation::Select => "select".to_string(),
+        };
+        ModifierEvidence {
+            alias,
+            span: best.modifier_span.unwrap_or((0, 0)),
+        }
+    });
+
+    let col_tokens: Vec<String> = indexed_tokens[best.column_span.0..best.column_span.1]
+        .iter()
+        .map(|t| t.text.clone())
+        .collect();
+    let column_phrase_evidence = Some(ColumnPhraseEvidence {
+        tokens: col_tokens,
+        span: best.column_span,
+    });
+
+    let match_class_label = best.match_class.label().to_string();
+    let evidence_str = match best.match_class {
+        MatchClass::Exact => "exact contiguous phrase".to_string(),
+        MatchClass::TerminalSVariant => "terminal-s variant".to_string(),
+    };
+
+    let canonical_op_str = match operation {
+        CanonicalOperation::Select => "select".to_string(),
+        CanonicalOperation::Distinct => "distinct".to_string(),
+    };
+
+    let evidence = RecognitionEvidence {
+        prompt_tokens: prompt_token_evidence,
+        action: action_evidence,
+        modifier: modifier_evidence,
+        column_phrase: column_phrase_evidence,
+        matched_column: Some(MatchedColumn {
+            column_id: best.column.id.clone(),
+            display_name: best.column.display_name.clone(),
+            score: best.score,
+            evidence: evidence_str,
+        }),
+        match_class: Some(match_class_label),
+        canonical_operation: Some(canonical_op_str),
+        refusal_reason: None,
+        competing_parses: Vec::new(),
+    };
+
+    Ok(RecognizedIntent {
+        action,
+        operation,
+        column_id: best.column.id.clone(),
+        column_display_name: best.column.display_name.clone(),
+        evidence,
+    })
+}
+
+pub fn compile_intent_to_plan(
+    intent: &RecognizedIntent,
+    source_revision: &str,
+    table_id: &str,
+) -> Plan {
+    let source = PlanSource {
+        revision: source_revision.to_string(),
+        table_id: table_id.to_string(),
+    };
+    match intent.operation {
+        CanonicalOperation::Select => Plan {
+            schema_version: 1,
+            source,
+            steps: vec![PlanStep::Select {
+                columns: vec![intent.column_id.clone()],
+            }],
+        },
+        CanonicalOperation::Distinct => Plan {
+            schema_version: 1,
+            source,
+            steps: vec![
+                PlanStep::Filter {
+                    predicate: Expression::IsNotBlank {
+                        column: intent.column_id.clone(),
+                    },
+                },
+                PlanStep::Select {
+                    columns: vec![intent.column_id.clone()],
+                },
+                PlanStep::Distinct {
+                    columns: vec![intent.column_id.clone()],
+                    keep: DistinctKeep::First,
+                },
+            ],
+        },
+    }
 }
 
 #[cfg(test)]
@@ -200,11 +465,38 @@ mod tests {
         ]
     }
 
+    fn income_time_columns() -> Vec<ColumnDefinition> {
+        vec![
+            ColumnDefinition {
+                id: "col-income".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Income".to_string()),
+                source_header_normalized: Some("income".to_string()),
+                display_name: "Income".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-time".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("Time".to_string()),
+                source_header_normalized: Some("time".to_string()),
+                display_name: "Time".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-show-time".to_string(),
+                ordinal: 2,
+                source_header_raw: Some("Show Time".to_string()),
+                source_header_normalized: Some("show time".to_string()),
+                display_name: "Show Time".to_string(),
+            },
+        ]
+    }
+
     #[test]
     fn extract_unique_floor_plans() {
         let cols = columns();
         let intent = recognize_intent("Extract all the unique floor plans", &cols).unwrap();
-        assert_eq!(intent.operation, "distinct");
+        assert_eq!(intent.action, CanonicalAction::Retrieve);
+        assert_eq!(intent.operation, CanonicalOperation::Distinct);
         assert_eq!(intent.column_id, "column-1");
         assert_eq!(intent.column_display_name, "Floor Plan");
         assert!(intent.evidence.matched_column.is_some());
@@ -218,7 +510,8 @@ mod tests {
     fn list_distinct_floor_plans() {
         let cols = columns();
         let intent = recognize_intent("list distinct floor plans", &cols).unwrap();
-        assert_eq!(intent.operation, "distinct");
+        assert_eq!(intent.action, CanonicalAction::Retrieve);
+        assert_eq!(intent.operation, CanonicalOperation::Distinct);
         assert_eq!(intent.column_id, "column-1");
     }
 
@@ -226,7 +519,8 @@ mod tests {
     fn show_unique_floor_plan_singular() {
         let cols = columns();
         let intent = recognize_intent("show unique floor plan", &cols).unwrap();
-        assert_eq!(intent.operation, "distinct");
+        assert_eq!(intent.action, CanonicalAction::Retrieve);
+        assert_eq!(intent.operation, CanonicalOperation::Distinct);
         assert_eq!(intent.column_id, "column-1");
     }
 
@@ -234,7 +528,17 @@ mod tests {
     fn get_the_unique_values_from_floor_plan() {
         let cols = columns();
         let intent = recognize_intent("get the unique values from floor plan", &cols).unwrap();
-        assert_eq!(intent.operation, "distinct");
+        assert_eq!(intent.action, CanonicalAction::Retrieve);
+        assert_eq!(intent.operation, CanonicalOperation::Distinct);
+        assert_eq!(intent.column_id, "column-1");
+    }
+
+    #[test]
+    fn select_only_retrieval() {
+        let cols = columns();
+        let intent = recognize_intent("show floor plans", &cols).unwrap();
+        assert_eq!(intent.action, CanonicalAction::Retrieve);
+        assert_eq!(intent.operation, CanonicalOperation::Select);
         assert_eq!(intent.column_id, "column-1");
     }
 
@@ -253,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_columns() {
+    fn partial_column_match_refused() {
         let cols = vec![
             ColumnDefinition {
                 id: "column-0".to_string(),
@@ -271,7 +575,7 @@ mod tests {
             },
         ];
         let err = recognize_intent("extract unique floor plan", &cols).unwrap_err();
-        assert!(matches!(err, IntentError::ColumnAmbiguous { .. }));
+        assert!(matches!(err, IntentError::ColumnNotFound { .. }));
     }
 
     #[test]
@@ -279,12 +583,206 @@ mod tests {
         let cols = columns();
         let intent = recognize_intent("Extract all the unique floor plans", &cols).unwrap();
         let ev = &intent.evidence;
-        assert!(ev.prompt_tokens.contains(&"extract".to_string()));
-        assert!(ev.prompt_tokens.contains(&"unique".to_string()));
-        assert!(ev.prompt_tokens.contains(&"floor".to_string()));
-        assert!(ev.prompt_tokens.contains(&"plans".to_string()));
+        let token_texts: Vec<&str> = ev.prompt_tokens.iter().map(|t| t.text.as_str()).collect();
+        assert!(token_texts.contains(&"extract"));
+        assert!(token_texts.contains(&"unique"));
+        assert!(token_texts.contains(&"floor"));
+        assert!(token_texts.contains(&"plans"));
         let mc = ev.matched_column.as_ref().unwrap();
         assert!(mc.score >= 0.5);
         assert!(!mc.evidence.is_empty());
+        assert!(ev.action.is_some());
+        assert!(ev.match_class.is_some());
+        assert!(ev.canonical_operation.is_some());
+    }
+
+    #[test]
+    fn list_income_select_only() {
+        let cols = income_time_columns();
+        let intent = recognize_intent("List income", &cols).unwrap();
+        assert_eq!(intent.action, CanonicalAction::Retrieve);
+        assert_eq!(intent.operation, CanonicalOperation::Select);
+        assert_eq!(intent.column_id, "col-income");
+        assert_eq!(intent.column_display_name, "Income");
+        let mc = intent.evidence.matched_column.as_ref().unwrap();
+        assert!((mc.score - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn list_incomes_terminal_s() {
+        let cols = vec![ColumnDefinition {
+            id: "col-income".to_string(),
+            ordinal: 0,
+            source_header_raw: Some("Income".to_string()),
+            source_header_normalized: Some("income".to_string()),
+            display_name: "Income".to_string(),
+        }];
+        let intent = recognize_intent("List incomes", &cols).unwrap();
+        assert_eq!(intent.action, CanonicalAction::Retrieve);
+        assert_eq!(intent.operation, CanonicalOperation::Select);
+        assert_eq!(intent.column_id, "col-income");
+        let mc = intent.evidence.matched_column.as_ref().unwrap();
+        assert!((mc.score - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn show_time_exact_column() {
+        let cols = income_time_columns();
+        let intent = recognize_intent("Show time", &cols).unwrap();
+        assert_eq!(intent.action, CanonicalAction::Retrieve);
+        assert_eq!(intent.operation, CanonicalOperation::Select);
+        assert_eq!(intent.column_id, "col-time");
+        assert_eq!(intent.column_display_name, "Time");
+    }
+
+    #[test]
+    fn list_show_time_full_column() {
+        let cols = income_time_columns();
+        let intent = recognize_intent("List Show Time", &cols).unwrap();
+        assert_eq!(intent.action, CanonicalAction::Retrieve);
+        assert_eq!(intent.operation, CanonicalOperation::Select);
+        assert_eq!(intent.column_id, "col-show-time");
+        assert_eq!(intent.column_display_name, "Show Time");
+    }
+
+    #[test]
+    fn show_show_time() {
+        let cols = income_time_columns();
+        let intent = recognize_intent("Show Show Time", &cols).unwrap();
+        assert_eq!(intent.action, CanonicalAction::Retrieve);
+        assert_eq!(intent.operation, CanonicalOperation::Select);
+        assert_eq!(intent.column_id, "col-show-time");
+        assert_eq!(intent.column_display_name, "Show Time");
+    }
+
+    #[test]
+    fn show_time_no_partial_match_on_show_time_only() {
+        let cols = vec![ColumnDefinition {
+            id: "col-show-time".to_string(),
+            ordinal: 0,
+            source_header_raw: Some("Show Time".to_string()),
+            source_header_normalized: Some("show time".to_string()),
+            display_name: "Show Time".to_string(),
+        }];
+        let err = recognize_intent("Show time", &cols).unwrap_err();
+        assert!(matches!(err, IntentError::ColumnNotFound { .. }));
+    }
+
+    #[test]
+    fn no_token_role_overlap() {
+        let cols = income_time_columns();
+        let intent = recognize_intent("Show time", &cols).unwrap();
+        let mc = intent.evidence.matched_column.as_ref().unwrap();
+        assert_eq!(mc.evidence, "exact contiguous phrase");
+        let col_phrase = intent.evidence.column_phrase.as_ref().unwrap();
+        assert_eq!(col_phrase.tokens, vec!["time"]);
+        assert_eq!(intent.action, CanonicalAction::Retrieve);
+    }
+
+    #[test]
+    fn words_ending_in_s_not_corrupted() {
+        let cols = vec![ColumnDefinition {
+            id: "col-status".to_string(),
+            ordinal: 0,
+            source_header_raw: Some("Status".to_string()),
+            source_header_normalized: Some("status".to_string()),
+            display_name: "Status".to_string(),
+        }];
+        let intent = recognize_intent("list status", &cols).unwrap();
+        assert_eq!(intent.column_id, "col-status");
+        let mc = intent.evidence.matched_column.as_ref().unwrap();
+        assert!((mc.score - 1.0).abs() < f64::EPSILON);
+        assert_eq!(mc.evidence, "exact contiguous phrase");
+
+        let cols2 = vec![ColumnDefinition {
+            id: "col-address".to_string(),
+            ordinal: 0,
+            source_header_raw: Some("Address".to_string()),
+            source_header_normalized: Some("address".to_string()),
+            display_name: "Address".to_string(),
+        }];
+        let err = recognize_intent("list addresses", &cols2).unwrap_err();
+        assert!(matches!(err, IntentError::ColumnNotFound { .. }));
+    }
+
+    #[test]
+    fn parse_ambiguous_tied_parses() {
+        let cols = vec![
+            ColumnDefinition {
+                id: "col-floor".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Floor".to_string()),
+                source_header_normalized: Some("floor".to_string()),
+                display_name: "Floor".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-floor-2".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("floor".to_string()),
+                source_header_normalized: Some("floor".to_string()),
+                display_name: "floor".to_string(),
+            },
+        ];
+        let err = recognize_intent("list floor", &cols).unwrap_err();
+        assert!(matches!(err, IntentError::ParseAmbiguous { .. }));
+    }
+
+    fn make_intent(operation: CanonicalOperation, column_id: &str) -> RecognizedIntent {
+        RecognizedIntent {
+            action: CanonicalAction::Retrieve,
+            operation,
+            column_id: column_id.to_string(),
+            column_display_name: column_id.to_string(),
+            evidence: RecognitionEvidence {
+                prompt_tokens: Vec::new(),
+                action: None,
+                modifier: None,
+                column_phrase: None,
+                matched_column: None,
+                match_class: None,
+                canonical_operation: None,
+                refusal_reason: None,
+                competing_parses: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn select_only_plan_has_one_step() {
+        let intent = make_intent(CanonicalOperation::Select, "col-0");
+        let plan = compile_intent_to_plan(&intent, "rev-1", "table-0");
+        assert_eq!(plan.steps.len(), 1);
+        assert!(matches!(&plan.steps[0], PlanStep::Select { columns } if columns == &["col-0"]));
+    }
+
+    #[test]
+    fn distinct_plan_has_three_steps() {
+        let intent = make_intent(CanonicalOperation::Distinct, "col-0");
+        let plan = compile_intent_to_plan(&intent, "rev-1", "table-0");
+        assert_eq!(plan.steps.len(), 3);
+        assert!(matches!(&plan.steps[0], PlanStep::Filter { .. }));
+        assert!(matches!(&plan.steps[1], PlanStep::Select { .. }));
+        assert!(matches!(&plan.steps[2], PlanStep::Distinct { .. }));
+    }
+
+    #[test]
+    fn plan_source_uses_provided_revision_and_table() {
+        let intent = make_intent(CanonicalOperation::Select, "col-0");
+        let plan = compile_intent_to_plan(&intent, "rev-abc", "table-9");
+        assert_eq!(plan.source.revision, "rev-abc");
+        assert_eq!(plan.source.table_id, "table-9");
+    }
+
+    #[test]
+    fn select_plan_preserves_blanks() {
+        let intent = make_intent(CanonicalOperation::Select, "col-0");
+        let plan = compile_intent_to_plan(&intent, "rev-1", "table-0");
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|s| matches!(s, PlanStep::Filter { .. })),
+            "select-only plan must not contain a filter step"
+        );
     }
 }

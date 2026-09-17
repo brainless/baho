@@ -13,13 +13,13 @@ use baho_model::candidate::TableCandidate;
 use baho_model::diagnostic::{Diagnostic, Severity};
 use baho_model::document::Value;
 use baho_model::materialized::MaterializedView;
-use baho_plan::plan::{DistinctKeep, Expression, Plan, PlanSource, PlanStep};
+use baho_plan::plan::Plan;
 use baho_plan::validation::{validate_plan_references, validate_plan_structure};
 use serde::{Deserialize, Serialize};
 
 use crate::candidate_selection::select_candidate;
 use crate::error::CoreError;
-use crate::intent::{RecognizedIntent, recognize_intent};
+use crate::intent::{RecognizedIntent, compile_intent_to_plan, recognize_intent};
 
 /// The outcome of a pipeline run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,7 +347,7 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
                     crate::error::IntentError::Unsupported(_) => "intent.unsupported",
                     crate::error::IntentError::ColumnNotFound { .. } => "intent.column_not_found",
                     crate::error::IntentError::ColumnAmbiguous { .. } => "intent.column_ambiguous",
-                    crate::error::IntentError::NoOperation => "intent.unsupported",
+                    crate::error::IntentError::ParseAmbiguous { .. } => "intent.parse_ambiguous",
                 }
                 .to_string(),
                 severity: Severity::Error,
@@ -365,6 +365,7 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
         "intent_recognized",
         "intent",
         serde_json::json!({
+            "action": intent.action,
             "operation": intent.operation,
             "column_id": intent.column_id,
             "score": intent.evidence.matched_column.as_ref().map(|m| m.score),
@@ -373,27 +374,7 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
     result.intent = Some(intent.clone());
 
     // Step 8: Build plan
-    let plan = Plan {
-        schema_version: 1,
-        source: PlanSource {
-            revision: source_revision.clone(),
-            table_id: selected.id.clone(),
-        },
-        steps: vec![
-            PlanStep::Filter {
-                predicate: Expression::IsNotBlank {
-                    column: intent.column_id.clone(),
-                },
-            },
-            PlanStep::Select {
-                columns: vec![intent.column_id.clone()],
-            },
-            PlanStep::Distinct {
-                columns: vec![intent.column_id.clone()],
-                keep: DistinctKeep::First,
-            },
-        ],
-    };
+    let plan = compile_intent_to_plan(&intent, &source_revision, &selected.id);
 
     // Step 9: Validate plan
     if let Err(e) = validate_plan_structure(&plan) {
@@ -504,6 +485,7 @@ fn push_event(events: &mut Vec<CoreEvent>, name: &str, stage: &str, fields: serd
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baho_plan::plan::PlanStep;
     use std::io::Write;
 
     fn write_temp_csv(content: &str) -> tempfile::NamedTempFile {
@@ -537,7 +519,10 @@ Total,4 items,approximate,extra,notes,more
 
         // Intent resolved to Floor Plan
         let intent = result.intent.as_ref().unwrap();
-        assert_eq!(intent.operation, "distinct");
+        assert_eq!(
+            intent.operation,
+            crate::intent::CanonicalOperation::Distinct
+        );
         let matched = intent.evidence.matched_column.as_ref().unwrap();
         assert!(matched.display_name.to_lowercase().contains("floor plan"));
 
@@ -952,5 +937,193 @@ Total,4 items,approximate,extra,notes,more
         assert_eq!(result.diagnostics.len(), 1);
         assert_eq!(result.diagnostics[0].code, "csv.dialect_ambiguous");
         assert_eq!(result.diagnostics[0].stage, "ingest-csv");
+    }
+
+    #[test]
+    fn select_only_preserves_blanks_and_duplicates() {
+        let csv = "\
+ID,Income
+1,50000
+2,
+3,60000
+4,50000
+5,
+6,70000
+";
+        let file = write_temp_csv(csv);
+        let result = run_pipeline(file.path(), "List income");
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+
+        // Plan has exactly 1 step: Select only (no Filter, no Distinct)
+        let plan = result.plan.as_ref().unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        assert!(matches!(plan.steps[0], PlanStep::Select { .. }));
+
+        // Intent resolved as select-only
+        let intent = result.intent.as_ref().unwrap();
+        assert_eq!(intent.operation, crate::intent::CanonicalOperation::Select);
+        assert_eq!(intent.column_display_name, "Income");
+
+        // Output has 6 rows including blanks and duplicates
+        let output = result.output.as_ref().unwrap();
+        assert_eq!(output.rows.len(), 6);
+
+        // Values: 50000, blank, 60000, 50000, blank, 70000
+        let values: Vec<Option<&str>> = output
+            .rows
+            .iter()
+            .map(|r| match r.values.first().unwrap() {
+                Some(Value::Text(s)) => Some(s.as_str()),
+                Some(Value::Blank) => None,
+                _ => panic!("expected text or blank"),
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                Some("50000"),
+                None,
+                Some("60000"),
+                Some("50000"),
+                None,
+                Some("70000")
+            ]
+        );
+
+        // Source order is maintained
+        assert_eq!(output.provenance[0].source_row, 1);
+        assert_eq!(output.provenance[1].source_row, 2);
+        assert_eq!(output.provenance[2].source_row, 3);
+        assert_eq!(output.provenance[3].source_row, 4);
+        assert_eq!(output.provenance[4].source_row, 5);
+        assert_eq!(output.provenance[5].source_row, 6);
+
+        // Provenance points to the Income column (col 1)
+        assert!(
+            output
+                .provenance
+                .iter()
+                .all(|p| { p.source_addresses.len() == 1 && p.source_addresses[0].col == 1 })
+        );
+    }
+
+    #[test]
+    fn collision_show_time_selects_exact_time_column() {
+        let csv = "\
+ID,Time,Show Time
+1,9:00,10:00
+2,11:00,12:00
+3,14:00,15:00
+";
+        let file = write_temp_csv(csv);
+
+        // "Show time" → action show, exact column Time
+        let result = run_pipeline(file.path(), "Show time");
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        let intent = result.intent.as_ref().unwrap();
+        assert_eq!(intent.column_display_name, "Time");
+        assert_eq!(intent.column_id, "column-1");
+
+        // Output is the Time column values
+        let output = result.output.as_ref().unwrap();
+        assert_eq!(output.rows.len(), 3);
+        let values: Vec<&str> = output
+            .rows
+            .iter()
+            .map(|r| match r.values.first().unwrap().as_ref().unwrap() {
+                Value::Text(s) => s.as_str(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert_eq!(values, vec!["9:00", "11:00", "14:00"]);
+    }
+
+    #[test]
+    fn collision_list_show_time_selects_show_time_column() {
+        let csv = "\
+ID,Time,Show Time
+1,9:00,10:00
+2,11:00,12:00
+3,14:00,15:00
+";
+        let file = write_temp_csv(csv);
+
+        // "List Show Time" → action list, exact column Show Time
+        let result = run_pipeline(file.path(), "List Show Time");
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        let intent = result.intent.as_ref().unwrap();
+        assert_eq!(intent.column_display_name, "Show Time");
+        assert_eq!(intent.column_id, "column-2");
+
+        let output = result.output.as_ref().unwrap();
+        assert_eq!(output.rows.len(), 3);
+        let values: Vec<&str> = output
+            .rows
+            .iter()
+            .map(|r| match r.values.first().unwrap().as_ref().unwrap() {
+                Value::Text(s) => s.as_str(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert_eq!(values, vec!["10:00", "12:00", "15:00"]);
+    }
+
+    #[test]
+    fn terminal_s_variant_in_pipeline() {
+        let csv = "\
+ID,Income
+1,50000
+2,60000
+3,70000
+";
+        let file = write_temp_csv(csv);
+
+        // "List incomes" → recognizes Income through terminal-s variant
+        let result = run_pipeline(file.path(), "List incomes");
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+
+        let intent = result.intent.as_ref().unwrap();
+        assert_eq!(intent.operation, crate::intent::CanonicalOperation::Select);
+        assert_eq!(intent.column_display_name, "Income");
+
+        let plan = result.plan.as_ref().unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        assert!(matches!(plan.steps[0], PlanStep::Select { .. }));
+
+        let output = result.output.as_ref().unwrap();
+        assert_eq!(output.rows.len(), 3);
+        let values: Vec<&str> = output
+            .rows
+            .iter()
+            .map(|r| match r.values.first().unwrap().as_ref().unwrap() {
+                Value::Text(s) => s.as_str(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert_eq!(values, vec!["50000", "60000", "70000"]);
+    }
+
+    #[test]
+    fn parse_ambiguous_diagnostic_produces_failure() {
+        // Two columns with the same normalized display name cause a tie
+        let csv = "\
+floor,Floor
+1,A
+2,B
+3,C
+";
+        let file = write_temp_csv(csv);
+        let result = run_pipeline(file.path(), "list floor");
+
+        assert_eq!(result.outcome, CoreOutcome::Failed);
+        assert!(result.output.is_none());
+
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "intent.parse_ambiguous")
+            .expect("expected parse_ambiguous diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
     }
 }

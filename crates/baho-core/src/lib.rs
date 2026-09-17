@@ -13,5 +13,7 @@ pub mod orchestration;
 pub use baho_ingest_csv::{CandidateConfig, ParserConfig};
 pub use candidate_selection::select_candidate;
 pub use error::{CoreError, IntentError};
-pub use intent::{RecognizedIntent, recognize_intent};
+pub use intent::{
+    CanonicalAction, CanonicalOperation, RecognizedIntent, compile_intent_to_plan, recognize_intent,
+};
 pub use orchestration::{CoreEvent, CoreOutcome, CoreResult, run_pipeline};

@@ -158,7 +158,7 @@ fn run_records_the_request_and_input_identity() {
 
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    assert_eq!(plan["schema_version"], 1);
+    assert_eq!(plan["schema_version"], 2);
     assert_eq!(plan["plan"]["schema_version"], 1);
 
     assert_eq!(
@@ -274,4 +274,53 @@ fn runs_latest_reports_the_greatest_run_without_creating_one() {
         ".baho/runs/000002\n"
     );
     assert!(!workspace.path().join(".baho/runs/000003").exists());
+}
+
+#[test]
+fn select_only_run_writes_correct_plan() {
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = workspace.path().join("sample.csv");
+    fs::write(&input, "ID,Name\n1,Ada\n2,Bob\n3,Carol\n").expect("write input");
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List name",
+        ])
+        .output()
+        .expect("run baho");
+
+    assert!(output.status.success(), "{output:?}");
+
+    let run = workspace.path().join(".baho/runs/000001");
+
+    // Plan artifact has schema_version 2
+    let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
+        .expect("valid plan JSON");
+    assert_eq!(plan["schema_version"], 2);
+
+    // Plan has exactly 1 step (select only)
+    let steps = plan["plan"]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["op"], "select");
+
+    // Recognition evidence has canonical_operation: "select"
+    let evidence = &plan["recognition_evidence"];
+    assert_eq!(evidence["canonical_operation"], "select");
+
+    // Output is materialized
+    let result: Value =
+        serde_json::from_slice(&fs::read(run.join("output/result.json")).expect("read result"))
+            .expect("valid result JSON");
+    assert_eq!(result["schema_version"], 2);
+    let rows = result["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+
+    // Stdout has the values
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines, vec!["Ada", "Bob", "Carol"]);
 }
