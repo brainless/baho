@@ -49,7 +49,8 @@ struct CandidatesArtifact<'a> {
 #[derive(Debug, Serialize)]
 struct PlanArtifact<'a> {
     schema_version: u32,
-    plan: &'a Plan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<&'a Plan>,
     recognition_evidence: Option<&'a RecognitionEvidence>,
 }
 
@@ -352,11 +353,11 @@ fn record_reserved(
             )?;
             manifest.artifacts.push("candidates.json".to_owned());
 
-            if let Some(ref plan) = core_result.plan {
+            if let Some(intent_evidence) = core_result.intent_evidence.as_ref() {
                 let plan_artifact = PlanArtifact {
                     schema_version: PLAN_ARTIFACT_SCHEMA_VERSION,
-                    plan,
-                    recognition_evidence: core_result.intent.as_ref().map(|i| &i.evidence),
+                    plan: core_result.plan.as_ref(),
+                    recognition_evidence: Some(intent_evidence),
                 };
                 write_json(&run_path.join("plan.json"), &plan_artifact)?;
                 manifest.artifacts.push("plan.json".to_owned());

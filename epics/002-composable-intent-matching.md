@@ -202,8 +202,18 @@ may be considered later with explicit precedence rules.
 
 When more than one complete candidate parse remains within the configured ambiguity
 margin, recognition emits `intent.parse_ambiguous` and does not materialize a result.
-When one column span maps equally to multiple columns, the existing
-`intent.column_ambiguous` behavior remains appropriate.
+When one column span maps equally to multiple columns — multiple headers share the
+same normalized label that a single prompt phrase matches — recognition emits
+`intent.column_ambiguous` instead, listing the matched column display names in
+deterministic order. The two cases are distinguished structurally: tying candidates
+that share a column span and resolve different columns are column ambiguity, while
+tying candidates with distinct spans or modifier/column assignments are parse
+ambiguity. For example, two `floor`/`Floor` headers produce `intent.column_ambiguous`
+for `list floor`, whereas `list unique income` with columns `Unique Income` and
+`Income` produces `intent.parse_ambiguous` because the prompt phrase can be read
+either as a distinct modifier plus `Income` or as the whole `Unique Income` column.
+This distinction does not affect the collision table: `Show time`, `List Show Time`,
+and `Show Show Time` each resolve to a single unambiguous parse as documented above.
 
 ## Scope
 

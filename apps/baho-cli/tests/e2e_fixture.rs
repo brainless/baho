@@ -183,6 +183,43 @@ fn unsupported_intent_returns_failure() {
         fs::read_to_string(run.join("intent.txt")).expect("read intent"),
         "Calculate the average floor plan size"
     );
+
+    // Refusal persists bounded recognition evidence in plan.json with no plan.
+    let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
+        .expect("valid plan JSON");
+    assert_eq!(plan["schema_version"], 2);
+    assert!(
+        plan.get("plan").is_none(),
+        "refusal must not write a nested plan, got {:?}",
+        plan.get("plan")
+    );
+    let evidence = &plan["recognition_evidence"];
+    assert_eq!(evidence["refusal_reason"], "intent.unsupported");
+    assert_eq!(
+        evidence["competing_parses"].as_array().unwrap().len(),
+        0,
+        "unsupported must not carry competing parses"
+    );
+    assert!(evidence["canonical_operation"].is_null());
+    assert!(evidence["matched_column"].is_null());
+    assert!(
+        evidence["prompt_tokens"].as_array().is_some(),
+        "refusal evidence must retain bounded prompt tokens"
+    );
+
+    // No misleading materialized output on refusal.
+    assert!(
+        !run.join("output/result.json").exists(),
+        "refusal must not write output/result.json"
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(run.join("manifest.json")).expect("read manifest"))
+            .expect("valid manifest JSON");
+    let artifacts = manifest["artifacts"].as_array().unwrap();
+    assert!(
+        !artifacts.iter().any(|a| a == "output/result.json"),
+        "artifact index must not list output/result.json"
+    );
 }
 
 #[test]
@@ -221,4 +258,74 @@ fn column_not_found_returns_failure() {
         diag_codes.contains(&"intent.column_not_found"),
         "expected column_not_found diagnostic, got: {diag_codes:?}"
     );
+
+    let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
+        .expect("valid plan JSON");
+    let evidence = &plan["recognition_evidence"];
+    assert_eq!(evidence["refusal_reason"], "intent.column_not_found");
+    assert!(
+        plan.get("plan").is_none(),
+        "column_not_found refusal must not write a nested plan"
+    );
+    assert!(!run.join("output/result.json").exists());
+}
+
+#[test]
+fn ambiguous_parse_writes_competing_parse_evidence() {
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = workspace.path().join("sample.csv");
+    fs::write(&input, "Unique Income,Income\n1000,10\n2000,20\n3000,30\n").expect("write input");
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "list unique income",
+        ])
+        .output()
+        .expect("run baho");
+
+    assert!(!output.status.success(), "expected failure: {output:?}");
+
+    let run = workspace.path().join(".baho/runs/000001");
+    let diagnostics: Value =
+        serde_json::from_slice(&fs::read(run.join("diagnostics.json")).expect("read diagnostics"))
+            .expect("valid diagnostics JSON");
+    let diag_codes: Vec<&str> = diagnostics["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["code"].as_str().unwrap())
+        .collect();
+    assert!(
+        diag_codes.contains(&"intent.parse_ambiguous"),
+        "expected parse_ambiguous diagnostic, got: {diag_codes:?}"
+    );
+
+    let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
+        .expect("valid plan JSON");
+    let evidence = &plan["recognition_evidence"];
+    assert_eq!(evidence["refusal_reason"], "intent.parse_ambiguous");
+    let competing = evidence["competing_parses"].as_array().unwrap();
+    let rows: Vec<(String, f64)> = competing
+        .iter()
+        .map(|c| {
+            (
+                c["column_display_name"].as_str().unwrap().to_owned(),
+                c["score"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert!(
+        rows.contains(&("Unique Income".to_string(), 1.0)),
+        "competing parses must include Unique Income: {rows:?}"
+    );
+    assert!(
+        rows.contains(&("Income".to_string(), 1.0)),
+        "competing parses must include Income: {rows:?}"
+    );
+    assert!(plan.get("plan").is_none());
+    assert!(!run.join("output/result.json").exists());
 }

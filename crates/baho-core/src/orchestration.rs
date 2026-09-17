@@ -13,6 +13,7 @@ use baho_model::candidate::TableCandidate;
 use baho_model::diagnostic::{Diagnostic, Severity};
 use baho_model::document::Value;
 use baho_model::materialized::MaterializedView;
+use baho_plan::evidence::RecognitionEvidence;
 use baho_plan::plan::Plan;
 use baho_plan::validation::{validate_plan_references, validate_plan_structure};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,7 @@ pub struct CoreResult {
     pub selected_candidate: Option<TableCandidate>,
     pub intent: Option<RecognizedIntent>,
     pub plan: Option<Plan>,
+    pub intent_evidence: Option<RecognitionEvidence>,
     pub output: Option<MaterializedView>,
     pub diagnostics: Vec<Diagnostic>,
     pub events: Vec<CoreEvent>,
@@ -61,6 +63,7 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
         selected_candidate: None,
         intent: None,
         plan: None,
+        intent_evidence: None,
         output: None,
         diagnostics: Vec::new(),
         events: Vec::new(),
@@ -342,9 +345,10 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
     let intent = match recognize_intent(prompt, &columns) {
         Ok(i) => i,
         Err(e) => {
+            result.intent_evidence = recognition_evidence_of(&e);
             result.diagnostics.push(Diagnostic {
                 code: match &e {
-                    crate::error::IntentError::Unsupported(_) => "intent.unsupported",
+                    crate::error::IntentError::Unsupported(_, _) => "intent.unsupported",
                     crate::error::IntentError::ColumnNotFound { .. } => "intent.column_not_found",
                     crate::error::IntentError::ColumnAmbiguous { .. } => "intent.column_ambiguous",
                     crate::error::IntentError::ParseAmbiguous { .. } => "intent.parse_ambiguous",
@@ -372,6 +376,7 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
         }),
     );
     result.intent = Some(intent.clone());
+    result.intent_evidence = Some(intent.evidence.clone());
 
     // Step 8: Build plan
     let plan = compile_intent_to_plan(&intent, &source_revision, &selected.id);
@@ -480,6 +485,15 @@ fn push_event(events: &mut Vec<CoreEvent>, name: &str, stage: &str, fields: serd
         stage: stage.to_string(),
         fields,
     });
+}
+
+fn recognition_evidence_of(error: &crate::error::IntentError) -> Option<RecognitionEvidence> {
+    match error {
+        crate::error::IntentError::Unsupported(_, evidence) => evidence.clone(),
+        crate::error::IntentError::ColumnNotFound { evidence, .. } => evidence.clone(),
+        crate::error::IntentError::ColumnAmbiguous { evidence, .. } => evidence.clone(),
+        crate::error::IntentError::ParseAmbiguous { evidence, .. } => evidence.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -1105,8 +1119,9 @@ ID,Income
     }
 
     #[test]
-    fn parse_ambiguous_diagnostic_produces_failure() {
-        // Two columns with the same normalized display name cause a tie
+    fn column_ambiguous_diagnostic_produces_failure() {
+        // Two columns with the same normalized header cause a single column
+        // span to map equally to multiple columns.
         let csv = "\
 floor,Floor
 1,A
@@ -1122,8 +1137,86 @@ floor,Floor
         let diagnostic = result
             .diagnostics
             .iter()
+            .find(|d| d.code == "intent.column_ambiguous")
+            .expect("expected column_ambiguous diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+
+        let evidence = result
+            .intent_evidence
+            .as_ref()
+            .expect("column_ambiguous must surface refusal evidence");
+        assert_eq!(
+            evidence.refusal_reason.as_deref(),
+            Some("intent.column_ambiguous")
+        );
+        let rows: Vec<(&str, f64)> = evidence
+            .competing_parses
+            .iter()
+            .map(|c| (c.column_display_name.as_str(), c.score))
+            .collect();
+        assert!(
+            rows.contains(&("floor", 1.0)),
+            "competing parses must include both matched headers: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ambiguous_diagnostic_produces_failure() {
+        // "unique" can be read as the distinct modifier (span "income" ->
+        // Income) or as the first word of the "Unique Income" header
+        // (span "unique income"). Both parses score equally, so the tie is
+        // between distinct complete parses, not between columns sharing a
+        // header.
+        let csv = "\
+Unique Income,Income
+1000,10
+2000,20
+3000,30
+";
+        let file = write_temp_csv(csv);
+        let result = run_pipeline(file.path(), "list unique income");
+
+        assert_eq!(result.outcome, CoreOutcome::Failed);
+        assert!(result.output.is_none());
+
+        let diagnostic = result
+            .diagnostics
+            .iter()
             .find(|d| d.code == "intent.parse_ambiguous")
             .expect("expected parse_ambiguous diagnostic");
         assert_eq!(diagnostic.severity, Severity::Error);
+
+        let evidence = result
+            .intent_evidence
+            .as_ref()
+            .expect("parse_ambiguous must surface refusal evidence");
+        assert_eq!(
+            evidence.refusal_reason.as_deref(),
+            Some("intent.parse_ambiguous")
+        );
+        assert_eq!(evidence.competing_parses.len(), 2);
+    }
+
+    #[test]
+    fn intent_evidence_surfaced_on_success() {
+        let csv = "\
+ID,Name
+1,Ada
+2,Bob
+3,Carol
+";
+        let file = write_temp_csv(csv);
+        let result = run_pipeline(file.path(), "List name");
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        let evidence = result
+            .intent_evidence
+            .as_ref()
+            .expect("success must surface recognition evidence");
+        assert_eq!(evidence.refusal_reason, None);
+        assert_eq!(evidence.canonical_operation.as_deref(), Some("select"));
+        assert!(
+            evidence.matched_column.as_ref().is_some(),
+            "success evidence must carry the matched column"
+        );
     }
 }

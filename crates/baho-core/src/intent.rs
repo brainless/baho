@@ -1,9 +1,11 @@
 use baho_model::column::ColumnDefinition;
 use baho_plan::evidence::{
-    ActionEvidence, ColumnPhraseEvidence, MatchedColumn, ModifierEvidence, PromptToken,
-    RecognitionEvidence,
+    ActionEvidence, ColumnPhraseEvidence, CompetingParseEvidence, MatchedColumn, ModifierEvidence,
+    PromptToken, RecognitionEvidence,
 };
 use baho_plan::plan::{DistinctKeep, Expression, Plan, PlanSource, PlanStep};
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::IntentError;
@@ -196,6 +198,56 @@ fn build_candidate_parses(
     candidates
 }
 
+/// When several tied candidates share one column span, that single prompt
+/// phrase resolves equally to multiple columns and is a column-level
+/// ambiguity; otherwise the tie is between distinct parses.
+fn column_ambiguous_candidates(tied: &[&CandidateParse]) -> Option<Vec<String>> {
+    let ambiguous_span = ambiguous_span(tied)?;
+
+    // tied is already sorted by score desc then column id, so filtering
+    // preserves deterministic ordering of the matched columns.
+    let mut candidates: Vec<String> = tied
+        .iter()
+        .filter(|c| c.column_span == ambiguous_span)
+        .map(|c| c.column.display_name.clone())
+        .collect();
+    candidates.dedup();
+    Some(candidates)
+}
+
+/// The single column span shared by a tying group that resolves to more than
+/// one distinct column, if any.
+fn ambiguous_span(tied: &[&CandidateParse]) -> Option<(usize, usize)> {
+    let mut by_span: HashMap<(usize, usize), Vec<&&CandidateParse>> = HashMap::new();
+    for c in tied {
+        by_span.entry(c.column_span).or_default().push(c);
+    }
+
+    by_span.iter().find_map(|(span, group)| {
+        let mut ids: Vec<&str> = group.iter().map(|c| c.column.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() > 1 { Some(*span) } else { None }
+    })
+}
+
+/// Deterministically ordered bounded evidence for a set of tied candidates.
+fn competing_parse_evidence(tied: &[&CandidateParse]) -> Vec<CompetingParseEvidence> {
+    let mut seen: Vec<(String, f64)> = Vec::new();
+    for c in tied {
+        let entry = (c.column.display_name.clone(), c.score);
+        if !seen.contains(&entry) {
+            seen.push(entry);
+        }
+    }
+    seen.into_iter()
+        .map(|(column_display_name, score)| CompetingParseEvidence {
+            column_display_name,
+            score,
+        })
+        .collect()
+}
+
 fn normalize_for_match(s: &str) -> String {
     let trimmed = s.trim().to_lowercase();
     let mut result = String::with_capacity(trimmed.len());
@@ -234,7 +286,20 @@ pub fn recognize_intent(
         .collect();
 
     if raw_tokens.is_empty() {
-        return Err(IntentError::Unsupported("empty prompt".to_string()));
+        return Err(IntentError::Unsupported(
+            "empty prompt".to_string(),
+            Some(RecognitionEvidence {
+                prompt_tokens: Vec::new(),
+                action: None,
+                modifier: None,
+                column_phrase: None,
+                matched_column: None,
+                match_class: None,
+                canonical_operation: None,
+                refusal_reason: Some("intent.unsupported".to_string()),
+                competing_parses: Vec::new(),
+            }),
+        ));
     }
 
     let mut offset = 0;
@@ -261,10 +326,20 @@ pub fn recognize_intent(
         .collect();
 
     if resolve_action(&indexed_tokens[0].text).is_none() {
-        return Err(IntentError::Unsupported(format!(
-            "expected action verb, got '{}'",
-            indexed_tokens[0].text
-        )));
+        return Err(IntentError::Unsupported(
+            format!("expected action verb, got '{}'", indexed_tokens[0].text),
+            Some(RecognitionEvidence {
+                prompt_tokens: prompt_token_evidence,
+                action: None,
+                modifier: None,
+                column_phrase: None,
+                matched_column: None,
+                match_class: None,
+                canonical_operation: None,
+                refusal_reason: Some("intent.unsupported".to_string()),
+                competing_parses: Vec::new(),
+            }),
+        ));
     }
 
     let action_evidence = Some(ActionEvidence {
@@ -299,7 +374,23 @@ pub fn recognize_intent(
             .map(|t| t.text.as_str())
             .collect::<Vec<_>>()
             .join(" ");
-        return Err(IntentError::ColumnNotFound { prompt_term: term });
+        return Err(IntentError::ColumnNotFound {
+            prompt_term: term,
+            evidence: Some(RecognitionEvidence {
+                prompt_tokens: prompt_token_evidence,
+                action: Some(ActionEvidence {
+                    alias: indexed_tokens[0].text.clone(),
+                    span: (0, 1),
+                }),
+                modifier: None,
+                column_phrase: None,
+                matched_column: None,
+                match_class: None,
+                canonical_operation: None,
+                refusal_reason: Some("intent.column_not_found".to_string()),
+                competing_parses: Vec::new(),
+            }),
+        });
     }
 
     let mut sorted = candidates;
@@ -317,6 +408,26 @@ pub fn recognize_intent(
         .collect();
 
     if tied.len() > 1 {
+        let competing_parses = competing_parse_evidence(&tied);
+        if let Some(candidates) = column_ambiguous_candidates(&tied) {
+            return Err(IntentError::ColumnAmbiguous {
+                candidates,
+                evidence: Some(RecognitionEvidence {
+                    prompt_tokens: prompt_token_evidence,
+                    action: Some(ActionEvidence {
+                        alias: indexed_tokens[0].text.clone(),
+                        span: (0, 1),
+                    }),
+                    modifier: None,
+                    column_phrase: None,
+                    matched_column: None,
+                    match_class: None,
+                    canonical_operation: None,
+                    refusal_reason: Some("intent.column_ambiguous".to_string()),
+                    competing_parses,
+                }),
+            });
+        }
         let candidate_descs: Vec<String> = tied
             .iter()
             .map(|c| {
@@ -330,6 +441,20 @@ pub fn recognize_intent(
             .collect();
         return Err(IntentError::ParseAmbiguous {
             candidates: candidate_descs,
+            evidence: Some(RecognitionEvidence {
+                prompt_tokens: prompt_token_evidence,
+                action: Some(ActionEvidence {
+                    alias: indexed_tokens[0].text.clone(),
+                    span: (0, 1),
+                }),
+                modifier: None,
+                column_phrase: None,
+                matched_column: None,
+                match_class: None,
+                canonical_operation: None,
+                refusal_reason: Some("intent.parse_ambiguous".to_string()),
+                competing_parses,
+            }),
         });
     }
 
@@ -553,7 +678,7 @@ mod tests {
     fn unsupported_intent() {
         let cols = columns();
         let err = recognize_intent("do something random", &cols).unwrap_err();
-        assert!(matches!(err, IntentError::Unsupported(_)));
+        assert!(matches!(err, IntentError::Unsupported(_, _)));
     }
 
     #[test]
@@ -706,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_ambiguous_tied_parses() {
+    fn single_span_matching_duplicate_headers_is_column_ambiguous() {
         let cols = vec![
             ColumnDefinition {
                 id: "col-floor".to_string(),
@@ -724,6 +849,73 @@ mod tests {
             },
         ];
         let err = recognize_intent("list floor", &cols).unwrap_err();
+        assert!(matches!(
+            err,
+            IntentError::ColumnAmbiguous { ref candidates, .. }
+                if candidates == &vec!["Floor".to_string(), "floor".to_string()]
+        ));
+    }
+
+    #[test]
+    fn single_span_matching_three_duplicate_headers_lists_them_deterministically() {
+        let cols = vec![
+            ColumnDefinition {
+                id: "col-b".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("status".to_string()),
+                source_header_normalized: Some("status".to_string()),
+                display_name: "status".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-a".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Status".to_string()),
+                source_header_normalized: Some("status".to_string()),
+                display_name: "Status".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-c".to_string(),
+                ordinal: 2,
+                source_header_raw: Some("STATUS".to_string()),
+                source_header_normalized: Some("status".to_string()),
+                display_name: "STATUS".to_string(),
+            },
+        ];
+        let err = recognize_intent("list status", &cols).unwrap_err();
+        match err {
+            IntentError::ColumnAmbiguous { candidates, .. } => {
+                assert_eq!(candidates.len(), 3);
+                assert!(candidates.contains(&"Status".to_string()));
+                assert!(candidates.contains(&"status".to_string()));
+                assert!(candidates.contains(&"STATUS".to_string()));
+            }
+            other => panic!("expected ColumnAmbiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ambiguous_distinct_parses_tied() {
+        let cols = vec![
+            ColumnDefinition {
+                id: "col-unique-income".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Unique Income".to_string()),
+                source_header_normalized: Some("unique income".to_string()),
+                display_name: "Unique Income".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-income".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("Income".to_string()),
+                source_header_normalized: Some("income".to_string()),
+                display_name: "Income".to_string(),
+            },
+        ];
+        // "list unique income" yields two distinct 1.0 parses: select of
+        // "Unique Income" (span "unique income") and distinct of "Income"
+        // (span "income"). These are different parses, not one span mapping to
+        // multiple columns, so this is parse ambiguity.
+        let err = recognize_intent("list unique income", &cols).unwrap_err();
         assert!(matches!(err, IntentError::ParseAmbiguous { .. }));
     }
 
@@ -784,5 +976,131 @@ mod tests {
                 .any(|s| matches!(s, PlanStep::Filter { .. })),
             "select-only plan must not contain a filter step"
         );
+    }
+
+    fn as_refusal(
+        evidence: &RecognitionEvidence,
+    ) -> (&Option<String>, &Vec<CompetingParseEvidence>) {
+        (&evidence.refusal_reason, &evidence.competing_parses)
+    }
+
+    #[test]
+    fn refusal_evidence_present_on_all_error_variants() {
+        let cols = income_time_columns();
+
+        let err = recognize_intent("do something", &cols).unwrap_err();
+        match err {
+            IntentError::Unsupported(_, evidence) => {
+                let ev = evidence.expect("unsupported must carry evidence");
+                let (reason, competing) = as_refusal(&ev);
+                assert_eq!(reason.as_deref(), Some("intent.unsupported"));
+                assert!(competing.is_empty());
+                assert_eq!(ev.prompt_tokens.len(), 2);
+                assert!(ev.action.is_none());
+                assert!(ev.matched_column.is_none());
+                assert!(ev.canonical_operation.is_none());
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+
+        let no_match_cols = vec![ColumnDefinition {
+            id: "col-show-time".to_string(),
+            ordinal: 0,
+            source_header_raw: Some("Show Time".to_string()),
+            source_header_normalized: Some("show time".to_string()),
+            display_name: "Show Time".to_string(),
+        }];
+        let err = recognize_intent("Show time", &no_match_cols).unwrap_err();
+        match err {
+            IntentError::ColumnNotFound { evidence, .. } => {
+                let ev = evidence.expect("column_not_found must carry evidence");
+                let (reason, competing) = as_refusal(&ev);
+                assert_eq!(reason.as_deref(), Some("intent.column_not_found"));
+                assert!(competing.is_empty());
+                assert!(ev.matched_column.is_none());
+                assert!(ev.action.is_some());
+            }
+            other => panic!("expected ColumnNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn column_ambiguous_refusal_has_competing_parses() {
+        let cols = vec![
+            ColumnDefinition {
+                id: "col-floor".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Floor".to_string()),
+                source_header_normalized: Some("floor".to_string()),
+                display_name: "Floor".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-floor-2".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("floor".to_string()),
+                source_header_normalized: Some("floor".to_string()),
+                display_name: "floor".to_string(),
+            },
+        ];
+        let err = recognize_intent("list floor", &cols).unwrap_err();
+        match err {
+            IntentError::ColumnAmbiguous { evidence, .. } => {
+                let ev = evidence.expect("column_ambiguous must carry evidence");
+                let (reason, competing) = as_refusal(&ev);
+                assert_eq!(reason.as_deref(), Some("intent.column_ambiguous"));
+                let rows: Vec<(&str, f64)> = competing
+                    .iter()
+                    .map(|c| (c.column_display_name.as_str(), c.score))
+                    .collect();
+                assert_eq!(
+                    rows,
+                    vec![("Floor", 1.0), ("floor", 1.0)],
+                    "competing parses must be deterministic and include scores"
+                );
+                assert!(ev.matched_column.is_none());
+                assert!(ev.canonical_operation.is_none());
+            }
+            other => panic!("expected ColumnAmbiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ambiguous_refusal_has_competing_parses() {
+        let cols = vec![
+            ColumnDefinition {
+                id: "col-unique-income".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Unique Income".to_string()),
+                source_header_normalized: Some("unique income".to_string()),
+                display_name: "Unique Income".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-income".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("Income".to_string()),
+                source_header_normalized: Some("income".to_string()),
+                display_name: "Income".to_string(),
+            },
+        ];
+        let err = recognize_intent("list unique income", &cols).unwrap_err();
+        match err {
+            IntentError::ParseAmbiguous { evidence, .. } => {
+                let ev = evidence.expect("parse_ambiguous must carry evidence");
+                let (reason, competing) = as_refusal(&ev);
+                assert_eq!(reason.as_deref(), Some("intent.parse_ambiguous"));
+                let rows: Vec<(&str, f64)> = competing
+                    .iter()
+                    .map(|c| (c.column_display_name.as_str(), c.score))
+                    .collect();
+                assert_eq!(
+                    rows,
+                    vec![("Income", 1.0), ("Unique Income", 1.0)],
+                    "competing parses must be deterministic and include scores"
+                );
+                assert!(ev.matched_column.is_none());
+                assert!(ev.canonical_operation.is_none());
+            }
+            other => panic!("expected ParseAmbiguous, got {other:?}"),
+        }
     }
 }
