@@ -1,0 +1,19 @@
+[package]
+name = "baho-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+baho-model = { path = "../baho-model" }
+baho-ingest = { path = "../baho-ingest" }
+baho-ingest-csv = { path = "../baho-ingest-csv" }
+baho-plan = { path = "../baho-plan" }
+baho-exec = { path = "../baho-exec" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3"

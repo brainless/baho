@@ -19,8 +19,11 @@ fn main() -> ExitCode {
             output,
         } => match run_record::record(input, prompt, output, arguments) {
             Ok(run) => {
-                eprintln!("Run {} recorded at {}", run.id, run.path.display());
-                eprintln!("The request was captured; CSV processing is not implemented yet.");
+                if run.materialized {
+                    eprintln!("Run {} materialized at {}", run.id, run.path.display());
+                } else {
+                    eprintln!("Run {} recorded at {}", run.id, run.path.display());
+                }
                 ExitCode::SUCCESS
             }
             Err(failure) => {

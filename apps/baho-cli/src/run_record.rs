@@ -7,8 +7,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use baho_core::CoreOutcome;
+use baho_model::document::Value;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -19,6 +21,7 @@ const RUN_ID_WIDTH: usize = 6;
 pub(crate) struct RecordedRun {
     pub(crate) id: String,
     pub(crate) path: PathBuf,
+    pub(crate) materialized: bool,
 }
 
 #[derive(Debug)]
@@ -47,6 +50,7 @@ struct Manifest {
 #[serde(rename_all = "snake_case")]
 enum Outcome {
     Running,
+    Materialized,
     Recorded,
     Error,
 }
@@ -119,10 +123,10 @@ impl EventLog {
 
     fn write(
         &mut self,
-        level: &'static str,
-        stage: &'static str,
-        event: &'static str,
-        fields: BTreeMap<String, Value>,
+        level: &str,
+        stage: &str,
+        event: &str,
+        fields: BTreeMap<String, JsonValue>,
     ) -> Result<()> {
         #[derive(Serialize)]
         struct Event<'a> {
@@ -131,7 +135,7 @@ impl EventLog {
             target: &'static str,
             stage: &'a str,
             event: &'a str,
-            fields: BTreeMap<String, Value>,
+            fields: BTreeMap<String, JsonValue>,
         }
 
         serde_json::to_writer(
@@ -168,10 +172,6 @@ pub(crate) fn record(
         Err(error) => return Err(RecordFailure { run: None, error }),
     };
     let relative_run_path = PathBuf::from(format!(".baho/runs/{id}"));
-    let recorded_run = RecordedRun {
-        id: id.clone(),
-        path: relative_run_path,
-    };
 
     let result = record_reserved(
         &absolute_run_path,
@@ -184,9 +184,17 @@ pub(crate) fn record(
     );
 
     match result {
-        Ok(()) => Ok(recorded_run),
+        Ok(materialized) => Ok(RecordedRun {
+            id: id.clone(),
+            path: relative_run_path,
+            materialized,
+        }),
         Err(error) => Err(RecordFailure {
-            run: Some(recorded_run),
+            run: Some(RecordedRun {
+                id: id.clone(),
+                path: relative_run_path,
+                materialized: false,
+            }),
             error,
         }),
     }
@@ -200,7 +208,7 @@ fn record_reserved(
     prompt: &str,
     output: Option<&Path>,
     arguments: Vec<String>,
-) -> Result<()> {
+) -> Result<bool> {
     let started_at = now();
     let timer = Instant::now();
     let manifest_path = run_path.join("manifest.json");
@@ -268,33 +276,102 @@ fn record_reserved(
             )?;
             manifest.input = Some(identity);
 
-            let diagnostics = Diagnostics {
-                schema_version: RUN_SCHEMA_VERSION,
-                diagnostics: vec![Diagnostic {
-                    code: "processing.not_implemented",
-                    severity: "warning",
-                    stage: "processing",
-                    message: "The request was recorded, but CSV processing is not implemented yet."
-                        .to_owned(),
-                }],
-            };
-            write_json(&run_path.join("diagnostics.json"), &diagnostics)?;
-            events.write(
-                "WARN",
-                "processing",
-                "processing_unavailable",
-                BTreeMap::new(),
+            let core_result = baho_core::run_pipeline(&absolute_input, prompt);
+
+            for core_event in &core_result.events {
+                events.write(
+                    "INFO",
+                    &core_event.stage,
+                    &core_event.name,
+                    BTreeMap::from([("fields".to_owned(), core_event.fields.clone())]),
+                )?;
+            }
+
+            if let Some(ref profile) = core_result.input_profile {
+                write_json(&run_path.join("input-profile.json"), profile)?;
+                manifest.artifacts.push("input-profile.json".to_owned());
+            }
+
+            write_json(
+                &run_path.join("candidates.json"),
+                &serde_json::json!({
+                    "candidates": core_result.candidates,
+                    "selected": core_result.selected_candidate,
+                }),
             )?;
+            manifest.artifacts.push("candidates.json".to_owned());
+
+            if let Some(ref plan) = core_result.plan {
+                write_json(&run_path.join("plan.json"), plan)?;
+                manifest.artifacts.push("plan.json".to_owned());
+            }
+
+            if let Some(ref view) = core_result.output {
+                fs::create_dir_all(run_path.join("output"))
+                    .context("could not create output directory")?;
+                write_json(&run_path.join("output/result.json"), view)?;
+                manifest.artifacts.push("output/result.json".to_owned());
+            }
+
+            write_json(
+                &run_path.join("diagnostics.json"),
+                &serde_json::json!({
+                    "schema_version": RUN_SCHEMA_VERSION,
+                    "diagnostics": core_result.diagnostics,
+                }),
+            )?;
+
+            let outcome = match core_result.outcome {
+                CoreOutcome::Materialized => Outcome::Materialized,
+                CoreOutcome::Recorded => Outcome::Recorded,
+                CoreOutcome::Failed => Outcome::Error,
+            };
+
             events.write(
                 "INFO",
                 "run",
                 "run_finished",
-                BTreeMap::from([("outcome".to_owned(), json!("recorded"))]),
+                BTreeMap::from([(
+                    "outcome".to_owned(),
+                    json!(match core_result.outcome {
+                        CoreOutcome::Materialized => "materialized",
+                        CoreOutcome::Recorded => "recorded",
+                        CoreOutcome::Failed => "error",
+                    }),
+                )]),
             )?;
 
-            manifest.outcome = Outcome::Recorded;
+            if matches!(core_result.outcome, CoreOutcome::Materialized) {
+                if let Some(ref view) = core_result.output {
+                    for row in &view.rows {
+                        for value in &row.values {
+                            match value {
+                                Some(Value::Text(s)) => println!("{s}"),
+                                Some(Value::Number(n)) => println!("{n}"),
+                                Some(Value::Boolean(b)) => println!("{b}"),
+                                Some(Value::Blank) | None => println!(""),
+                            }
+                        }
+                    }
+                }
+            }
+
+            manifest.outcome = outcome;
             finish_manifest(&mut manifest, timer);
-            write_json(&manifest_path, &manifest)
+            write_json(&manifest_path, &manifest)?;
+
+            if matches!(core_result.outcome, CoreOutcome::Materialized) {
+                Ok(true)
+            } else {
+                let error_msg = core_result
+                    .diagnostics
+                    .iter()
+                    .filter(|d| matches!(d.severity, baho_model::diagnostic::Severity::Error))
+                    .map(|d| d.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                Err(anyhow!("{}", error_msg))
+            }
         }
         Err(error) => {
             let message = format!("{error:#}");

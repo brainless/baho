@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/baho-cli", "crates/baho-llm"]
+members = ["apps/baho-cli", "crates/baho-core", "crates/baho-exec", "crates/baho-ingest", "crates/baho-ingest-csv", "crates/baho-llm", "crates/baho-model", "crates/baho-plan"]
 resolver = "2"
 
 [workspace.package]
