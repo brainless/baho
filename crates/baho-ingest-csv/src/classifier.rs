@@ -9,6 +9,20 @@ pub fn classify_rows(
     header_row: usize,
     config: &CandidateConfig,
 ) -> Vec<RowClassification> {
+    classify_rows_with_config(
+        features,
+        header_row,
+        config,
+        &crate::config::RowClassificationConfig::default(),
+    )
+}
+
+pub fn classify_rows_with_config(
+    features: &[RowFeatures],
+    header_row: usize,
+    config: &CandidateConfig,
+    row_config: &crate::config::RowClassificationConfig,
+) -> Vec<RowClassification> {
     let mut classifications = Vec::new();
 
     let header_width = features
@@ -42,8 +56,8 @@ pub fn classify_rows(
             header_width - feat.physical_width
         };
 
-        let density_drop = feat.density < 0.3;
-        let width_incompatible = width_diff > 2;
+        let density_drop = feat.density < row_config.min_data_density;
+        let width_incompatible = width_diff > row_config.max_body_width_difference;
 
         if width_incompatible || density_drop {
             consecutive_footer += 1;
@@ -147,6 +161,23 @@ mod tests {
         let cls = classify_rows(&features, 0, &config);
         assert_eq!(cls.len(), 3);
         assert!(cls.iter().all(|c| c.kind == RowKind::Data));
+    }
+
+    #[test]
+    fn configured_density_threshold_controls_classification() {
+        let features = vec![make_features(0, 4, 4, false), make_features(1, 4, 2, false)];
+        let config = CandidateConfig::default();
+        let classifications = classify_rows_with_config(
+            &features,
+            0,
+            &config,
+            &crate::config::RowClassificationConfig {
+                min_data_density: 0.75,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(classifications[0].kind, RowKind::Note);
     }
 
     #[test]

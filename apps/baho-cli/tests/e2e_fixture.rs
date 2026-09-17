@@ -103,12 +103,14 @@ fn extract_unique_floor_plans_from_fixture() {
     let profile: Value =
         serde_json::from_slice(&fs::read(run.join("input-profile.json")).expect("read profile"))
             .expect("valid profile JSON");
-    assert!(profile["encoding"].as_str().is_some());
-    assert!(profile["logical_record_count"].as_u64().unwrap() > 0);
+    assert_eq!(profile["schema_version"], 1);
+    assert!(profile["profile"]["encoding"].as_str().is_some());
+    assert!(profile["profile"]["logical_record_count"].as_u64().unwrap() > 0);
 
     let candidates: Value =
         serde_json::from_slice(&fs::read(run.join("candidates.json")).expect("read candidates"))
             .expect("valid candidates JSON");
+    assert_eq!(candidates["schema_version"], 1);
     assert!(
         candidates["candidates"].as_array().unwrap().len() >= 1,
         "expected at least one candidate"
@@ -116,6 +118,7 @@ fn extract_unique_floor_plans_from_fixture() {
 
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
+    assert_eq!(plan["schema_version"], 1);
     let steps = plan["plan"]["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 3);
     assert_eq!(steps[0]["op"], "filter");
@@ -135,7 +138,8 @@ fn extract_unique_floor_plans_from_fixture() {
     let result: Value =
         serde_json::from_slice(&fs::read(run.join("output/result.json")).expect("read result"))
             .expect("valid result JSON");
-    let rows = result["rows"].as_array().unwrap();
+    assert_eq!(result["schema_version"], 2);
+    let rows = result["result"]["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 3);
 }
 

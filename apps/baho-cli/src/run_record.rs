@@ -8,14 +8,56 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use baho_core::CoreOutcome;
+use baho_model::candidate::TableCandidate;
 use baho_model::document::Value;
+use baho_model::materialized::MaterializedView;
+use baho_plan::{evidence::RecognitionEvidence, plan::Plan};
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const RUN_SCHEMA_VERSION: u32 = 1;
+const INPUT_PROFILE_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+const CANDIDATES_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+const PLAN_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+const MATERIALIZED_RESULT_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 const RUN_ID_WIDTH: usize = 6;
+
+#[derive(Debug, Serialize)]
+struct InputProfileArtifact<T> {
+    schema_version: u32,
+    profile: T,
+}
+
+impl<T> InputProfileArtifact<T> {
+    fn new(profile: T) -> Self {
+        Self {
+            schema_version: INPUT_PROFILE_ARTIFACT_SCHEMA_VERSION,
+            profile,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CandidatesArtifact<'a> {
+    schema_version: u32,
+    candidates: &'a [TableCandidate],
+    selected: Option<&'a TableCandidate>,
+}
+
+#[derive(Debug, Serialize)]
+struct PlanArtifact<'a> {
+    schema_version: u32,
+    plan: &'a Plan,
+    recognition_evidence: Option<&'a RecognitionEvidence>,
+}
+
+#[derive(Debug, Serialize)]
+struct MaterializedResultArtifact<'a> {
+    schema_version: u32,
+    result: &'a MaterializedView,
+}
 
 #[derive(Debug)]
 pub(crate) struct RecordedRun {
@@ -288,7 +330,10 @@ fn record_reserved(
             }
 
             if let Some(ref profile) = core_result.input_profile {
-                write_json(&run_path.join("input-profile.json"), profile)?;
+                write_json(
+                    &run_path.join("input-profile.json"),
+                    &InputProfileArtifact::new(profile),
+                )?;
                 manifest.artifacts.push("input-profile.json".to_owned());
             }
 
@@ -299,18 +344,20 @@ fn record_reserved(
 
             write_json(
                 &run_path.join("candidates.json"),
-                &serde_json::json!({
-                    "candidates": core_result.candidates,
-                    "selected": core_result.selected_candidate,
-                }),
+                &CandidatesArtifact {
+                    schema_version: CANDIDATES_ARTIFACT_SCHEMA_VERSION,
+                    candidates: &core_result.candidates,
+                    selected: core_result.selected_candidate.as_ref(),
+                },
             )?;
             manifest.artifacts.push("candidates.json".to_owned());
 
             if let Some(ref plan) = core_result.plan {
-                let plan_artifact = serde_json::json!({
-                    "plan": plan,
-                    "recognition_evidence": core_result.intent.as_ref().map(|i| &i.evidence),
-                });
+                let plan_artifact = PlanArtifact {
+                    schema_version: PLAN_ARTIFACT_SCHEMA_VERSION,
+                    plan,
+                    recognition_evidence: core_result.intent.as_ref().map(|i| &i.evidence),
+                };
                 write_json(&run_path.join("plan.json"), &plan_artifact)?;
                 manifest.artifacts.push("plan.json".to_owned());
             }
@@ -318,7 +365,13 @@ fn record_reserved(
             if let Some(ref view) = core_result.output {
                 fs::create_dir_all(run_path.join("output"))
                     .context("could not create output directory")?;
-                write_json(&run_path.join("output/result.json"), view)?;
+                write_json(
+                    &run_path.join("output/result.json"),
+                    &MaterializedResultArtifact {
+                        schema_version: MATERIALIZED_RESULT_ARTIFACT_SCHEMA_VERSION,
+                        result: view,
+                    },
+                )?;
                 manifest.artifacts.push("output/result.json".to_owned());
             }
 

@@ -9,12 +9,12 @@ use crate::row_features::{ColumnShape, RowFeatures};
 /// Configuration for candidate detection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CandidateConfig {
-    pub schema_version: u32,
     pub min_body_rows: usize,
     pub min_header_density: f64,
     pub max_header_to_body_gap: usize,
     pub blank_gap_lookahead: usize,
     pub footer_lookahead: usize,
+    pub max_body_width_difference: usize,
     pub min_score_threshold: f64,
     pub ambiguity_margin: f64,
 }
@@ -22,12 +22,12 @@ pub struct CandidateConfig {
 impl Default for CandidateConfig {
     fn default() -> Self {
         Self {
-            schema_version: 1,
             min_body_rows: 1,
             min_header_density: 0.5,
             max_header_to_body_gap: 5,
             blank_gap_lookahead: 10,
             footer_lookahead: 10,
+            max_body_width_difference: 2,
             min_score_threshold: 0.3,
             ambiguity_margin: 0.1,
         }
@@ -42,7 +42,11 @@ fn is_header_like(feature: &RowFeatures, config: &CandidateConfig) -> bool {
             .all(|s| matches!(s, ColumnShape::Text | ColumnShape::Blank))
 }
 
-fn is_body_compatible(header_width: usize, feature: &RowFeatures) -> bool {
+fn is_body_compatible(
+    header_width: usize,
+    feature: &RowFeatures,
+    config: &CandidateConfig,
+) -> bool {
     if feature.is_blank {
         return false;
     }
@@ -51,7 +55,7 @@ fn is_body_compatible(header_width: usize, feature: &RowFeatures) -> bool {
     } else {
         header_width - feature.physical_width
     };
-    width_diff <= 2
+    width_diff <= config.max_body_width_difference
 }
 
 fn score_candidate(
@@ -59,6 +63,7 @@ fn score_candidate(
     body_rows: &[usize],
     features: &[RowFeatures],
     _records: &[LogicalRecord],
+    scoring: &crate::config::CandidateScoringConfig,
 ) -> CandidateScore {
     let header = &features[header_idx];
     let _header_width = header.physical_width;
@@ -129,12 +134,13 @@ fn score_candidate(
     let first_nonblank = features.iter().position(|f| !f.is_blank).unwrap_or(0);
     let header_position = 1.0 / (1.0 + header_idx.saturating_sub(first_nonblank) as f64);
 
-    let total = 0.22 * header_density
-        + 0.10 * body_width_stability
-        + 0.10 * body_shape_consistency
-        + 0.10 * header_body_distance
-        + 0.32 * body_row_count
-        + 0.16 * header_position;
+    let weights = &scoring.weights;
+    let total = weights.header_density * header_density
+        + weights.body_width_stability * body_width_stability
+        + weights.body_shape_consistency * body_shape_consistency
+        + weights.header_body_distance * header_body_distance
+        + weights.body_row_count * body_row_count
+        + weights.header_position * header_position;
 
     CandidateScore {
         total,
@@ -195,9 +201,11 @@ fn find_body_rows(
     let mut consecutive_incompatible = 0usize;
 
     let start = header_idx + 1;
+    let mut rows_since_header = 0usize;
 
     for i in start..features.len() {
         let feat = &features[i];
+        rows_since_header += 1;
 
         if feat.is_blank {
             blank_count += 1;
@@ -207,7 +215,10 @@ fn find_body_rows(
             continue;
         }
 
-        if is_body_compatible(header_width, feat) {
+        if is_body_compatible(header_width, feat, config) {
+            if body_rows.is_empty() && rows_since_header > config.max_header_to_body_gap + 1 {
+                break;
+            }
             body_rows.push(i);
             blank_count = 0;
             consecutive_incompatible = 0;
@@ -228,6 +239,24 @@ pub fn detect_candidates(
     features: &[RowFeatures],
     config: &CandidateConfig,
 ) -> Vec<TableCandidate> {
+    detect_candidates_with_config(
+        records,
+        features,
+        config,
+        &crate::config::CandidateScoringConfig::default(),
+        &crate::config::CandidateOrderingConfig::default(),
+    )
+}
+
+/// Detect candidates using the scoring weights and deterministic ordering
+/// recorded for this parsing run.
+pub fn detect_candidates_with_config(
+    records: &[LogicalRecord],
+    features: &[RowFeatures],
+    config: &CandidateConfig,
+    scoring: &crate::config::CandidateScoringConfig,
+    ordering: &crate::config::CandidateOrderingConfig,
+) -> Vec<TableCandidate> {
     let mut candidates = Vec::new();
 
     for (idx, feat) in features.iter().enumerate() {
@@ -241,7 +270,7 @@ pub fn detect_candidates(
             continue;
         }
 
-        let score = score_candidate(idx, &body_rows, features, records);
+        let score = score_candidate(idx, &body_rows, features, records, scoring);
 
         let last_body = *body_rows.last().unwrap();
         let max_col = feat.physical_width.saturating_sub(1);
@@ -266,13 +295,18 @@ pub fn detect_candidates(
         });
     }
 
-    candidates.sort_by(|a, b| {
-        b.score
-            .total
-            .partial_cmp(&a.score.total)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.region.header_row.cmp(&b.region.header_row))
-    });
+    match (ordering.primary, ordering.tie_breaker) {
+        (
+            crate::config::CandidatePrimaryOrder::ScoreDescending,
+            crate::config::CandidateTieBreaker::SourceOrder,
+        ) => candidates.sort_by(|a, b| {
+            b.score
+                .total
+                .partial_cmp(&a.score.total)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.region.header_row.cmp(&b.region.header_row))
+        }),
+    }
 
     candidates.retain(|c| c.score.total >= config.min_score_threshold);
 
@@ -383,6 +417,35 @@ mod tests {
         for i in 0..candidates.len().saturating_sub(1) {
             assert!(candidates[i].score.total >= candidates[i + 1].score.total);
         }
+    }
+
+    #[test]
+    fn configured_score_weights_determine_the_total() {
+        let records = vec![
+            make_record(0, &["Name", "Value"]),
+            make_record(1, &["Ada", "42"]),
+        ];
+        let features = features_from_records(&records);
+        let config = CandidateConfig::default();
+        let scoring = crate::config::CandidateScoringConfig {
+            weights: crate::config::CandidateScoreWeights {
+                header_density: 1.0,
+                body_width_stability: 0.0,
+                body_shape_consistency: 0.0,
+                header_body_distance: 0.0,
+                body_row_count: 0.0,
+                header_position: 0.0,
+            },
+        };
+        let candidates = detect_candidates_with_config(
+            &records,
+            &features,
+            &config,
+            &scoring,
+            &crate::config::CandidateOrderingConfig::default(),
+        );
+
+        assert_eq!(candidates[0].score.total, 1.0);
     }
 
     #[test]

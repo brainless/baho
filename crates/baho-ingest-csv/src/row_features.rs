@@ -22,39 +22,25 @@ pub struct RowFeatures {
     pub similarity_to_prev: Option<f64>,
 }
 
-fn is_blank_value(s: &str) -> bool {
-    s.trim().is_empty()
-}
-
-fn normalize_token(s: &str) -> String {
-    let trimmed = s.trim();
-    let mut result = String::with_capacity(trimmed.len());
-    let mut prev_was_space = false;
-    for ch in trimmed.chars() {
-        if ch.is_whitespace() {
-            if !prev_was_space {
-                result.push(' ');
-            }
-            prev_was_space = true;
-        } else {
-            result.push(ch);
-            prev_was_space = false;
-        }
-    }
-    result
-}
-
+#[cfg(test)]
 fn classify_column(values: &[&str]) -> ColumnShape {
+    classify_column_with_config(values, &crate::config::NormalizationConfig::default())
+}
+
+fn classify_column_with_config(
+    values: &[&str],
+    normalization: &crate::config::NormalizationConfig,
+) -> ColumnShape {
     let nonblank: Vec<&str> = values
         .iter()
         .copied()
-        .filter(|v| !is_blank_value(v))
+        .filter(|v| !normalization.is_blank(v))
         .collect();
     if nonblank.is_empty() {
         return ColumnShape::Blank;
     }
-    let all_numeric = nonblank.iter().all(|v| v.trim().parse::<f64>().is_ok());
-    let all_text = nonblank.iter().all(|v| v.trim().parse::<f64>().is_err());
+    let all_numeric = nonblank.iter().all(|v| normalization.is_numeric(v));
+    let all_text = nonblank.iter().all(|v| !normalization.is_numeric(v));
     if all_numeric {
         ColumnShape::Numeric
     } else if all_text {
@@ -87,6 +73,13 @@ fn similarity(a: &[u8], b: &[u8]) -> f64 {
 
 /// Compute features for each logical record.
 pub fn compute_row_features(records: &[LogicalRecord]) -> Vec<RowFeatures> {
+    compute_row_features_with_config(records, &crate::config::NormalizationConfig::default())
+}
+
+pub fn compute_row_features_with_config(
+    records: &[LogicalRecord],
+    normalization: &crate::config::NormalizationConfig,
+) -> Vec<RowFeatures> {
     if records.is_empty() {
         return Vec::new();
     }
@@ -102,7 +95,7 @@ pub fn compute_row_features(records: &[LogicalRecord]) -> Vec<RowFeatures> {
 
     let _column_shapes: Vec<ColumnShape> = column_values
         .iter()
-        .map(|vals| classify_column(vals))
+        .map(|vals| classify_column_with_config(vals, normalization))
         .collect();
 
     let mut prev_signature: Option<Vec<u8>> = None;
@@ -111,7 +104,11 @@ pub fn compute_row_features(records: &[LogicalRecord]) -> Vec<RowFeatures> {
         .iter()
         .map(|rec| {
             let physical_width = rec.fields.len();
-            let nonblank_count = rec.fields.iter().filter(|f| !is_blank_value(f)).count();
+            let nonblank_count = rec
+                .fields
+                .iter()
+                .filter(|f| !normalization.is_blank(f))
+                .count();
             let density = if physical_width == 0 {
                 0.0
             } else {
@@ -121,12 +118,15 @@ pub fn compute_row_features(records: &[LogicalRecord]) -> Vec<RowFeatures> {
             let row_shapes: Vec<ColumnShape> = (0..physical_width)
                 .map(|col| {
                     let vals: Vec<&str> = vec![rec.fields[col].as_str()];
-                    classify_column(&vals)
+                    classify_column_with_config(&vals, normalization)
                 })
                 .collect();
 
-            let normalized_tokens: Vec<String> =
-                rec.fields.iter().map(|f| normalize_token(f)).collect();
+            let normalized_tokens: Vec<String> = rec
+                .fields
+                .iter()
+                .map(|f| normalization.normalize_feature(f))
+                .collect();
 
             let sig = shape_signature(&row_shapes);
             let similarity_to_prev = prev_signature.as_ref().map(|prev| similarity(prev, &sig));
@@ -152,7 +152,8 @@ mod tests {
 
     fn make_record(index: usize, fields: &[&str]) -> LogicalRecord {
         let fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-        let is_blank = fields.iter().all(|f| is_blank_value(f));
+        let normalization = crate::config::NormalizationConfig::default();
+        let is_blank = fields.iter().all(|f| normalization.is_blank(f));
         LogicalRecord {
             index,
             fields,

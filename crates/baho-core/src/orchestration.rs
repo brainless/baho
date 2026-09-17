@@ -3,12 +3,12 @@ use std::path::Path;
 use baho_exec::executor::{ExecutionResult, GridInput, execute_plan};
 use baho_ingest::InspectOptions;
 use baho_ingest::profile::InputProfile;
-use baho_ingest::traits::FormatImporter;
-use baho_ingest_csv::CsvImporter;
-use baho_ingest_csv::candidates::CandidateConfig;
-use baho_ingest_csv::classify_rows;
-use baho_ingest_csv::header::build_header;
-use baho_ingest_csv::row_features::compute_row_features;
+use baho_ingest_csv::header::build_header_with_config;
+use baho_ingest_csv::row_features::compute_row_features_with_config;
+use baho_ingest_csv::{
+    CsvImporter, DialectDetectionError, ParserConfig, SelectedRegionError,
+    detect_candidates_with_config, read_selected_region,
+};
 use baho_model::candidate::TableCandidate;
 use baho_model::diagnostic::{Diagnostic, Severity};
 use baho_model::document::Value;
@@ -41,7 +41,7 @@ pub struct CoreEvent {
 #[derive(Debug)]
 pub struct CoreResult {
     pub input_profile: Option<InputProfile>,
-    pub parser_config: Option<CandidateConfig>,
+    pub parser_config: Option<ParserConfig>,
     pub candidates: Vec<TableCandidate>,
     pub selected_candidate: Option<TableCandidate>,
     pub intent: Option<RecognizedIntent>,
@@ -70,7 +70,26 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
     // Step 1: Import
     let importer = CsvImporter;
     let options = InspectOptions::default();
-    let imported = match importer.import(path, &options) {
+    let parser_config = match ParserConfig::detect(path, options) {
+        Ok(config) => config,
+        Err(error) => {
+            result.diagnostics.push(Diagnostic {
+                code: match &error {
+                    DialectDetectionError::Ambiguous { .. } => "csv.dialect_ambiguous",
+                    DialectDetectionError::Io { .. } => "core.import_failed",
+                }
+                .to_string(),
+                severity: Severity::Error,
+                stage: "ingest-csv".to_string(),
+                message: error.to_string(),
+                location: None,
+            });
+            result.outcome = CoreOutcome::Failed;
+            return result;
+        }
+    };
+    result.parser_config = Some(parser_config.clone());
+    let imported = match importer.import_with_config(path, &parser_config) {
         Ok(doc) => doc,
         Err(e) => {
             result.diagnostics.push(Diagnostic {
@@ -85,20 +104,21 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
         }
     };
 
-    result.input_profile = Some(imported.input_profile.clone());
-    result.diagnostics.extend(imported.diagnostics.clone());
+    result.input_profile = Some(imported.input_profile);
+    result.diagnostics.extend(imported.diagnostics);
+    let input_profile = result.input_profile.as_ref().unwrap();
     push_event(
         &mut result.events,
         "input_profiled",
         "ingest",
         serde_json::json!({
-            "encoding": imported.input_profile.encoding,
-            "record_count": imported.input_profile.logical_record_count,
+            "encoding": input_profile.encoding,
+            "record_count": input_profile.logical_record_count,
         }),
     );
 
-    let doc = &imported.document;
-    let sheet = match doc.sheets.first() {
+    let source_revision = imported.document.source.content_hash;
+    let sheet = match imported.document.sheets.into_iter().next() {
         Some(s) => s,
         None => {
             result.diagnostics.push(Diagnostic {
@@ -112,23 +132,40 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
             return result;
         }
     };
+    let source_sheet_index = sheet.index;
 
-    // Step 2: Compute row features
+    // Step 2: Move the bounded analysis rows into CSV records. Moving the
+    // strings avoids retaining both a sampled Document and a duplicate record
+    // collection throughout the rest of the pipeline.
     let logical_records: Vec<baho_ingest_csv::inspector::LogicalRecord> = sheet
         .rows
-        .iter()
-        .map(|r| baho_ingest_csv::inspector::LogicalRecord {
-            index: r.index,
-            fields: r.cells.iter().map(|c| c.raw_text.clone()).collect(),
-            is_blank: r.cells.iter().all(|c| c.raw_text.trim().is_empty()),
+        .into_iter()
+        .map(|r| {
+            let fields = r
+                .cells
+                .into_iter()
+                .map(|cell| cell.raw_text)
+                .collect::<Vec<_>>();
+            let is_blank = fields
+                .iter()
+                .all(|field| parser_config.normalization.is_blank(field));
+            baho_ingest_csv::inspector::LogicalRecord {
+                index: r.index,
+                fields,
+                is_blank,
+            }
         })
         .collect();
-    let features = compute_row_features(&logical_records);
+    let features = compute_row_features_with_config(&logical_records, &parser_config.normalization);
 
     // Step 3: Detect candidates
-    let candidate_config = CandidateConfig::default();
-    let candidates =
-        baho_ingest_csv::detect_candidates(&logical_records, &features, &candidate_config);
+    let candidates = detect_candidates_with_config(
+        &logical_records,
+        &features,
+        &parser_config.candidate_detection,
+        &parser_config.candidate_scoring,
+        &parser_config.candidate_ordering,
+    );
     result.candidates = candidates.clone();
     push_event(
         &mut result.events,
@@ -140,7 +177,7 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
     );
 
     // Step 4: Select candidate
-    let selected = match select_candidate(&candidates, &candidate_config) {
+    let mut selected = match select_candidate(&candidates, &parser_config.candidate_detection) {
         Ok(c) => c.clone(),
         Err(CoreError::NoTableFound) => {
             result.diagnostics.push(Diagnostic {
@@ -192,7 +229,12 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
     let header_idx = selected.region.header_row.unwrap_or(0);
     let header_record = &logical_records[header_idx];
     let header_feature = &features[header_idx];
-    let (header_decision, header_diag) = build_header(header_feature, header_record, 0);
+    let (header_decision, header_diag) = build_header_with_config(
+        header_feature,
+        header_record,
+        source_sheet_index,
+        &parser_config.normalization,
+    );
     result.diagnostics.extend(header_diag);
     push_event(
         &mut result.events,
@@ -205,23 +247,61 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
     );
 
     // Step 6: Classify body rows
-    let classifications = classify_rows(&features, header_idx, &candidate_config);
-    let data_row_indices: Vec<usize> = classifications
+    let selected_region = match read_selected_region(
+        path,
+        header_feature.physical_width,
+        selected.region.body_start_row,
+        &parser_config,
+    ) {
+        Ok(region) => region,
+        Err(error) => {
+            let (code, stage, location) = match &error {
+                SelectedRegionError::FieldTooLarge { row, col, .. } => (
+                    "csv.field_too_large",
+                    "ingest-csv",
+                    Some(baho_model::diagnostic::DiagnosticLocation {
+                        row: Some(*row),
+                        col: Some(*col),
+                        cell: None,
+                    }),
+                ),
+                SelectedRegionError::MalformedRecord { row, .. } => (
+                    "csv.malformed_record",
+                    "ingest-csv",
+                    Some(baho_model::diagnostic::DiagnosticLocation {
+                        row: Some(*row),
+                        col: None,
+                        cell: None,
+                    }),
+                ),
+                SelectedRegionError::Io { .. } => ("core.materialize_region_failed", "core", None),
+            };
+            result.diagnostics.push(Diagnostic {
+                code: code.to_string(),
+                severity: Severity::Error,
+                stage: stage.to_string(),
+                message: error.to_string(),
+                location,
+            });
+            result.outcome = CoreOutcome::Failed;
+            return result;
+        }
+    };
+    selected.region.body_end_row = selected_region.body_end_row;
+    let data_row_indices: Vec<usize> = selected_region
+        .data_records
         .iter()
-        .filter(|c| {
-            matches!(c.kind, baho_model::candidate::RowKind::Data)
-                && c.source_row >= selected.region.body_start_row
-                && c.source_row <= selected.region.body_end_row
-        })
-        .map(|c| c.source_row)
+        .map(|record| record.index)
         .collect();
+    let classifications = &selected_region.classifications;
     push_event(
         &mut result.events,
         "body_rows_classified",
         "classify",
         serde_json::json!({
             "data_rows": data_row_indices.len(),
-            "total_classified": classifications.len(),
+            "total_classified": selected_region.classification_count,
+            "classification_evidence_retained": classifications.len(),
         }),
     );
 
@@ -230,15 +310,16 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
     for candidate in result.candidates.iter_mut() {
         if candidate.id == selected_id {
             candidate.header = header_decision.clone();
+            candidate.region.body_end_row = selected.region.body_end_row;
             candidate.body_row_classifications = classifications.clone();
             candidate.selected = true;
         }
     }
     if let Some(ref mut sel) = result.selected_candidate {
         sel.header = header_decision.clone();
+        sel.region.body_end_row = selected.region.body_end_row;
         sel.body_row_classifications = classifications.clone();
     }
-    result.parser_config = Some(candidate_config.clone());
 
     // Build column definitions from header
     let columns: Vec<baho_model::column::ColumnDefinition> = header_decision
@@ -295,7 +376,7 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
     let plan = Plan {
         schema_version: 1,
         source: PlanSource {
-            revision: doc.source.content_hash.clone(),
+            revision: source_revision.clone(),
             table_id: selected.id.clone(),
         },
         steps: vec![
@@ -352,17 +433,17 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
     result.plan = Some(plan.clone());
 
     // Step 10: Build GridInput from the selected candidate's data rows
-    let grid_rows: Vec<Vec<Option<Value>>> = data_row_indices
+    let data_rows = selected_region.data_records;
+    let grid_rows: Vec<Vec<Option<Value>>> = data_rows
         .iter()
-        .map(|&row_idx| {
-            let row = &sheet.rows[row_idx];
+        .map(|row| {
             (0..columns.len())
                 .map(|col| {
-                    row.cells.get(col).map(|cell| {
-                        if cell.raw_text.trim().is_empty() {
+                    row.fields.get(col).map(|raw_text| {
+                        if parser_config.normalization.is_blank(raw_text) {
                             Value::Blank
                         } else {
-                            Value::Text(cell.raw_text.clone())
+                            Value::Text(raw_text.clone())
                         }
                     })
                 })
@@ -372,10 +453,11 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
 
     let grid = GridInput {
         table_id: selected.id.clone(),
-        source_revision: doc.source.content_hash.clone(),
+        source_revision,
+        source_sheet_index,
         columns: columns.clone(),
         rows: grid_rows,
-        source_rows: data_row_indices.clone(),
+        source_rows: data_rows.iter().map(|row| row.index).collect(),
     };
 
     // Step 11: Execute plan
@@ -478,6 +560,11 @@ Total,4 items,approximate,extra,notes,more
             })
             .collect();
         assert_eq!(values, vec!["Type A", "Type B", "Type C"]);
+        assert!(output.provenance.iter().all(|provenance| {
+            provenance.source_addresses.len() == 1
+                && provenance.source_addresses[0].sheet_index == 0
+                && provenance.source_addresses[0].col == 1
+        }));
 
         // Events in correct order
         let event_names: Vec<&str> = result.events.iter().map(|e| e.name.as_str()).collect();
@@ -520,6 +607,124 @@ Total,4 items,approximate,extra,notes,more
         assert!(idx_selected < idx_intent);
         assert!(idx_intent < idx_plan);
         assert!(idx_plan < idx_materialized);
+    }
+
+    #[test]
+    fn all_text_table_with_five_body_rows_materializes() {
+        let csv = "\
+Name,City
+Ada,London
+Bob,Paris
+Eve,Berlin
+Lin,Taipei
+Sam,Lagos
+";
+        let file = write_temp_csv(csv);
+        let result = run_pipeline(file.path(), "Extract all the unique names");
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        let selected = result.selected_candidate.as_ref().unwrap();
+        assert_eq!(selected.region.header_row, Some(0));
+        assert_eq!(selected.region.body_end_row, 5);
+
+        let values = result
+            .output
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| match row.values.first().unwrap().as_ref().unwrap() {
+                Value::Text(value) => value.as_str(),
+                _ => panic!("expected text"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["Ada", "Bob", "Eve", "Lin", "Sam"]);
+    }
+
+    #[test]
+    fn large_input_retains_bounded_evidence_and_selected_region_provenance() {
+        let mut csv = String::from("Name,Code\n");
+        for index in 0..1_500 {
+            let code = if index == 1_200 {
+                "C"
+            } else if index % 2 == 0 {
+                "A"
+            } else {
+                "B"
+            };
+            csv.push_str(&format!("person-{index},{code}\n"));
+        }
+        let file = write_temp_csv(&csv);
+        let result = run_pipeline(file.path(), "Extract all the unique codes");
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        assert_eq!(
+            result.input_profile.as_ref().unwrap().logical_record_count,
+            Some(1_501)
+        );
+        let selected = result.selected_candidate.as_ref().unwrap();
+        assert_eq!(selected.region.body_end_row, 1_500);
+        assert_eq!(
+            selected.body_row_classifications.len(),
+            InspectOptions::default().max_sample_records
+        );
+
+        let output = result.output.as_ref().unwrap();
+        let values = output
+            .rows
+            .iter()
+            .map(|row| match row.values[0].as_ref().unwrap() {
+                Value::Text(value) => value.as_str(),
+                _ => panic!("expected text"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["A", "B", "C"]);
+        assert_eq!(output.provenance[0].source_addresses[0].row, 1);
+        assert_eq!(output.provenance[0].source_addresses[0].col, 1);
+        assert_eq!(output.provenance[1].source_addresses[0].row, 2);
+        assert_eq!(output.provenance[2].source_addresses[0].row, 1_201);
+    }
+
+    #[test]
+    fn oversized_field_in_selected_region_fails_without_output() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "Name,Code").unwrap();
+        for (name, code) in [
+            ("Ada", "A"),
+            ("Bob", "B"),
+            ("Eve", "C"),
+            ("Lin", "D"),
+            ("Sam", "E"),
+        ] {
+            writeln!(file, "{name},{code}").unwrap();
+        }
+        writeln!(
+            file,
+            "Oversized,{}",
+            "x".repeat(InspectOptions::default().max_field_size + 1)
+        )
+        .unwrap();
+
+        let result = run_pipeline(file.path(), "Extract all the unique codes");
+
+        assert_eq!(result.outcome, CoreOutcome::Failed);
+        assert!(result.output.is_none());
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "csv.field_too_large" && diagnostic.severity == Severity::Error
+            })
+            .expect("selected-region limit violation should be an error");
+        let location = diagnostic.location.as_ref().unwrap();
+        assert_eq!(location.row, Some(6));
+        assert_eq!(location.col, Some(1));
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|event| event.name == "materialization_completed")
+        );
     }
 
     #[test]
@@ -709,5 +914,43 @@ Total,4 items,approximate,extra,notes,more
             floor_plan_cell.is_some(),
             "header must contain normalized 'Floor Plan' cell"
         );
+    }
+
+    #[test]
+    fn pipeline_uses_content_detected_semicolon_dialect() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("misnamed.csv");
+        std::fs::write(
+            &path,
+            "ID;Code;Comment\n1;A;\"comma, inside\"\n2;B;plain\n3;A;other\n4;C;last\n",
+        )
+        .unwrap();
+
+        let result = run_pipeline(&path, "Extract all the unique codes");
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        assert_eq!(
+            result.parser_config.as_ref().unwrap().dialect.delimiter,
+            b';'
+        );
+        assert_eq!(
+            result.input_profile.as_ref().unwrap().detected_delimiter,
+            Some(';')
+        );
+    }
+
+    #[test]
+    fn pipeline_refuses_ambiguous_dialect_with_stable_diagnostic() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mixed");
+        std::fs::write(&path, "A,B;C\n1,2;3\n4,5;6\n").unwrap();
+
+        let result = run_pipeline(&path, "Extract all the unique values");
+
+        assert_eq!(result.outcome, CoreOutcome::Failed);
+        assert!(result.output.is_none());
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code, "csv.dialect_ambiguous");
+        assert_eq!(result.diagnostics[0].stage, "ingest-csv");
     }
 }

@@ -10,24 +10,7 @@ use crate::row_features::RowFeatures;
 /// (including embedded newlines) to a single space, and returns an
 /// empty string for blank cells.
 pub fn normalize_header_cell(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let mut result = String::with_capacity(trimmed.len());
-    let mut prev_was_space = false;
-    for ch in trimmed.chars() {
-        if ch.is_whitespace() {
-            if !prev_was_space {
-                result.push(' ');
-            }
-            prev_was_space = true;
-        } else {
-            result.push(ch);
-            prev_was_space = false;
-        }
-    }
-    result
+    crate::config::NormalizationConfig::default().normalize_header(raw)
 }
 
 /// Build a header decision from a row.
@@ -36,11 +19,25 @@ pub fn build_header(
     record: &LogicalRecord,
     _sheet_index: usize,
 ) -> (HeaderDecision, Vec<Diagnostic>) {
+    build_header_with_config(
+        _row,
+        record,
+        _sheet_index,
+        &crate::config::NormalizationConfig::default(),
+    )
+}
+
+pub fn build_header_with_config(
+    _row: &RowFeatures,
+    record: &LogicalRecord,
+    _sheet_index: usize,
+    normalization: &crate::config::NormalizationConfig,
+) -> (HeaderDecision, Vec<Diagnostic>) {
     let mut cells = Vec::new();
     let mut diagnostics = Vec::new();
 
     for (col, field) in record.fields.iter().enumerate() {
-        let normalized = normalize_header_cell(field);
+        let normalized = normalization.normalize_header(field);
         let column_id = format!("column-{}", col);
 
         if normalized.is_empty() {

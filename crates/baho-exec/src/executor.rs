@@ -12,6 +12,7 @@ use crate::error::ExecutionError;
 pub struct GridInput {
     pub table_id: String,
     pub source_revision: String,
+    pub source_sheet_index: usize,
     pub columns: Vec<ColumnDefinition>,
     pub rows: Vec<Vec<Option<Value>>>,
     pub source_rows: Vec<usize>,
@@ -55,12 +56,13 @@ pub fn execute_plan(plan: &Plan, grid: &GridInput) -> Result<ExecutionResult, Ex
     let mut diagnostics = Vec::new();
     let rows_processed = grid.rows.len();
 
-    // Working data: (row_values, source_row_index)
-    let mut working: Vec<(Vec<Option<Value>>, usize)> = grid
+    // Working data: (row_values, source_row_index, source_column_indices)
+    let source_columns: Vec<usize> = grid.columns.iter().map(|column| column.ordinal).collect();
+    let mut working: Vec<(Vec<Option<Value>>, usize, Vec<usize>)> = grid
         .rows
         .iter()
         .zip(grid.source_rows.iter())
-        .map(|(row, &src)| (row.clone(), src))
+        .map(|(row, &src)| (row.clone(), src, source_columns.clone()))
         .collect();
 
     // Track output columns (updated by select)
@@ -95,7 +97,7 @@ pub fn execute_plan(plan: &Plan, grid: &GridInput) -> Result<ExecutionResult, Ex
                     .iter()
                     .enumerate()
                     .map(|(new_ord, &old_idx)| {
-                        let mut col = grid.columns[old_idx].clone();
+                        let mut col = current_columns[old_idx].clone();
                         col.ordinal = new_ord;
                         col
                     })
@@ -132,20 +134,23 @@ pub fn execute_plan(plan: &Plan, grid: &GridInput) -> Result<ExecutionResult, Ex
     // Build materialized rows and provenance
     let materialized_rows: Vec<MaterializedRow> = working
         .iter()
-        .map(|(values, _)| MaterializedRow {
+        .map(|(values, _, _)| MaterializedRow {
             values: values.clone(),
         })
         .collect();
 
     let provenance: Vec<RowProvenance> = working
         .iter()
-        .map(|(_, source_row)| RowProvenance {
+        .map(|(_, source_row, source_columns)| RowProvenance {
             source_row: *source_row,
-            source_address: CellAddress {
-                sheet_index: 0,
-                row: *source_row,
-                col: 0,
-            },
+            source_addresses: source_columns
+                .iter()
+                .map(|source_column| CellAddress {
+                    sheet_index: grid.source_sheet_index,
+                    row: *source_row,
+                    col: *source_column,
+                })
+                .collect(),
         })
         .collect();
 
@@ -200,14 +205,14 @@ fn resolve_column_index(
 }
 
 fn apply_filter(
-    rows: Vec<(Vec<Option<Value>>, usize)>,
+    rows: Vec<(Vec<Option<Value>>, usize, Vec<usize>)>,
     col_idx: usize,
     predicate: &Expression,
-) -> Vec<(Vec<Option<Value>>, usize)> {
+) -> Vec<(Vec<Option<Value>>, usize, Vec<usize>)> {
     match predicate {
         Expression::IsNotBlank { .. } => rows
             .into_iter()
-            .filter(|(values, _)| values.get(col_idx).map_or(false, |v| is_not_blank(v)))
+            .filter(|(values, _, _)| values.get(col_idx).is_some_and(is_not_blank))
             .collect(),
     }
 }
@@ -222,30 +227,34 @@ fn is_not_blank(value: &Option<Value>) -> bool {
 }
 
 fn apply_select(
-    rows: Vec<(Vec<Option<Value>>, usize)>,
+    rows: Vec<(Vec<Option<Value>>, usize, Vec<usize>)>,
     indices: &[usize],
-) -> Vec<(Vec<Option<Value>>, usize)> {
+) -> Vec<(Vec<Option<Value>>, usize, Vec<usize>)> {
     rows.into_iter()
-        .map(|(values, src)| {
+        .map(|(values, src, source_columns)| {
             let selected: Vec<Option<Value>> = indices
                 .iter()
                 .map(|&i| values.get(i).cloned().flatten())
                 .collect();
-            (selected, src)
+            let selected_source_columns = indices
+                .iter()
+                .filter_map(|&i| source_columns.get(i).copied())
+                .collect();
+            (selected, src, selected_source_columns)
         })
         .collect()
 }
 
 fn apply_distinct(
-    rows: Vec<(Vec<Option<Value>>, usize)>,
+    rows: Vec<(Vec<Option<Value>>, usize, Vec<usize>)>,
     indices: &[usize],
     keep: &DistinctKeep,
-) -> Vec<(Vec<Option<Value>>, usize)> {
+) -> Vec<(Vec<Option<Value>>, usize, Vec<usize>)> {
     match keep {
         DistinctKeep::First => {
             let mut seen = HashSet::new();
             let mut result = Vec::new();
-            for (values, src) in rows {
+            for (values, src, source_columns) in rows {
                 let key: Vec<String> = indices
                     .iter()
                     .map(|&i| match values.get(i).and_then(|v| v.as_ref()) {
@@ -257,7 +266,7 @@ fn apply_distinct(
                     })
                     .collect();
                 if seen.insert(key) {
-                    result.push((values, src));
+                    result.push((values, src, source_columns));
                 }
             }
             result
@@ -315,6 +324,7 @@ mod tests {
         let grid = GridInput {
             table_id: "table-0".to_string(),
             source_revision: "hash".to_string(),
+            source_sheet_index: 0,
             columns: grid_columns(),
             rows: vec![
                 vec![text("A"), text("Type A")],
@@ -350,6 +360,7 @@ mod tests {
         let grid = GridInput {
             table_id: "table-0".to_string(),
             source_revision: "hash".to_string(),
+            source_sheet_index: 0,
             columns: grid_columns(),
             rows: vec![vec![text("A"), text("B"), text("C")]],
             source_rows: vec![0],
@@ -370,6 +381,14 @@ mod tests {
         assert_eq!(result.view.columns[1].id, "column-0");
         assert_eq!(result.view.rows[0].values[0], text("C"));
         assert_eq!(result.view.rows[0].values[1], text("A"));
+        assert_eq!(
+            result.view.provenance[0]
+                .source_addresses
+                .iter()
+                .map(|address| address.col)
+                .collect::<Vec<_>>(),
+            vec![2, 0]
+        );
     }
 
     #[test]
@@ -377,6 +396,7 @@ mod tests {
         let grid = GridInput {
             table_id: "table-0".to_string(),
             source_revision: "hash".to_string(),
+            source_sheet_index: 0,
             columns: grid_columns(),
             rows: vec![
                 vec![text("A"), text("Type A")],
@@ -410,6 +430,7 @@ mod tests {
         let grid = GridInput {
             table_id: "table-0".to_string(),
             source_revision: "hash".to_string(),
+            source_sheet_index: 0,
             columns: grid_columns(),
             rows: vec![
                 vec![text("X"), text("Type A")],
@@ -453,6 +474,13 @@ mod tests {
         assert_eq!(result.view.provenance[0].source_row, 0);
         assert_eq!(result.view.provenance[1].source_row, 1);
         assert_eq!(result.view.provenance[2].source_row, 4);
+        assert!(
+            result
+                .view
+                .provenance
+                .iter()
+                .all(|provenance| provenance.source_addresses[0].col == 1)
+        );
     }
 
     #[test]
@@ -460,6 +488,7 @@ mod tests {
         let grid = GridInput {
             table_id: "table-0".to_string(),
             source_revision: "hash".to_string(),
+            source_sheet_index: 0,
             columns: grid_columns(),
             rows: vec![
                 vec![text("valid"), text("A")],
@@ -492,6 +521,7 @@ mod tests {
         let grid = GridInput {
             table_id: "table-0".to_string(),
             source_revision: "hash".to_string(),
+            source_sheet_index: 0,
             columns: grid_columns(),
             rows: vec![
                 vec![text("A"), text("X")],
@@ -530,6 +560,7 @@ mod tests {
         let grid = GridInput {
             table_id: "table-0".to_string(),
             source_revision: "hash".to_string(),
+            source_sheet_index: 0,
             columns: grid_columns(),
             rows: vec![],
             source_rows: vec![],
@@ -557,6 +588,7 @@ mod tests {
         let grid = GridInput {
             table_id: "table-0".to_string(),
             source_revision: "hash".to_string(),
+            source_sheet_index: 0,
             columns: grid_columns(),
             rows: vec![vec![text("A"), text("B")]],
             source_rows: vec![0],
@@ -583,6 +615,7 @@ mod tests {
         let grid = GridInput {
             table_id: "table-0".to_string(),
             source_revision: "hash".to_string(),
+            source_sheet_index: 0,
             columns: grid_columns(),
             rows: vec![vec![text("A"), text("B")]],
             source_rows: vec![0],
@@ -609,6 +642,7 @@ mod tests {
         let grid = GridInput {
             table_id: "table-0".to_string(),
             source_revision: "actual-hash".to_string(),
+            source_sheet_index: 0,
             columns: grid_columns(),
             rows: vec![vec![text("A"), text("B"), text("C")]],
             source_rows: vec![0],

@@ -18,12 +18,13 @@ pub struct MaterializedRow {
     pub values: Vec<Option<Value>>,
 }
 
-/// Tracks which source row and cell a materialized row originated from.
+/// Tracks which source row and cells a materialized row originated from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RowProvenance {
     /// Zero-based source row index.
     pub source_row: usize,
-    pub source_address: CellAddress,
+    /// Column-aligned source addresses for the materialized row's values.
+    pub source_addresses: Vec<CellAddress>,
 }
 
 #[cfg(test)]
@@ -64,19 +65,33 @@ mod tests {
             provenance: vec![
                 RowProvenance {
                     source_row: 1,
-                    source_address: CellAddress {
-                        sheet_index: 0,
-                        row: 1,
-                        col: 0,
-                    },
+                    source_addresses: vec![
+                        CellAddress {
+                            sheet_index: 0,
+                            row: 1,
+                            col: 0,
+                        },
+                        CellAddress {
+                            sheet_index: 0,
+                            row: 1,
+                            col: 1,
+                        },
+                    ],
                 },
                 RowProvenance {
                     source_row: 2,
-                    source_address: CellAddress {
-                        sheet_index: 0,
-                        row: 2,
-                        col: 0,
-                    },
+                    source_addresses: vec![
+                        CellAddress {
+                            sheet_index: 0,
+                            row: 2,
+                            col: 0,
+                        },
+                        CellAddress {
+                            sheet_index: 0,
+                            row: 2,
+                            col: 1,
+                        },
+                    ],
                 },
             ],
         }
@@ -100,7 +115,8 @@ mod tests {
     fn provenance_tracks_source() {
         let view = sample_view();
         assert_eq!(view.provenance[0].source_row, 1);
-        assert_eq!(view.provenance[0].source_address.row, 1);
+        assert_eq!(view.provenance[0].source_addresses[0].row, 1);
+        assert_eq!(view.provenance[0].source_addresses[1].col, 1);
     }
 
     #[test]

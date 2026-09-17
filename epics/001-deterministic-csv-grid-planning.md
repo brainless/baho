@@ -6,16 +6,41 @@ Status: Implemented
 
 All 9 implementation outline steps completed. The deterministic CSV processing pipeline is functional:
 
-- **baho-model** (29 tests): Source revisions, sheets, cells, coordinates, grid regions, column definitions, values, provenance, diagnostics
-- **baho-ingest** (12 tests): Format-independent import contracts, InputProfile, ImportRegistry
-- **baho-ingest-csv** (36 tests): CSV dialect inspection, row features, candidate detection, header normalization, body/footer classification, CsvImporter
-- **baho-plan** (15 tests): Versioned plan IR (filter/select/distinct), structural validation, recognition evidence
-- **baho-exec** (17 tests): Typed validation, deterministic filter/select/distinct materialization with provenance
-- **baho-core** (16 tests): Orchestration pipeline, narrow deterministic intent recognizer, candidate selection
-- **baho-cli** (7 integration tests): Full run lifecycle with pipeline integration, stage artifact serialization
+- **baho-model**: Source revisions, sheets, cells, coordinates, grid regions, column definitions, values, provenance, diagnostics
+- **baho-ingest**: Format-independent import contracts, InputProfile, ImportRegistry
+- **baho-ingest-csv**: CSV dialect inspection, row features, candidate detection, header normalization, body/footer classification, CsvImporter
+- **baho-plan**: Versioned plan IR (filter/select/distinct), structural validation, recognition evidence
+- **baho-exec**: Typed validation, deterministic filter/select/distinct materialization with provenance
+- **baho-core**: Orchestration pipeline, narrow deterministic intent recognizer, candidate selection
+- **baho-cli**: Full run lifecycle with pipeline integration, stage artifact serialization
 - **Synthetic fixture**: `tests/fixtures/report_with_preamble.csv` with preamble, embedded-newline header, interleaved blanks, repeated values, footer
 
-Workspace baseline: `cargo fmt --check`, `cargo check --workspace`, `cargo test --workspace` (145 tests) all pass.
+Persisted stage artifacts use typed envelopes at the CLI boundary. `input-profile.json`,
+`candidates.json`, and `plan.json` use artifact schema version 1. The materialized
+`output/result.json` envelope uses artifact schema version 2 because row provenance now
+contains column-aligned `source_addresses` rather than the former single
+`source_address`.
+
+Artifacts written before these envelopes are legacy, unversioned shapes. Compatibility
+is defined per artifact rather than by guessing from current fields:
+
+- a legacy raw input profile migrates to input-profile version 1 by nesting the complete
+  value under `profile` and adding `schema_version: 1`;
+- a legacy candidates object with `candidates` and `selected` migrates to candidates
+  version 1 by adding `schema_version: 1`, with both payload fields unchanged;
+- a legacy plan object with `plan` and `recognition_evidence` migrates to plan-artifact
+  version 1 by adding `schema_version: 1`; the nested plan retains its independent plan
+  IR schema version; and
+- a legacy raw materialized view migrates to result-artifact version 2 by nesting it
+  under `result`, adding `schema_version: 2`, and replacing each provenance
+  `source_address` with a one-element `source_addresses` array.
+
+Baho does not rewrite historical runs and currently has no artifact reader. New runs
+write only the versions above. A future reader may implement these explicit migrations;
+other unversioned shapes or unknown versions must be rejected rather than inferred.
+
+Verification baselines are recorded in the implementation handoff rather than pinned to
+test counts in this epic, because the workspace suite grows as regressions are added.
 
 Motivating run: `000001`
 
@@ -441,4 +466,3 @@ Rejected. Candidate selection must persist named score components and the observ
 3. What default candidate-score threshold and ambiguity margin should ship initially? These should be established from synthetic fixtures, not tuned solely to run `000001`. **Resolved: min_score_threshold=0.3, ambiguity_margin=0.1.**
 4. Should wholly blank internal rows be represented in the candidate's semantic row-classification list, or summarized as ranges while their physical cells remain available from the grid? **Resolved: classified as `BlankSeparator` in the semantic row-classification list.**
 5. For version 1, should duplicate and unnamed headers always block intent resolution only when they affect the requested column, or block selection of the entire table? **Resolved: block at intent resolution when they affect the requested column.**
-

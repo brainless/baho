@@ -37,12 +37,12 @@ pub struct InspectionResult {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-fn is_blank_field(s: &str) -> bool {
-    s.trim().is_empty()
-}
-
-fn make_logical_record(index: usize, fields: Vec<String>) -> LogicalRecord {
-    let is_blank = fields.iter().all(|f| is_blank_field(f));
+fn make_logical_record(
+    index: usize,
+    fields: Vec<String>,
+    normalization: &crate::config::NormalizationConfig,
+) -> LogicalRecord {
+    let is_blank = fields.iter().all(|f| normalization.is_blank(f));
     LogicalRecord {
         index,
         fields,
@@ -50,13 +50,27 @@ fn make_logical_record(index: usize, fields: Vec<String>) -> LogicalRecord {
     }
 }
 
-const MAX_BLANK_INDICES: usize = 10_000;
-
 /// Inspect a CSV file with bounded sampling.
 pub fn inspect_csv(
     path: &Path,
     dialect: &CsvDialect,
     options: &InspectOptions,
+) -> Result<InspectionResult, ImportError> {
+    inspect_csv_with_config(
+        path,
+        dialect,
+        options,
+        &crate::config::NormalizationConfig::default(),
+        crate::config::EvidenceLimitsConfig::default().max_blank_record_indices,
+    )
+}
+
+pub fn inspect_csv_with_config(
+    path: &Path,
+    dialect: &CsvDialect,
+    options: &InspectOptions,
+    normalization: &crate::config::NormalizationConfig,
+    max_blank_record_indices: usize,
 ) -> Result<InspectionResult, ImportError> {
     let file = File::open(path).map_err(|source| ImportError::Io {
         path: path.to_path_buf(),
@@ -148,10 +162,10 @@ pub fn inspect_csv(
                     width_max = width;
                 }
 
-                let rec = make_logical_record(total_count, fields);
+                let rec = make_logical_record(total_count, fields, normalization);
 
                 if rec.is_blank {
-                    if blank_record_indices.len() < MAX_BLANK_INDICES {
+                    if blank_record_indices.len() < max_blank_record_indices {
                         blank_record_indices.push(rec.index);
                     } else if !blank_indices_capped {
                         blank_indices_capped = true;
@@ -198,11 +212,9 @@ pub fn inspect_csv(
         width_min = 0;
     }
 
-    let logical_record_count = if sampling_complete {
-        Some(valid_count)
-    } else {
-        None
-    };
+    // Inspection always completes the streaming pass; only retained samples
+    // are capped. The aggregate count therefore remains available.
+    let logical_record_count = Some(valid_count);
 
     Ok(InspectionResult {
         dialect: dialect.clone(),
@@ -281,7 +293,7 @@ mod tests {
         let csv = "a,b\n1,2\n3,4\n5,6\n";
         let result = inspect_from_str(csv, 2);
         assert_eq!(result.sampled_records.len(), 2);
-        assert_eq!(result.logical_record_count, None);
+        assert_eq!(result.logical_record_count, Some(4));
         assert!(
             result
                 .limits_reached

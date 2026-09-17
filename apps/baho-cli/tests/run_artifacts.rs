@@ -90,17 +90,48 @@ fn run_records_the_request_and_input_identity() {
     let result: Value =
         serde_json::from_slice(&fs::read(run.join("output/result.json")).expect("read result"))
             .expect("valid result JSON");
-    assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(result["schema_version"], 2);
+    assert_eq!(result["result"]["rows"].as_array().unwrap().len(), 1);
+    let provenance = &result["result"]["provenance"][0];
+    assert!(provenance.get("source_address").is_none());
+    assert_eq!(provenance["source_addresses"].as_array().unwrap().len(), 1);
 
     let parser_config: Value = serde_json::from_slice(
         &fs::read(run.join("parser-config.json")).expect("read parser-config"),
     )
     .expect("valid parser-config JSON");
     assert_eq!(parser_config["schema_version"], 1);
+    assert_eq!(parser_config["dialect"]["delimiter"], b',');
+    assert_eq!(parser_config["dialect"]["quote"], b'"');
+    assert_eq!(parser_config["inspection"]["max_sample_records"], 1000);
+    assert_eq!(parser_config["inspection"]["max_field_size"], 1_048_576);
+    assert!(parser_config["inspection"]["force_encoding"].is_null());
+    assert_eq!(
+        parser_config["candidate_detection"]["max_body_width_difference"],
+        2
+    );
+    assert_eq!(parser_config["row_classification"]["min_data_density"], 0.3);
+    assert_eq!(
+        parser_config["candidate_scoring"]["weights"]["body_row_count"],
+        0.32
+    );
+    assert_eq!(
+        parser_config["normalization"]["header_whitespace"],
+        "trim_and_collapse"
+    );
+    assert_eq!(
+        parser_config["candidate_ordering"]["tie_breaker"],
+        "source_order"
+    );
+    assert_eq!(
+        parser_config["evidence_limits"]["max_blank_record_indices"],
+        10_000
+    );
 
     let candidates: Value =
         serde_json::from_slice(&fs::read(run.join("candidates.json")).expect("read candidates"))
             .expect("valid candidates JSON");
+    assert_eq!(candidates["schema_version"], 1);
     let selected = candidates["selected"]
         .as_object()
         .expect("selected candidate");
@@ -117,6 +148,32 @@ fn run_records_the_request_and_input_identity() {
     assert!(
         !classifications.is_empty(),
         "selected candidate must have populated classifications"
+    );
+
+    let profile: Value =
+        serde_json::from_slice(&fs::read(run.join("input-profile.json")).expect("read profile"))
+            .expect("valid profile JSON");
+    assert_eq!(profile["schema_version"], 1);
+    assert_eq!(profile["profile"]["encoding"], "utf-8");
+
+    let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
+        .expect("valid plan JSON");
+    assert_eq!(plan["schema_version"], 1);
+    assert_eq!(plan["plan"]["schema_version"], 1);
+
+    assert_eq!(
+        manifest["artifacts"],
+        serde_json::json!([
+            "manifest.json",
+            "intent.txt",
+            "events.jsonl",
+            "diagnostics.json",
+            "input-profile.json",
+            "parser-config.json",
+            "candidates.json",
+            "plan.json",
+            "output/result.json"
+        ])
     );
 }
 
