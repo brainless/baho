@@ -2,6 +2,25 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// A format that is recognized but does not yet have an importer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedFormat {
+    Excel,
+    Ods,
+    Pdf,
+}
+
+impl std::fmt::Display for UnsupportedFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Excel => "Excel",
+            Self::Ods => "ODS",
+            Self::Pdf => "PDF",
+        };
+        formatter.write_str(name)
+    }
+}
+
 /// Errors that can occur during document ingestion.
 #[derive(Debug, Error)]
 pub enum ImportError {
@@ -16,6 +35,9 @@ pub enum ImportError {
 
     #[error("format detection failed: {detail}")]
     FormatDetectionFailed { detail: String },
+
+    #[error("unsupported {format} format")]
+    UnsupportedFormat { format: UnsupportedFormat },
 
     #[error("limit exceeded ({limit}): {detail}")]
     LimitExceeded { limit: String, detail: String },
@@ -52,6 +74,14 @@ mod tests {
             detail: "no importer claimed the file".to_string(),
         };
         assert!(err.to_string().contains("no importer claimed the file"));
+    }
+
+    #[test]
+    fn unsupported_format_display() {
+        let err = ImportError::UnsupportedFormat {
+            format: UnsupportedFormat::Pdf,
+        };
+        assert_eq!(err.to_string(), "unsupported PDF format");
     }
 
     #[test]

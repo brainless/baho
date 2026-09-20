@@ -1,0 +1,31 @@
+[package]
+name = "baho-gui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "baho-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+baho-core = { path = "../../crates/baho-core" }
+clap = { version = "4.5", features = ["derive"] }
+thiserror = "2.0"
+
+# Keep the pre-alpha presentation dependency inside this application. The
+# revision is pinned because akar's Rust API is not yet a stable release.
+akar-components = { git = "file:///Users/brainless/Projects/akar", rev = "0d33253648d5f6c04b2d6a6b5ecbbaa3c97b0ea6" }
+akar-core = { git = "file:///Users/brainless/Projects/akar", rev = "0d33253648d5f6c04b2d6a6b5ecbbaa3c97b0ea6", features = ["serde"] }
+akar-layout = { git = "file:///Users/brainless/Projects/akar", rev = "0d33253648d5f6c04b2d6a6b5ecbbaa3c97b0ea6" }
+akar-winit = { git = "file:///Users/brainless/Projects/akar", rev = "0d33253648d5f6c04b2d6a6b5ecbbaa3c97b0ea6" }
+pollster = "0.4"
+png = "0.17"
+serde_json = "1"
+wgpu = "29"
+winit = "0.30"
+
+[dev-dependencies]
+tempfile = "3.10"

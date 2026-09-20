@@ -9,9 +9,9 @@ pub mod profile;
 pub mod registry;
 pub mod traits;
 
-pub use error::ImportError;
+pub use error::{ImportError, UnsupportedFormat};
 pub use profile::{InputProfile, InspectOptions};
-pub use registry::ImportRegistry;
+pub use registry::{DetectedFormat, ImportRegistry, detect_format};
 pub use traits::{FormatImporter, FormatInspector};
 
 use baho_model::diagnostic::Diagnostic;

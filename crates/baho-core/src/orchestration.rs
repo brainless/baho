@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use baho_exec::executor::{ExecutionResult, GridInput, execute_plan};
-use baho_ingest::InspectOptions;
 use baho_ingest::profile::InputProfile;
+use baho_ingest::{DetectedFormat, ImportError, InspectOptions, detect_format};
 use baho_ingest_csv::header::build_header_with_config;
 use baho_ingest_csv::row_features::compute_row_features_with_config;
 use baho_ingest_csv::{
@@ -54,8 +54,602 @@ pub struct CoreResult {
     pub outcome: CoreOutcome,
 }
 
+/// A raw cell in an opened selected table. `Missing` is distinct from an
+/// explicitly present empty field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawCell {
+    Present(String),
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedRow {
+    pub source_row: usize,
+    pub cells: Vec<RawCell>,
+}
+
+/// The selected source table, before intent recognition or plan execution.
+#[derive(Debug)]
+pub struct OpenedTable {
+    pub source_revision: baho_model::revision::SourceRevision,
+    pub source_sheet_index: usize,
+    pub source_sheet_name: Option<String>,
+    pub selected_candidate: TableCandidate,
+    pub candidates: Vec<TableCandidate>,
+    pub columns: Vec<baho_model::column::ColumnDefinition>,
+    pub rows: Vec<OpenedRow>,
+    pub input_profile: InputProfile,
+    pub parser_config: ParserConfig,
+    pub diagnostics: Vec<Diagnostic>,
+    pub events: Vec<CoreEvent>,
+}
+
+#[derive(Debug)]
+pub struct OpenTableFailure {
+    pub error: CoreError,
+    pub input_profile: Option<InputProfile>,
+    pub parser_config: Option<ParserConfig>,
+    pub candidates: Vec<TableCandidate>,
+    pub selected_candidate: Option<TableCandidate>,
+    pub diagnostics: Vec<Diagnostic>,
+    pub events: Vec<CoreEvent>,
+}
+
+impl std::fmt::Display for OpenTableFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for OpenTableFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Dispatch an input to a supported format importer without parsing it.
+pub fn dispatch_format(path: &Path) -> Result<DetectedFormat, CoreError> {
+    Ok(detect_format(path, &InspectOptions::default())?)
+}
+
+fn opening_failure(
+    error: CoreError,
+    input_profile: Option<InputProfile>,
+    parser_config: Option<ParserConfig>,
+    candidates: Vec<TableCandidate>,
+    selected_candidate: Option<TableCandidate>,
+    diagnostics: Vec<Diagnostic>,
+    events: Vec<CoreEvent>,
+) -> OpenTableFailure {
+    OpenTableFailure {
+        error,
+        input_profile,
+        parser_config,
+        candidates,
+        selected_candidate,
+        diagnostics,
+        events,
+    }
+}
+
+/// Open and classify the selected CSV table without a prompt or plan.
+pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
+    let mut diagnostics = Vec::new();
+    let mut events = Vec::new();
+    let mut input_profile = None;
+    let mut parser_config = None;
+    let mut candidates = Vec::new();
+    let selected_candidate = None;
+
+    if let Err(error) = dispatch_format(path) {
+        diagnostics.push(Diagnostic {
+            code: if matches!(
+                error,
+                CoreError::Ingest(ImportError::UnsupportedFormat { .. })
+            ) {
+                "core.unsupported_format"
+            } else {
+                "core.format_detection_failed"
+            }
+            .to_string(),
+            severity: Severity::Error,
+            stage: "ingest".to_string(),
+            message: error.to_string(),
+            location: None,
+        });
+        return Err(opening_failure(
+            error,
+            input_profile,
+            parser_config,
+            candidates,
+            selected_candidate,
+            diagnostics,
+            events,
+        ));
+    }
+
+    let config = match ParserConfig::detect(path, InspectOptions::default()) {
+        Ok(config) => config,
+        Err(error) => {
+            let code = match &error {
+                DialectDetectionError::Ambiguous { .. } => "csv.dialect_ambiguous",
+                DialectDetectionError::Io { .. } => "core.import_failed",
+            };
+            diagnostics.push(Diagnostic {
+                code: code.to_string(),
+                severity: Severity::Error,
+                stage: "ingest-csv".to_string(),
+                message: error.to_string(),
+                location: None,
+            });
+            let core_error = CoreError::Ingest(ImportError::FormatDetectionFailed {
+                detail: error.to_string(),
+            });
+            return Err(opening_failure(
+                core_error,
+                input_profile,
+                parser_config,
+                candidates,
+                selected_candidate,
+                diagnostics,
+                events,
+            ));
+        }
+    };
+    parser_config = Some(config.clone());
+
+    let imported = match CsvImporter.import_with_config(path, &config) {
+        Ok(imported) => imported,
+        Err(error) => {
+            let core_error = CoreError::Ingest(error);
+            diagnostics.push(Diagnostic {
+                code: "core.import_failed".to_string(),
+                severity: Severity::Error,
+                stage: "core".to_string(),
+                message: core_error.to_string(),
+                location: None,
+            });
+            return Err(opening_failure(
+                core_error,
+                input_profile,
+                parser_config,
+                candidates,
+                selected_candidate,
+                diagnostics,
+                events,
+            ));
+        }
+    };
+    input_profile = Some(imported.input_profile);
+    diagnostics.extend(imported.diagnostics);
+    let profile = input_profile.as_ref().expect("import profile stored");
+    push_event(
+        &mut events,
+        "input_profiled",
+        "ingest",
+        serde_json::json!({
+            "encoding": profile.encoding, "record_count": profile.logical_record_count,
+        }),
+    );
+
+    let source_revision = imported.document.source;
+    let sheet = match imported.document.sheets.into_iter().next() {
+        Some(sheet) => sheet,
+        None => {
+            let error = CoreError::NoTableFound;
+            diagnostics.push(Diagnostic {
+                code: "core.no_sheet".to_string(),
+                severity: Severity::Error,
+                stage: "core".to_string(),
+                message: "imported document has no sheets".to_string(),
+                location: None,
+            });
+            return Err(opening_failure(
+                error,
+                input_profile,
+                parser_config,
+                candidates,
+                selected_candidate,
+                diagnostics,
+                events,
+            ));
+        }
+    };
+    let source_sheet_index = sheet.index;
+    let source_sheet_name = sheet.name;
+    let logical_records = sheet
+        .rows
+        .into_iter()
+        .map(|row| {
+            let fields = row
+                .cells
+                .into_iter()
+                .map(|cell| cell.raw_text)
+                .collect::<Vec<_>>();
+            let is_blank = fields
+                .iter()
+                .all(|field| config.normalization.is_blank(field));
+            baho_ingest_csv::inspector::LogicalRecord {
+                index: row.index,
+                fields,
+                is_blank,
+            }
+        })
+        .collect::<Vec<_>>();
+    let features = compute_row_features_with_config(&logical_records, &config.normalization);
+    candidates = detect_candidates_with_config(
+        &logical_records,
+        &features,
+        &config.candidate_detection,
+        &config.candidate_scoring,
+        &config.candidate_ordering,
+    );
+    push_event(
+        &mut events,
+        "table_candidates_detected",
+        "detect",
+        serde_json::json!({ "count": candidates.len() }),
+    );
+
+    let mut selected = match select_candidate(&candidates, &config.candidate_detection) {
+        Ok(candidate) => candidate.clone(),
+        Err(error @ CoreError::NoTableFound) => {
+            diagnostics.push(Diagnostic {
+                code: "table.not_found".to_string(),
+                severity: Severity::Error,
+                stage: "core".to_string(),
+                message: "no table candidate met the minimum score threshold".to_string(),
+                location: None,
+            });
+            return Err(opening_failure(
+                error,
+                input_profile,
+                parser_config,
+                candidates,
+                selected_candidate,
+                diagnostics,
+                events,
+            ));
+        }
+        Err(error @ CoreError::AmbiguousTable { candidate_count }) => {
+            diagnostics.push(Diagnostic {
+                code: "table.ambiguous".to_string(),
+                severity: Severity::Error,
+                stage: "core".to_string(),
+                message: format!("{} candidates with similar scores", candidate_count),
+                location: None,
+            });
+            return Err(opening_failure(
+                error,
+                input_profile,
+                parser_config,
+                candidates,
+                selected_candidate,
+                diagnostics,
+                events,
+            ));
+        }
+        Err(error) => {
+            diagnostics.push(Diagnostic {
+                code: "core.candidate_selection_failed".to_string(),
+                severity: Severity::Error,
+                stage: "core".to_string(),
+                message: error.to_string(),
+                location: None,
+            });
+            return Err(opening_failure(
+                error,
+                input_profile,
+                parser_config,
+                candidates,
+                selected_candidate,
+                diagnostics,
+                events,
+            ));
+        }
+    };
+    push_event(
+        &mut events,
+        "table_candidate_selected",
+        "select",
+        serde_json::json!({ "candidate_id": selected.id, "score": selected.score.total }),
+    );
+
+    let header_idx = selected.region.header_row.unwrap_or(0);
+    let (header_decision, header_diag) = build_header_with_config(
+        &features[header_idx],
+        &logical_records[header_idx],
+        source_sheet_index,
+        &config.normalization,
+    );
+    diagnostics.extend(header_diag);
+    push_event(
+        &mut events,
+        "header_selected",
+        "header",
+        serde_json::json!({ "source_row": header_decision.source_row, "column_count": header_decision.cells.len() }),
+    );
+
+    let selected_region = match read_selected_region(
+        path,
+        features[header_idx].physical_width,
+        selected.region.body_start_row,
+        &config,
+    ) {
+        Ok(region) => region,
+        Err(error) => {
+            let (code, stage, location) = match &error {
+                SelectedRegionError::FieldTooLarge { row, col, .. } => (
+                    "csv.field_too_large",
+                    "ingest-csv",
+                    Some(baho_model::diagnostic::DiagnosticLocation {
+                        row: Some(*row),
+                        col: Some(*col),
+                        cell: None,
+                    }),
+                ),
+                SelectedRegionError::MalformedRecord { row, .. } => (
+                    "csv.malformed_record",
+                    "ingest-csv",
+                    Some(baho_model::diagnostic::DiagnosticLocation {
+                        row: Some(*row),
+                        col: None,
+                        cell: None,
+                    }),
+                ),
+                SelectedRegionError::Io { .. } => ("core.materialize_region_failed", "core", None),
+            };
+            diagnostics.push(Diagnostic {
+                code: code.to_string(),
+                severity: Severity::Error,
+                stage: stage.to_string(),
+                message: error.to_string(),
+                location,
+            });
+            let core_error = CoreError::Ingest(ImportError::FormatDetectionFailed {
+                detail: error.to_string(),
+            });
+            return Err(opening_failure(
+                core_error,
+                input_profile,
+                parser_config,
+                candidates,
+                selected_candidate,
+                diagnostics,
+                events,
+            ));
+        }
+    };
+    selected.region.body_end_row = selected_region.body_end_row;
+    push_event(
+        &mut events,
+        "body_rows_classified",
+        "classify",
+        serde_json::json!({
+            "data_rows": selected_region.data_records.len(), "total_classified": selected_region.classification_count,
+            "classification_evidence_retained": selected_region.classifications.len(),
+        }),
+    );
+    for candidate in &mut candidates {
+        if candidate.id == selected.id {
+            candidate.header = header_decision.clone();
+            candidate.region.body_end_row = selected.region.body_end_row;
+            candidate.body_row_classifications = selected_region.classifications.clone();
+            candidate.selected = true;
+        }
+    }
+    selected.header = header_decision.clone();
+    selected.body_row_classifications = selected_region.classifications.clone();
+    let columns = header_decision
+        .cells
+        .iter()
+        .map(|cell| baho_model::column::ColumnDefinition {
+            id: cell.column_id.clone(),
+            ordinal: cell.col,
+            source_header_raw: Some(cell.raw_text.clone()),
+            source_header_normalized: Some(cell.normalized_text.clone()),
+            display_name: if cell.normalized_text.is_empty() {
+                format!("Column {}", cell.col)
+            } else {
+                cell.normalized_text.clone()
+            },
+        })
+        .collect::<Vec<_>>();
+    let rows = selected_region
+        .data_records
+        .iter()
+        .map(|record| OpenedRow {
+            source_row: record.index,
+            cells: (0..columns.len())
+                .map(|col| {
+                    record
+                        .fields
+                        .get(col)
+                        .cloned()
+                        .map(RawCell::Present)
+                        .unwrap_or(RawCell::Missing)
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(OpenedTable {
+        source_revision,
+        source_sheet_index,
+        source_sheet_name,
+        selected_candidate: selected,
+        candidates,
+        columns,
+        rows,
+        input_profile: input_profile.expect("import profile stored"),
+        parser_config: parser_config.expect("parser config stored"),
+        diagnostics,
+        events,
+    })
+}
+
 /// Run the full pipeline: ingest, detect, select, plan, validate, execute.
 pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
+    let opened = match open_table(path) {
+        Ok(opened) => opened,
+        Err(failure) => {
+            return CoreResult {
+                input_profile: failure.input_profile,
+                parser_config: failure.parser_config,
+                candidates: failure.candidates,
+                selected_candidate: failure.selected_candidate,
+                intent: None,
+                plan: None,
+                intent_evidence: None,
+                output: None,
+                diagnostics: failure.diagnostics,
+                events: failure.events,
+                outcome: CoreOutcome::Failed,
+            };
+        }
+    };
+    run_pipeline_from_opened(opened, prompt)
+}
+
+fn run_pipeline_from_opened(opened: OpenedTable, prompt: &str) -> CoreResult {
+    let mut result = CoreResult {
+        input_profile: Some(opened.input_profile.clone()),
+        parser_config: Some(opened.parser_config.clone()),
+        candidates: opened.candidates.clone(),
+        selected_candidate: Some(opened.selected_candidate.clone()),
+        intent: None,
+        plan: None,
+        intent_evidence: None,
+        output: None,
+        diagnostics: opened.diagnostics.clone(),
+        events: opened.events.clone(),
+        outcome: CoreOutcome::Recorded,
+    };
+    let intent = match recognize_intent(prompt, &opened.columns) {
+        Ok(intent) => intent,
+        Err(error) => {
+            result.intent_evidence = recognition_evidence_of(&error);
+            result.diagnostics.push(Diagnostic {
+                code: match &error {
+                    crate::error::IntentError::Unsupported(_, _) => "intent.unsupported",
+                    crate::error::IntentError::ColumnNotFound { .. } => "intent.column_not_found",
+                    crate::error::IntentError::ColumnAmbiguous { .. } => "intent.column_ambiguous",
+                    crate::error::IntentError::ParseAmbiguous { .. } => "intent.parse_ambiguous",
+                }
+                .to_string(),
+                severity: Severity::Error,
+                stage: "intent".to_string(),
+                message: error.to_string(),
+                location: None,
+            });
+            result.outcome = CoreOutcome::Failed;
+            return result;
+        }
+    };
+    push_event(
+        &mut result.events,
+        "intent_recognized",
+        "intent",
+        serde_json::json!({
+            "action": intent.action, "operation": intent.operation, "column_id": intent.column_id,
+            "score": intent.evidence.matched_column.as_ref().map(|matched| matched.score),
+        }),
+    );
+    result.intent_evidence = Some(intent.evidence.clone());
+    result.intent = Some(intent.clone());
+    let plan = compile_intent_to_plan(
+        &intent,
+        &opened.source_revision.content_hash,
+        &opened.selected_candidate.id,
+    );
+    if let Err(error) = validate_plan_structure(&plan) {
+        result.diagnostics.push(Diagnostic {
+            code: "plan.invalid".to_string(),
+            severity: Severity::Error,
+            stage: "plan".to_string(),
+            message: error.to_string(),
+            location: None,
+        });
+        result.outcome = CoreOutcome::Failed;
+        return result;
+    }
+    let available_col_ids = opened
+        .columns
+        .iter()
+        .map(|column| column.id.clone())
+        .collect::<Vec<_>>();
+    if let Err(error) = validate_plan_references(&plan, &available_col_ids) {
+        result.diagnostics.push(Diagnostic {
+            code: "plan.invalid".to_string(),
+            severity: Severity::Error,
+            stage: "plan".to_string(),
+            message: error.to_string(),
+            location: None,
+        });
+        result.outcome = CoreOutcome::Failed;
+        return result;
+    }
+    push_event(
+        &mut result.events,
+        "plan_validated",
+        "plan",
+        serde_json::json!({ "schema_version": plan.schema_version, "step_count": plan.steps.len() }),
+    );
+    result.plan = Some(plan.clone());
+    let grid = GridInput {
+        table_id: opened.selected_candidate.id,
+        source_revision: opened.source_revision.content_hash,
+        source_sheet_index: opened.source_sheet_index,
+        columns: opened.columns,
+        rows: opened
+            .rows
+            .iter()
+            .map(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| match cell {
+                        RawCell::Present(text)
+                            if opened.parser_config.normalization.is_blank(text) =>
+                        {
+                            Some(Value::Blank)
+                        }
+                        RawCell::Present(text) => Some(Value::Text(text.clone())),
+                        RawCell::Missing => None,
+                    })
+                    .collect()
+            })
+            .collect(),
+        source_rows: opened.rows.iter().map(|row| row.source_row).collect(),
+    };
+    let execution = match execute_plan(&plan, &grid) {
+        Ok(execution) => execution,
+        Err(error) => {
+            result.diagnostics.push(Diagnostic {
+                code: "execution.failed".to_string(),
+                severity: Severity::Error,
+                stage: "exec".to_string(),
+                message: error.to_string(),
+                location: None,
+            });
+            result.outcome = CoreOutcome::Failed;
+            return result;
+        }
+    };
+    result.diagnostics.extend(execution.diagnostics);
+    push_event(
+        &mut result.events,
+        "materialization_completed",
+        "exec",
+        serde_json::json!({
+            "rows_processed": execution.rows_processed, "rows_output": execution.rows_output,
+        }),
+    );
+    result.output = Some(execution.view);
+    result.outcome = CoreOutcome::Materialized;
+    result
+}
+
+#[allow(dead_code)]
+fn run_pipeline_legacy(path: &Path, prompt: &str) -> CoreResult {
     let mut result = CoreResult {
         input_profile: None,
         parser_config: None,
@@ -70,7 +664,27 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
         outcome: CoreOutcome::Recorded,
     };
 
-    // Step 1: Import
+    // Step 1: Dispatch, then import. This boundary prevents recognized
+    // non-CSV inputs from reaching CSV dialect detection.
+    if let Err(error) = dispatch_format(path) {
+        result.diagnostics.push(Diagnostic {
+            code: match &error {
+                CoreError::Ingest(ImportError::UnsupportedFormat { .. }) => {
+                    "core.unsupported_format"
+                }
+                _ => "core.format_detection_failed",
+            }
+            .to_string(),
+            severity: Severity::Error,
+            stage: "ingest".to_string(),
+            message: error.to_string(),
+            location: None,
+        });
+        result.outcome = CoreOutcome::Failed;
+        return result;
+    }
+
+    // Step 2: Import
     let importer = CsvImporter;
     let options = InspectOptions::default();
     let parser_config = match ParserConfig::detect(path, options) {
@@ -506,6 +1120,143 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(content.as_bytes()).unwrap();
         file
+    }
+
+    #[test]
+    fn open_table_preserves_preamble_source_rows_and_ragged_raw_cells() {
+        let file = write_temp_csv(
+            "Report title,,,\n,,,\nID,Name,Note\n1,A,\n2,B\n3,C,raw\nFooter,summary,extra,ignored,tail,more\n",
+        );
+
+        let opened = open_table(file.path()).expect("synthetic table should open");
+
+        assert_eq!(opened.source_sheet_index, 0);
+        assert!(!opened.source_revision.content_hash.is_empty());
+        assert_eq!(
+            opened
+                .columns
+                .iter()
+                .map(|column| column.display_name.as_str())
+                .collect::<Vec<_>>(),
+            ["ID", "Name", "Note"]
+        );
+        assert_eq!(
+            opened
+                .rows
+                .iter()
+                .map(|row| row.source_row)
+                .collect::<Vec<_>>(),
+            [3, 4, 5]
+        );
+        assert_eq!(opened.rows[0].cells[2], RawCell::Present(String::new()));
+        assert_eq!(opened.rows[1].cells[2], RawCell::Missing);
+        assert_eq!(opened.rows[2].cells[2], RawCell::Present("raw".to_string()));
+        assert!(
+            opened
+                .selected_candidate
+                .body_row_classifications
+                .iter()
+                .any(|classification| classification.source_row == 4)
+        );
+        assert!(
+            opened
+                .events
+                .iter()
+                .any(|event| event.name == "body_rows_classified")
+        );
+    }
+
+    #[test]
+    fn run_pipeline_reuses_opening_metadata_and_event_prefix() {
+        let file = write_temp_csv(
+            "Title,,,\n,,,\nID,Name,Note\n1,A,\n2,B\n3,C,raw\nFooter,summary,extra,ignored,tail,more\n",
+        );
+        let opened = open_table(file.path()).expect("synthetic table should open");
+        let pipeline = run_pipeline(file.path(), "List name");
+
+        assert_eq!(pipeline.outcome, CoreOutcome::Materialized);
+        assert_eq!(pipeline.input_profile.as_ref(), Some(&opened.input_profile));
+        assert_eq!(pipeline.parser_config.as_ref(), Some(&opened.parser_config));
+        assert_eq!(
+            pipeline.selected_candidate.as_ref(),
+            Some(&opened.selected_candidate)
+        );
+        let opening_event_names = opened
+            .events
+            .iter()
+            .map(|event| event.name.as_str())
+            .collect::<Vec<_>>();
+        let pipeline_event_names = pipeline
+            .events
+            .iter()
+            .map(|event| event.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &pipeline_event_names[..opening_event_names.len()],
+            opening_event_names
+        );
+        assert_eq!(
+            pipeline
+                .output
+                .as_ref()
+                .unwrap()
+                .provenance
+                .iter()
+                .map(|provenance| provenance.source_row)
+                .collect::<Vec<_>>(),
+            [3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn dispatch_returns_typed_unsupported_formats_before_csv_parsing() {
+        let cases = [
+            (
+                "report.xlsx",
+                b"not csv".as_slice(),
+                baho_ingest::UnsupportedFormat::Excel,
+            ),
+            (
+                "report.ods",
+                b"not csv".as_slice(),
+                baho_ingest::UnsupportedFormat::Ods,
+            ),
+            (
+                "report.pdf",
+                b"%PDF-1.7".as_slice(),
+                baho_ingest::UnsupportedFormat::Pdf,
+            ),
+        ];
+
+        for (suffix, bytes, expected) in cases {
+            let mut file = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+            file.write_all(bytes).unwrap();
+            assert!(matches!(
+                dispatch_format(file.path()),
+                Err(CoreError::Ingest(
+                    baho_ingest::ImportError::UnsupportedFormat { format }
+                )) if format == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn pipeline_keeps_unknown_input_distinct_from_unsupported_format() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"\0\x01\x02").unwrap();
+        let result = run_pipeline(file.path(), "List values");
+
+        assert_eq!(result.outcome, CoreOutcome::Failed);
+        assert_eq!(result.diagnostics[0].code, "core.format_detection_failed");
+        assert!(result.parser_config.is_none());
+
+        let mut pdf = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+        pdf.write_all(b"%PDF-1.7").unwrap();
+        let result = run_pipeline(pdf.path(), "List values");
+        assert_eq!(result.outcome, CoreOutcome::Failed);
+        assert_eq!(result.diagnostics[0].code, "core.unsupported_format");
+        assert!(result.diagnostics[0].message.contains("PDF"));
+        assert!(result.parser_config.is_none());
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::ImportedDocument;
-use crate::error::ImportError;
+use crate::error::{ImportError, UnsupportedFormat};
 use crate::profile::InspectOptions;
 use crate::traits::{FormatImporter, FormatInspector};
 
@@ -11,6 +11,56 @@ use crate::traits::{FormatImporter, FormatInspector};
 struct RegisteredFormat {
     inspector: Box<dyn FormatInspector>,
     importer: Box<dyn FormatImporter>,
+}
+
+/// The result of format dispatch before a format-specific importer runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectedFormat {
+    Csv,
+}
+
+/// Classify an input without invoking a format-specific parser.
+///
+/// Recognized formats without an importer are returned as typed errors. An
+/// input that is neither a supported CSV-like text file nor a recognized
+/// future format remains a format-detection failure.
+pub fn detect_format(path: &Path, options: &InspectOptions) -> Result<DetectedFormat, ImportError> {
+    let header = read_header(path, options.max_field_size)?;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if header.starts_with(b"%PDF-") || extension == "pdf" {
+        return Err(ImportError::UnsupportedFormat {
+            format: UnsupportedFormat::Pdf,
+        });
+    }
+    if extension == "ods" {
+        return Err(ImportError::UnsupportedFormat {
+            format: UnsupportedFormat::Ods,
+        });
+    }
+    if matches!(extension.as_str(), "xlsx" | "xls")
+        || header.starts_with(b"PK\x03\x04")
+        || header.starts_with(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1")
+    {
+        return Err(ImportError::UnsupportedFormat {
+            format: UnsupportedFormat::Excel,
+        });
+    }
+
+    let text_like = header
+        .iter()
+        .all(|&byte| byte == b'\n' || byte == b'\r' || (0x09..=0x7e).contains(&byte));
+    if matches!(extension.as_str(), "csv" | "tsv" | "txt") || text_like {
+        return Ok(DetectedFormat::Csv);
+    }
+
+    Err(ImportError::FormatDetectionFailed {
+        detail: format!("no supported format claimed `{}`", path.display()),
+    })
 }
 
 /// Registry of available format importers.
@@ -148,6 +198,64 @@ mod tests {
         let opts = InspectOptions::default();
         let err = registry.detect_and_import(file.path(), &opts).unwrap_err();
         assert!(matches!(err, ImportError::FormatDetectionFailed { .. }));
+    }
+
+    #[test]
+    fn dispatch_distinguishes_supported_csv_unknown_and_unsupported_formats() {
+        let cases = [
+            (
+                "table.csv",
+                b"a,b\n1,2\n".as_slice(),
+                Ok(DetectedFormat::Csv),
+            ),
+            (
+                "report.xlsx",
+                b"not csv".as_slice(),
+                Err(UnsupportedFormat::Excel),
+            ),
+            (
+                "report.ods",
+                b"not csv".as_slice(),
+                Err(UnsupportedFormat::Ods),
+            ),
+            (
+                "report.pdf",
+                b"%PDF-1.7".as_slice(),
+                Err(UnsupportedFormat::Pdf),
+            ),
+        ];
+
+        for (name, bytes, expected) in cases {
+            let mut file = tempfile::Builder::new().suffix(name).tempfile().unwrap();
+            file.write_all(bytes).unwrap();
+            let result = detect_format(file.path(), &InspectOptions::default());
+            match expected {
+                Ok(format) => assert_eq!(result.unwrap(), format),
+                Err(format) => assert!(matches!(
+                    result,
+                    Err(ImportError::UnsupportedFormat { format: actual }) if actual == format
+                )),
+            }
+        }
+
+        let mut unknown = NamedTempFile::new().unwrap();
+        unknown.write_all(b"\0\x01\x02").unwrap();
+        assert!(matches!(
+            detect_format(unknown.path(), &InspectOptions::default()),
+            Err(ImportError::FormatDetectionFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn pdf_signature_wins_over_csv_extension() {
+        let mut file = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+        file.write_all(b"%PDF-1.7").unwrap();
+        assert!(matches!(
+            detect_format(file.path(), &InspectOptions::default()),
+            Err(ImportError::UnsupportedFormat {
+                format: UnsupportedFormat::Pdf
+            })
+        ));
     }
 
     #[test]

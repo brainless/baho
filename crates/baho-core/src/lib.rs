@@ -16,4 +16,7 @@ pub use error::{CoreError, IntentError};
 pub use intent::{
     CanonicalAction, CanonicalOperation, RecognizedIntent, compile_intent_to_plan, recognize_intent,
 };
-pub use orchestration::{CoreEvent, CoreOutcome, CoreResult, run_pipeline};
+pub use orchestration::{
+    CoreEvent, CoreOutcome, CoreResult, OpenTableFailure, OpenedRow, OpenedTable, RawCell,
+    dispatch_format, open_table, run_pipeline,
+};
