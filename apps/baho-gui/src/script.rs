@@ -170,6 +170,14 @@ impl ScriptRunner {
         }
         None
     }
+
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.cursor >= self.steps.len()
+    }
 }
 
 #[cfg(test)]
@@ -182,5 +190,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(steps.len(), 5);
+    }
+
+    #[test]
+    fn exposes_delay_deadline_without_advancing_early() {
+        let now = Instant::now();
+        let mut runner = ScriptRunner::new(vec![Step::Delay(0.1), Step::Screenshot("x".into())]);
+        let mut input = InputState::default();
+        let layout = Layout::new();
+
+        assert_eq!(runner.advance(&mut input, &layout, now), None);
+        let deadline = runner.next_deadline().unwrap();
+        assert_eq!(deadline, now + Duration::from_millis(100));
+        assert!(!runner.is_exhausted());
+        assert_eq!(
+            runner.advance(&mut input, &layout, deadline),
+            Some("x".into())
+        );
+        assert!(runner.is_exhausted());
+        assert_eq!(runner.next_deadline(), None);
     }
 }

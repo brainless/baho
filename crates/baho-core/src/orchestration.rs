@@ -139,7 +139,7 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
     let mut input_profile = None;
     let mut parser_config = None;
     let mut candidates = Vec::new();
-    let selected_candidate = None;
+    let mut selected_candidate = None;
 
     if let Err(error) = dispatch_format(path) {
         diagnostics.push(Diagnostic {
@@ -348,6 +348,7 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
             ));
         }
     };
+    selected_candidate = Some(selected.clone());
     push_event(
         &mut events,
         "table_candidate_selected",
@@ -1436,7 +1437,7 @@ Sam,Lagos
     }
 
     #[test]
-    fn oversized_field_in_selected_region_fails_without_output() {
+    fn oversized_field_in_selected_region_retains_selected_candidate_without_output() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(file, "Name,Code").unwrap();
         for (name, code) in [
@@ -1459,6 +1460,19 @@ Sam,Lagos
 
         assert_eq!(result.outcome, CoreOutcome::Failed);
         assert!(result.output.is_none());
+        let selected = result
+            .selected_candidate
+            .as_ref()
+            .expect("candidate selected before the selected-region failure");
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.id == selected.id)
+        );
+        assert!(result.events.iter().any(|event| {
+            event.name == "table_candidate_selected" && event.fields["candidate_id"] == selected.id
+        }));
         let diagnostic = result
             .diagnostics
             .iter()

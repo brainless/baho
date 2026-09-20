@@ -11,6 +11,7 @@ use akar_layout::{Dimension, Layout, NodeId, PageConfig, Size, Style};
 use akar_winit::process_window_event;
 use anyhow::{Context, Result};
 use baho_core::open_table;
+use baho_model::{Diagnostic, Severity};
 use clap::Parser;
 use wgpu::{
     CompositeAlphaMode, CurrentSurfaceTexture, InstanceDescriptor, PresentMode, TextureUsages,
@@ -19,7 +20,7 @@ use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowAttributes},
 };
 
@@ -57,12 +58,15 @@ struct AppState {
     grid_node: NodeId,
     grid_state: DataGridState,
     adapter: GridAdapter,
+    row_keys: Vec<u64>,
+    descriptors: Vec<akar_components::DataGridColumn>,
 }
 
 struct App {
     state: Option<AppState>,
     args: Args,
     initial_adapter: Option<GridAdapter>,
+    fatal_error: Option<anyhow::Error>,
     script: Option<ScriptRunner>,
     start_time: Option<Instant>,
     screenshot_taken: bool,
@@ -112,21 +116,86 @@ fn run() -> Result<()> {
         })
         .transpose()?;
     let table = open_table(&args.input).map_err(|failure| anyhow::anyhow!(failure.to_string()))?;
+    if let Some(summary) = format_startup_diagnostics(&table.diagnostics) {
+        eprintln!("{summary}");
+    }
     let adapter =
         GridAdapter::from_opened_table(&table).context("could not adapt opened table to a grid")?;
     let event_loop = EventLoop::new().context("could not create event loop")?;
-    event_loop
-        .run_app(&mut App {
-            state: None,
-            args,
-            initial_adapter: Some(adapter),
-            script,
-            start_time: None,
-            screenshot_taken: false,
-            layout_dumped: false,
-            frame_dumped: false,
-        })
-        .context("window event loop failed")
+    let mut app = App {
+        state: None,
+        args,
+        initial_adapter: Some(adapter),
+        fatal_error: None,
+        script,
+        start_time: None,
+        screenshot_taken: false,
+        layout_dumped: false,
+        frame_dumped: false,
+    };
+    let event_loop_result = event_loop.run_app(&mut app);
+    finish_event_loop(event_loop_result, app.fatal_error)
+}
+
+const MAX_DIAGNOSTIC_GROUPS: usize = 8;
+
+fn format_startup_diagnostics(diagnostics: &[Diagnostic]) -> Option<String> {
+    if diagnostics.is_empty() {
+        return None;
+    }
+
+    let mut severity_counts = [0_usize; 3];
+    let mut groups = std::collections::BTreeMap::new();
+    for diagnostic in diagnostics {
+        let (rank, label) = match diagnostic.severity {
+            Severity::Error => (0_u8, "error"),
+            Severity::Warning => (1, "warning"),
+            Severity::Info => (2, "info"),
+        };
+        severity_counts[usize::from(rank)] += 1;
+        *groups
+            .entry((
+                rank,
+                label,
+                diagnostic.stage.as_str(),
+                diagnostic.code.as_str(),
+            ))
+            .or_insert(0_usize) += 1;
+    }
+
+    let mut summary = format!(
+        "baho-gui: {} diagnostic(s): {} error, {} warning, {} info",
+        diagnostics.len(),
+        severity_counts[0],
+        severity_counts[1],
+        severity_counts[2]
+    );
+    for ((_, severity, stage, code), count) in groups.iter().take(MAX_DIAGNOSTIC_GROUPS) {
+        use std::fmt::Write as _;
+        let _ = write!(
+            summary,
+            "\nbaho-gui: {severity} [{stage}] {code} ({count} occurrence(s))"
+        );
+    }
+    if groups.len() > MAX_DIAGNOSTIC_GROUPS {
+        use std::fmt::Write as _;
+        let _ = write!(
+            summary,
+            "\nbaho-gui: {} additional diagnostic group(s) omitted",
+            groups.len() - MAX_DIAGNOSTIC_GROUPS
+        );
+    }
+    Some(summary)
+}
+
+fn finish_event_loop(
+    event_loop_result: Result<(), winit::error::EventLoopError>,
+    fatal_error: Option<anyhow::Error>,
+) -> Result<()> {
+    if let Some(error) = fatal_error {
+        return Err(error);
+    }
+    event_loop_result.context("window event loop failed")
 }
 
 impl ApplicationHandler for App {
@@ -149,8 +218,10 @@ impl ApplicationHandler for App {
         ) {
             Ok(window) => Arc::new(window),
             Err(error) => {
-                eprintln!("baho-gui: could not create window: {error}");
-                event_loop.exit();
+                self.fail(
+                    event_loop,
+                    anyhow::anyhow!("could not create window: {error}"),
+                );
                 return;
             }
         };
@@ -160,8 +231,10 @@ impl ApplicationHandler for App {
         let surface = match instance.create_surface(window.clone()) {
             Ok(surface) => surface,
             Err(error) => {
-                eprintln!("baho-gui: could not create surface: {error}");
-                event_loop.exit();
+                self.fail(
+                    event_loop,
+                    anyhow::anyhow!("could not create surface: {error}"),
+                );
                 return;
             }
         };
@@ -172,8 +245,10 @@ impl ApplicationHandler for App {
             })) {
                 Ok(adapter) => adapter,
                 Err(error) => {
-                    eprintln!("baho-gui: no compatible GPU adapter: {error}");
-                    event_loop.exit();
+                    self.fail(
+                        event_loop,
+                        anyhow::anyhow!("no compatible GPU adapter: {error}"),
+                    );
                     return;
                 }
             };
@@ -181,8 +256,10 @@ impl ApplicationHandler for App {
             match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
                 Ok(pair) => pair,
                 Err(error) => {
-                    eprintln!("baho-gui: could not create GPU device: {error}");
-                    event_loop.exit();
+                    self.fail(
+                        event_loop,
+                        anyhow::anyhow!("could not create GPU device: {error}"),
+                    );
                     return;
                 }
             };
@@ -191,8 +268,10 @@ impl ApplicationHandler for App {
         {
             Some(config) => config,
             None => {
-                eprintln!("baho-gui: surface has no supported configuration");
-                event_loop.exit();
+                self.fail(
+                    event_loop,
+                    anyhow::anyhow!("surface has no supported configuration"),
+                );
                 return;
             }
         };
@@ -224,10 +303,15 @@ impl ApplicationHandler for App {
         layout.register_label("grid", grid_node);
         layout.set_children(page.main, &[grid_node]);
         let Some(adapter) = self.initial_adapter.take() else {
-            eprintln!("baho-gui: table was already initialized");
-            event_loop.exit();
+            self.fail(event_loop, anyhow::anyhow!("table was already initialized"));
             return;
         };
+        let row_keys = adapter.rows.iter().map(|row| row.key).collect();
+        let descriptors = adapter
+            .columns
+            .iter()
+            .map(|column| column.descriptor)
+            .collect();
         self.start_time = Some(Instant::now());
         self.state = Some(AppState {
             window,
@@ -241,6 +325,8 @@ impl ApplicationHandler for App {
             grid_node,
             grid_state: DataGridState::new(),
             adapter,
+            row_keys,
+            descriptors,
         });
         if let Some(state) = &self.state {
             state.window.request_redraw();
@@ -274,9 +360,39 @@ impl ApplicationHandler for App {
         process_window_event(&mut state.core.input, &event);
         state.window.request_redraw();
     }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let screenshot_deadline = (!self.screenshot_taken)
+            .then(|| self.args.screenshot.as_ref())
+            .flatten()
+            .and_then(|_| self.start_time)
+            .map(|start| start + Duration::from_secs_f64(self.args.delay));
+        let script_deadline = self.script.as_ref().and_then(ScriptRunner::next_deadline);
+        let deadline = [screenshot_deadline, script_deadline]
+            .into_iter()
+            .flatten()
+            .min();
+
+        match deadline {
+            Some(deadline) if deadline <= now => {
+                event_loop.set_control_flow(ControlFlow::Wait);
+                if let Some(state) = &self.state {
+                    state.window.request_redraw();
+                }
+            }
+            Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
 }
 
 impl App {
+    fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
+        self.fatal_error = Some(error);
+        event_loop.exit();
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let Some(state) = self.state.as_mut() else {
             return;
@@ -315,13 +431,8 @@ impl App {
             runner.advance(&mut state.core.input, &state.layout, Instant::now())
         });
         let style = DataGridStyle::from_theme(&AKAR_THEME_DARK);
-        let row_keys: Vec<u64> = state.adapter.rows.iter().map(|row| row.key).collect();
-        let descriptors: Vec<_> = state
-            .adapter
-            .columns
-            .iter()
-            .map(|column| column.descriptor)
-            .collect();
+        let row_keys = &state.row_keys;
+        let descriptors = &state.descriptors;
         // Akar consumes navigation input before begin so the same frame uses
         // the updated active cell and scroll position.
         let _keyboard = data_grid_handle_keyboard(
@@ -330,8 +441,8 @@ impl App {
             state.grid_node,
             &mut state.grid_state,
             state.adapter.rows.len(),
-            &row_keys,
-            &descriptors,
+            row_keys,
+            descriptors,
             &style,
         );
         let selected = state
@@ -346,10 +457,10 @@ impl App {
             state.grid_node,
             &mut state.grid_state,
             state.adapter.rows.len(),
-            &row_keys,
+            row_keys,
             style.row_height,
             style.header_height,
-            &descriptors,
+            descriptors,
             &style,
         );
         data_grid_header_begin(&mut state.core, &response, &style);
@@ -361,7 +472,7 @@ impl App {
                     &response,
                     state.grid_node,
                     column_index,
-                    &descriptors,
+                    descriptors,
                     &style,
                     &column.display_name,
                     DataGridSortDirection::None,
@@ -369,7 +480,7 @@ impl App {
             }
         }
         data_grid_header_end(&mut state.core);
-        data_grid_body_begin(&mut state.core, &response, &row_keys, &style, &selected);
+        data_grid_body_begin(&mut state.core, &response, row_keys, &style, &selected);
         for row_index in response.visible_rows.clone() {
             for column_index in response.visible_columns.clone() {
                 let Some(row) = state.adapter.rows.get(row_index) else {
@@ -390,7 +501,7 @@ impl App {
                     row_index,
                     row.key,
                     column_index,
-                    &descriptors,
+                    descriptors,
                     &style,
                     text,
                     selected.contains(&row.key),
@@ -494,8 +605,73 @@ impl App {
             && (capture || (self.args.screenshot.is_none() && self.script.is_none()));
         if exit_after_frame {
             event_loop.exit();
+            return;
         }
-        state.window.request_redraw();
+        if self
+            .script
+            .as_ref()
+            .is_some_and(|runner| !runner.is_exhausted() && runner.next_deadline().is_none())
+        {
+            state.window.request_redraw();
+        }
         let _ = surface_view;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use baho_model::{Diagnostic, Severity};
+
+    use super::{finish_event_loop, format_startup_diagnostics};
+
+    #[test]
+    fn fatal_application_error_is_returned_after_event_loop_exits_normally() {
+        let error = finish_event_loop(Ok(()), Some(anyhow::anyhow!("GPU setup failed")))
+            .expect_err("fatal application errors must fail the process");
+
+        assert_eq!(error.to_string(), "GPU setup failed");
+    }
+
+    #[test]
+    fn startup_diagnostics_are_grouped_deterministically_without_messages() {
+        let diagnostics = vec![
+            Diagnostic {
+                code: "csv.ragged_record".to_string(),
+                severity: Severity::Warning,
+                stage: "ingest-csv".to_string(),
+                message: "private cell contents: do not print".to_string(),
+                location: None,
+            },
+            Diagnostic {
+                code: "csv.detected_dialect".to_string(),
+                severity: Severity::Info,
+                stage: "inspection".to_string(),
+                message: "comma-delimited".to_string(),
+                location: None,
+            },
+            Diagnostic {
+                code: "csv.ragged_record".to_string(),
+                severity: Severity::Warning,
+                stage: "ingest-csv".to_string(),
+                message: "different private contents".to_string(),
+                location: None,
+            },
+        ];
+
+        let summary = format_startup_diagnostics(&diagnostics).expect("non-empty summary");
+
+        assert_eq!(
+            summary,
+            "baho-gui: 3 diagnostic(s): 0 error, 2 warning, 1 info\n\
+             baho-gui: warning [ingest-csv] csv.ragged_record (2 occurrence(s))\n\
+             baho-gui: info [inspection] csv.detected_dialect (1 occurrence(s))"
+        );
+        assert!(!summary.contains("private"));
+        assert!(!summary.contains("comma-delimited"));
+    }
+
+    #[test]
+    fn startup_diagnostics_are_silent_when_none_exist() {
+        assert_eq!(format_startup_diagnostics(&[]), None);
     }
 }
