@@ -2,16 +2,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use akar_components::{
-    AKAR_THEME_DARK, DataGridSortDirection, DataGridState, DataGridStyle, data_grid_begin,
-    data_grid_body_begin, data_grid_body_end, data_grid_cell, data_grid_end,
-    data_grid_handle_keyboard, data_grid_header_begin, data_grid_header_cell, data_grid_header_end,
+    AKAR_THEME_DARK, ButtonVariant, DataGridSortDirection, DataGridState, DataGridStyle,
+    akar_button, akar_paragraph, akar_text_input, data_grid_begin, data_grid_body_begin,
+    data_grid_body_end, data_grid_cell, data_grid_end, data_grid_handle_keyboard,
+    data_grid_header_begin, data_grid_header_cell, data_grid_header_end,
 };
 use akar_core::AkarCore;
-use akar_layout::{Dimension, Layout, NodeId, PageConfig, Size, Style};
+use akar_layout::{
+    Dimension, Display, FlexDirection, Layout, NodeId, PageConfig, PageLayout, Size, Style, length,
+};
 use akar_winit::process_window_event;
 use anyhow::{Context, Result};
 use baho_core::open_table;
 use baho_model::{Diagnostic, Severity};
+use baho_run::{InputIdentity, Invocation};
 use clap::Parser;
 use wgpu::{
     CompositeAlphaMode, CurrentSurfaceTexture, InstanceDescriptor, PresentMode, TextureUsages,
@@ -24,7 +28,7 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-use baho_gui::GridAdapter;
+use baho_gui::{GuiSession, SelectionState};
 mod script;
 use script::{ScriptRunner, parse_script};
 
@@ -54,24 +58,121 @@ struct AppState {
     surface_config: wgpu::SurfaceConfiguration,
     core: AkarCore,
     layout: Layout,
-    page: akar_layout::PageLayout,
+    page: PageLayout,
+    prompt_node: NodeId,
+    submit_node: NodeId,
+    status_node: NodeId,
     grid_node: NodeId,
     grid_state: DataGridState,
-    adapter: GridAdapter,
-    row_keys: Vec<u64>,
-    descriptors: Vec<akar_components::DataGridColumn>,
+    selection: SelectionState,
+    session: GuiSession,
+    runs_directory: std::path::PathBuf,
+    invocation: Invocation,
+}
+
+const SIDEBAR_WIDTH: f32 = 280.0;
+
+struct AppLayout {
+    page: PageLayout,
+    prompt: NodeId,
+    submit: NodeId,
+    status: NodeId,
+    grid: NodeId,
+}
+
+fn build_app_layout(layout: &mut Layout) -> AppLayout {
+    let page = layout.page(PageConfig {
+        header_height: None,
+        footer_height: None,
+        sidebar_left_width: Some(SIDEBAR_WIDTH),
+        sidebar_right_width: None,
+    });
+    let sidebar = page.sidebar_left.expect("left sidebar was requested");
+    layout.set_style(
+        sidebar,
+        Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            flex_shrink: 0.0,
+            gap: Size {
+                width: length(0.0_f32),
+                height: length(12.0_f32),
+            },
+            size: Size {
+                width: length(SIDEBAR_WIDTH),
+                height: Dimension::percent(1.0),
+            },
+            ..Default::default()
+        },
+    );
+    layout.set_padding(sidebar, 16.0, 16.0, 16.0, 16.0);
+    let prompt = layout.new_leaf(Style {
+        flex_shrink: 0.0,
+        size: Size {
+            width: Dimension::percent(1.0),
+            height: length(40.0_f32),
+        },
+        ..Default::default()
+    });
+    let submit = layout.new_leaf(Style {
+        flex_shrink: 0.0,
+        size: Size {
+            width: Dimension::percent(1.0),
+            height: length(40.0_f32),
+        },
+        ..Default::default()
+    });
+    let status = layout.new_leaf(Style {
+        flex_shrink: 0.0,
+        size: Size {
+            width: Dimension::percent(1.0),
+            height: length(96.0_f32),
+        },
+        ..Default::default()
+    });
+    layout.set_children(sidebar, &[prompt, submit, status]);
+
+    let grid = layout.new_leaf(Style {
+        size: Size {
+            width: Dimension::percent(1.0),
+            height: Dimension::percent(1.0),
+        },
+        ..Default::default()
+    });
+    layout.set_children(page.main, &[grid]);
+    for (name, node) in [
+        ("sidebar", sidebar),
+        ("prompt", prompt),
+        ("submit", submit),
+        ("status", status),
+        ("grid", grid),
+    ] {
+        layout.register_label(name, node);
+    }
+    AppLayout {
+        page,
+        prompt,
+        submit,
+        status,
+        grid,
+    }
+}
+
+fn grid_has_keyboard_focus(layout: &Layout, grid: NodeId, focused_id: Option<u64>) -> bool {
+    focused_id == Some(layout.widget_id_keyed(grid, 0))
 }
 
 struct App {
     state: Option<AppState>,
     args: Args,
-    initial_adapter: Option<GridAdapter>,
+    initial_session: Option<GuiSession>,
     fatal_error: Option<anyhow::Error>,
     script: Option<ScriptRunner>,
     start_time: Option<Instant>,
     screenshot_taken: bool,
     layout_dumped: bool,
     frame_dumped: bool,
+    working_directory: std::path::PathBuf,
 }
 
 fn write_png(path: &std::path::Path, frame: akar_core::CapturedFrame) -> Result<()> {
@@ -115,23 +216,33 @@ fn run() -> Result<()> {
             Ok::<_, anyhow::Error>(ScriptRunner::new(steps))
         })
         .transpose()?;
-    let table = open_table(&args.input).map_err(|failure| anyhow::anyhow!(failure.to_string()))?;
+    let working_directory = std::env::current_dir().context("could not read working directory")?;
+    let absolute_input = if args.input.is_absolute() {
+        args.input.clone()
+    } else {
+        working_directory.join(&args.input)
+    };
+    let table =
+        open_table(&absolute_input).map_err(|failure| anyhow::anyhow!(failure.to_string()))?;
     if let Some(summary) = format_startup_diagnostics(&table.diagnostics) {
         eprintln!("{summary}");
     }
-    let adapter =
-        GridAdapter::from_opened_table(&table).context("could not adapt opened table to a grid")?;
+    let input_identity =
+        InputIdentity::from_snapshot(&args.input, &absolute_input, &table.source_revision);
+    let session =
+        GuiSession::new(table, input_identity).context("could not adapt opened table to a grid")?;
     let event_loop = EventLoop::new().context("could not create event loop")?;
     let mut app = App {
         state: None,
         args,
-        initial_adapter: Some(adapter),
+        initial_session: Some(session),
         fatal_error: None,
         script,
         start_time: None,
         screenshot_taken: false,
         layout_dumped: false,
         frame_dumped: false,
+        working_directory,
     };
     let event_loop_result = event_loop.run_app(&mut app);
     finish_event_loop(event_loop_result, app.fatal_error)
@@ -287,31 +398,11 @@ impl ApplicationHandler for App {
             akar_core::TextPipelineConfig::default(),
         );
         let mut layout = Layout::new();
-        let page = layout.page(PageConfig {
-            header_height: None,
-            footer_height: None,
-            sidebar_left_width: None,
-            sidebar_right_width: None,
-        });
-        let grid_node = layout.new_leaf(Style {
-            size: Size {
-                width: Dimension::percent(1.0),
-                height: Dimension::percent(1.0),
-            },
-            ..Default::default()
-        });
-        layout.register_label("grid", grid_node);
-        layout.set_children(page.main, &[grid_node]);
-        let Some(adapter) = self.initial_adapter.take() else {
+        let app_layout = build_app_layout(&mut layout);
+        let Some(session) = self.initial_session.take() else {
             self.fail(event_loop, anyhow::anyhow!("table was already initialized"));
             return;
         };
-        let row_keys = adapter.rows.iter().map(|row| row.key).collect();
-        let descriptors = adapter
-            .columns
-            .iter()
-            .map(|column| column.descriptor)
-            .collect();
         self.start_time = Some(Instant::now());
         self.state = Some(AppState {
             window,
@@ -321,12 +412,23 @@ impl ApplicationHandler for App {
             surface_config,
             core,
             layout,
-            page,
-            grid_node,
+            page: app_layout.page,
+            prompt_node: app_layout.prompt,
+            submit_node: app_layout.submit,
+            status_node: app_layout.status,
+            grid_node: app_layout.grid,
             grid_state: DataGridState::new(),
-            adapter,
-            row_keys,
-            descriptors,
+            selection: SelectionState::default(),
+            session,
+            runs_directory: self.working_directory.join(".baho/runs"),
+            invocation: Invocation {
+                command: "baho-gui".to_owned(),
+                action: "submit".to_owned(),
+                event_target: "baho_gui".to_owned(),
+                arguments: std::env::args().collect(),
+                working_directory: self.working_directory.clone(),
+                output: None,
+            },
         });
         if let Some(state) = &self.state {
             state.window.request_redraw();
@@ -405,9 +507,6 @@ impl App {
             _ => return,
         };
         state.core.begin_frame(size.width, size.height, scale);
-        if self.args.dump_frame.is_some() && !self.frame_dumped {
-            state.core.draw_list.start_recording();
-        }
         let viewport = [
             0.0,
             0.0,
@@ -430,21 +529,71 @@ impl App {
         let script_capture = self.script.as_mut().and_then(|runner| {
             runner.advance(&mut state.core.input, &state.layout, Instant::now())
         });
-        let style = DataGridStyle::from_theme(&AKAR_THEME_DARK);
-        let row_keys = &state.row_keys;
-        let descriptors = &state.descriptors;
-        // Akar consumes navigation input before begin so the same frame uses
-        // the updated active cell and scroll position.
-        let _keyboard = data_grid_handle_keyboard(
+        let dump_this_frame = self.args.dump_frame.is_some()
+            && !self.frame_dumped
+            && (self.script.is_none() || script_capture.is_some());
+        if dump_this_frame {
+            state.core.draw_list.start_recording();
+        }
+        let _prompt_response = akar_text_input(
             &mut state.core,
             &state.layout,
-            state.grid_node,
-            &mut state.grid_state,
-            state.adapter.rows.len(),
-            row_keys,
-            descriptors,
-            &style,
+            state.prompt_node,
+            &mut state.session.prompt,
+            &mut state.session.prompt_edit,
+            "Describe the result",
+            true,
+            &AKAR_THEME_DARK,
         );
+        let submit = akar_button(
+            &mut state.core,
+            &state.layout,
+            state.submit_node,
+            "Submit",
+            ButtonVariant::Solid,
+            &AKAR_THEME_DARK,
+        );
+        if submit.clicked {
+            let _ = state.session.request_submit();
+        }
+        let status = state.session.status.message();
+        akar_paragraph(
+            &mut state.core,
+            &state.layout,
+            state.status_node,
+            &status,
+            None,
+            &AKAR_THEME_DARK,
+        );
+        let style = DataGridStyle::from_theme(&AKAR_THEME_DARK);
+        let row_keys = state
+            .session
+            .display
+            .rows()
+            .iter()
+            .map(|row| row.key)
+            .collect::<Vec<_>>();
+        let descriptors = state
+            .session
+            .display
+            .columns()
+            .iter()
+            .map(|column| column.descriptor)
+            .collect::<Vec<_>>();
+        // Akar consumes navigation input before begin so the same frame uses
+        // the updated active cell and scroll position.
+        if grid_has_keyboard_focus(&state.layout, state.grid_node, state.core.input.focused_id) {
+            let _ = data_grid_handle_keyboard(
+                &mut state.core,
+                &state.layout,
+                state.grid_node,
+                &mut state.grid_state,
+                state.session.display.rows().len(),
+                &row_keys,
+                &descriptors,
+                &style,
+            );
+        }
         let selected = state
             .grid_state
             .has_active_cell
@@ -456,23 +605,23 @@ impl App {
             &state.layout,
             state.grid_node,
             &mut state.grid_state,
-            state.adapter.rows.len(),
-            row_keys,
+            state.session.display.rows().len(),
+            &row_keys,
             style.row_height,
             style.header_height,
-            descriptors,
+            &descriptors,
             &style,
         );
         data_grid_header_begin(&mut state.core, &response, &style);
         for column_index in response.visible_columns.clone() {
-            if let Some(column) = state.adapter.columns.get(column_index) {
+            if let Some(column) = state.session.display.columns().get(column_index) {
                 let _ = data_grid_header_cell(
                     &mut state.core,
                     &state.layout,
                     &response,
                     state.grid_node,
                     column_index,
-                    descriptors,
+                    &descriptors,
                     &style,
                     &column.display_name,
                     DataGridSortDirection::None,
@@ -480,18 +629,19 @@ impl App {
             }
         }
         data_grid_header_end(&mut state.core);
-        data_grid_body_begin(&mut state.core, &response, row_keys, &style, &selected);
+        data_grid_body_begin(&mut state.core, &response, &row_keys, &style, &selected);
         for row_index in response.visible_rows.clone() {
             for column_index in response.visible_columns.clone() {
-                let Some(row) = state.adapter.rows.get(row_index) else {
+                let Some(row) = state.session.display.rows().get(row_index) else {
                     continue;
                 };
-                let Some(column) = state.adapter.columns.get(column_index) else {
+                let Some(column) = state.session.display.columns().get(column_index) else {
                     continue;
                 };
                 let text = state
-                    .adapter
-                    .cell_text(row_index, column.source_ordinal)
+                    .session
+                    .display
+                    .cell_text(row_index, column_index)
                     .unwrap_or("");
                 let cell = data_grid_cell(
                     &mut state.core,
@@ -501,7 +651,7 @@ impl App {
                     row_index,
                     row.key,
                     column_index,
-                    descriptors,
+                    &descriptors,
                     &style,
                     text,
                     selected.contains(&row.key),
@@ -510,11 +660,20 @@ impl App {
                     state.grid_state.active_row_key = row.key;
                     state.grid_state.active_column_key = column.descriptor.key;
                     state.grid_state.has_active_cell = true;
+                    state.selection.activate(row.key, column.descriptor.key);
+                    state.core.input.focused_id =
+                        Some(state.layout.widget_id_keyed(state.grid_node, 0));
                 }
             }
         }
         data_grid_body_end(&mut state.core);
         data_grid_end(&mut state.core);
+        let processed = state.session.process_pending(
+            &state.runs_directory,
+            state.invocation.clone(),
+            &mut state.grid_state,
+            &mut state.selection,
+        );
         let timed_capture = !self.screenshot_taken
             && self.args.screenshot.is_some()
             && self
@@ -563,7 +722,7 @@ impl App {
             });
             let _ = state.core.end_frame(&state.device, &state.queue, &mut pass);
         }
-        if let Some(path) = self.args.dump_frame.as_ref().filter(|_| !self.frame_dumped) {
+        if let Some(path) = self.args.dump_frame.as_ref().filter(|_| dump_this_frame) {
             let dump = serde_json::json!({ "recorded_calls": state.core.draw_list.recorded_calls(), "labeled_rects": state.layout.labeled_rects(), "visible_rows": response.visible_rows, "visible_columns": response.visible_columns });
             if let Err(error) = std::fs::File::create(path).and_then(|file| {
                 serde_json::to_writer_pretty(file, &dump).map_err(std::io::Error::other)
@@ -601,6 +760,9 @@ impl App {
             state.queue.submit(std::iter::once(encoder.finish()));
         }
         output.present();
+        if processed {
+            state.window.request_redraw();
+        }
         let exit_after_frame = self.args.exit
             && (capture || (self.args.screenshot.is_none() && self.script.is_none()));
         if exit_after_frame {
@@ -620,9 +782,55 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use akar_layout::{Layout, Size};
     use baho_model::{Diagnostic, Severity};
 
-    use super::{finish_event_loop, format_startup_diagnostics};
+    use super::{
+        SIDEBAR_WIDTH, build_app_layout, finish_event_loop, format_startup_diagnostics,
+        grid_has_keyboard_focus,
+    };
+
+    #[test]
+    fn app_layout_has_fixed_sidebar_and_flexible_grid_with_stable_labels() {
+        let mut layout = Layout::new();
+        let app = build_app_layout(&mut layout);
+        layout.compute(
+            app.page.root,
+            (Some(800.0), Some(600.0)),
+            |_, _, _, _, _| Size::ZERO,
+        );
+
+        assert_eq!(
+            layout.rect(layout.resolve_label("sidebar").unwrap())[2],
+            SIDEBAR_WIDTH
+        );
+        assert_eq!(
+            layout.rect(layout.resolve_label("grid").unwrap()),
+            [SIDEBAR_WIDTH, 0.0, 520.0, 600.0]
+        );
+        for label in ["prompt", "submit", "status"] {
+            let rect = layout.rect(layout.resolve_label(label).unwrap());
+            assert!(rect[2] > 0.0, "{label} has width");
+            assert!(rect[3] > 0.0, "{label} has height");
+        }
+    }
+
+    #[test]
+    fn prompt_focus_excludes_grid_navigation_but_grid_focus_allows_it() {
+        let mut layout = Layout::new();
+        let app = build_app_layout(&mut layout);
+        layout.compute(
+            app.page.root,
+            (Some(800.0), Some(600.0)),
+            |_, _, _, _, _| Size::ZERO,
+        );
+        let prompt_focus = Some(layout.widget_id(app.prompt));
+        let grid_focus = Some(layout.widget_id_keyed(app.grid, 0));
+
+        assert!(!grid_has_keyboard_focus(&layout, app.grid, prompt_focus));
+        assert!(grid_has_keyboard_focus(&layout, app.grid, grid_focus));
+        assert!(!grid_has_keyboard_focus(&layout, app.grid, None));
+    }
 
     #[test]
     fn fatal_application_error_is_returned_after_event_loop_exits_normally() {

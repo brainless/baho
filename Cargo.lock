@@ -252,13 +252,10 @@ dependencies = [
  "assert_cmd",
  "baho-core",
  "baho-model",
- "baho-plan",
+ "baho-run",
  "clap",
- "serde",
  "serde_json",
- "sha2",
  "tempfile",
- "time",
 ]
 
 [[package]]
@@ -297,6 +294,7 @@ dependencies = [
  "anyhow",
  "baho-core",
  "baho-model",
+ "baho-run",
  "clap",
  "png",
  "pollster",
@@ -356,6 +354,21 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "baho-run"
+version = "0.1.0"
+dependencies = [
+ "baho-core",
+ "baho-model",
+ "baho-plan",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
 ]
 
 [[package]]

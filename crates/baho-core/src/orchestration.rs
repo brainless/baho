@@ -508,10 +508,14 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
             };
         }
     };
-    run_pipeline_from_opened(opened, prompt)
+    execute_prompt(&opened, prompt)
 }
 
-fn run_pipeline_from_opened(opened: OpenedTable, prompt: &str) -> CoreResult {
+/// Recognize and execute one prompt against an already opened source table.
+///
+/// The opened table is borrowed so callers can issue independent requests
+/// against the same immutable source snapshot.
+pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
     let mut result = CoreResult {
         input_profile: Some(opened.input_profile.clone()),
         parser_config: Some(opened.parser_config.clone()),
@@ -597,10 +601,10 @@ fn run_pipeline_from_opened(opened: OpenedTable, prompt: &str) -> CoreResult {
     );
     result.plan = Some(plan.clone());
     let grid = GridInput {
-        table_id: opened.selected_candidate.id,
-        source_revision: opened.source_revision.content_hash,
+        table_id: opened.selected_candidate.id.clone(),
+        source_revision: opened.source_revision.content_hash.clone(),
         source_sheet_index: opened.source_sheet_index,
-        columns: opened.columns,
+        columns: opened.columns.clone(),
         rows: opened
             .rows
             .iter()
@@ -1210,6 +1214,98 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_prompt_execution_matches_pipeline_for_success_and_refusal() {
+        let file = write_temp_csv("ID,Name\n1,Ada\n2,Bob\n3,Ada\n");
+        let opened = open_table(file.path()).expect("synthetic table should open");
+
+        for prompt in ["List unique name", "Calculate an average"] {
+            let borrowed = execute_prompt(&opened, prompt);
+            let pipeline = run_pipeline(file.path(), prompt);
+
+            assert_eq!(borrowed.outcome, pipeline.outcome);
+            assert_eq!(borrowed.input_profile, pipeline.input_profile);
+            assert_eq!(borrowed.parser_config, pipeline.parser_config);
+            assert_eq!(borrowed.candidates, pipeline.candidates);
+            assert_eq!(borrowed.selected_candidate, pipeline.selected_candidate);
+            assert_eq!(borrowed.plan, pipeline.plan);
+            assert_eq!(borrowed.intent_evidence, pipeline.intent_evidence);
+            assert_eq!(borrowed.output, pipeline.output);
+            assert_eq!(borrowed.diagnostics, pipeline.diagnostics);
+            assert_eq!(
+                serde_json::to_value(&borrowed.events).unwrap(),
+                serde_json::to_value(&pipeline.events).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_prompt_execution_is_repeatable_and_does_not_mutate_opened_table() {
+        let file = write_temp_csv("ID,Name,City\n1,Ada,Pune\n2,Bob,Delhi\n3,Ada,Pune\n");
+        let opened = open_table(file.path()).expect("synthetic table should open");
+        let revision_before = opened.source_revision.clone();
+        let candidate_before = opened.selected_candidate.clone();
+        let candidates_before = opened.candidates.clone();
+        let columns_before = opened.columns.clone();
+        let rows_before = opened.rows.clone();
+        let profile_before = opened.input_profile.clone();
+        let config_before = opened.parser_config.clone();
+        let diagnostics_before = opened.diagnostics.clone();
+        let events_before = serde_json::to_value(&opened.events).unwrap();
+
+        let names = execute_prompt(&opened, "List unique name");
+        let cities = execute_prompt(&opened, "List city");
+        let names_again = execute_prompt(&opened, "List unique name");
+
+        assert_eq!(names.outcome, CoreOutcome::Materialized);
+        assert_eq!(cities.outcome, CoreOutcome::Materialized);
+        assert_eq!(names.output, names_again.output);
+        assert_eq!(names.plan, names_again.plan);
+        assert_eq!(names.intent_evidence, names_again.intent_evidence);
+        assert_eq!(names.output.as_ref().unwrap().rows.len(), 2);
+        assert_eq!(cities.output.as_ref().unwrap().rows.len(), 3);
+
+        assert_eq!(opened.source_revision, revision_before);
+        assert_eq!(opened.selected_candidate, candidate_before);
+        assert_eq!(opened.candidates, candidates_before);
+        assert_eq!(opened.columns, columns_before);
+        assert_eq!(opened.rows, rows_before);
+        assert_eq!(opened.input_profile, profile_before);
+        assert_eq!(opened.parser_config, config_before);
+        assert_eq!(opened.diagnostics, diagnostics_before);
+        assert_eq!(serde_json::to_value(&opened.events).unwrap(), events_before);
+    }
+
+    #[test]
+    fn borrowed_prompt_execution_preserves_original_source_provenance() {
+        let file =
+            write_temp_csv("Report,,\n,,\nID,Name,City\n1,Ada,Pune\n2,Bob,Delhi\n3,Ada,Pune\n");
+        let opened = open_table(file.path()).expect("synthetic table should open");
+
+        let result = execute_prompt(&opened, "List unique name");
+        let output = result.output.expect("supported prompt should materialize");
+
+        assert_eq!(
+            output
+                .provenance
+                .iter()
+                .map(|provenance| {
+                    (
+                        provenance.source_row,
+                        provenance.source_addresses[0].sheet_index,
+                        provenance.source_addresses[0].row,
+                        provenance.source_addresses[0].col,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [(3, 0, 3, 1), (4, 0, 4, 1)]
+        );
+        assert_eq!(
+            result.plan.unwrap().source.revision,
+            opened.source_revision.content_hash
+        );
+    }
+
+    #[test]
     fn dispatch_returns_typed_unsupported_formats_before_csv_parsing() {
         let cases = [
             (
@@ -1311,53 +1407,73 @@ Total,4 items,approximate,extra,notes,more
             })
             .collect();
         assert_eq!(values, vec!["Type A", "Type B", "Type C"]);
-        assert!(output.provenance.iter().all(|provenance| {
-            provenance.source_addresses.len() == 1
-                && provenance.source_addresses[0].sheet_index == 0
-                && provenance.source_addresses[0].col == 1
-        }));
+        assert_eq!(
+            output
+                .provenance
+                .iter()
+                .map(|provenance| {
+                    (
+                        provenance.source_row,
+                        provenance.source_addresses.as_slice(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                (
+                    4,
+                    &[baho_model::document::CellAddress {
+                        sheet_index: 0,
+                        row: 4,
+                        col: 1,
+                    }][..]
+                ),
+                (
+                    5,
+                    &[baho_model::document::CellAddress {
+                        sheet_index: 0,
+                        row: 5,
+                        col: 1,
+                    }][..]
+                ),
+                (
+                    7,
+                    &[baho_model::document::CellAddress {
+                        sheet_index: 0,
+                        row: 7,
+                        col: 1,
+                    }][..]
+                ),
+            ]
+        );
+
+        let evidence = result
+            .intent_evidence
+            .as_ref()
+            .expect("success must retain recognition evidence");
+        assert_eq!(evidence.refusal_reason, None);
+        assert_eq!(evidence.canonical_operation.as_deref(), Some("distinct"));
+        assert_eq!(evidence.action.as_ref().unwrap().alias, "extract");
+        assert_eq!(evidence.modifier.as_ref().unwrap().alias, "unique");
+        assert_eq!(
+            evidence.matched_column.as_ref().unwrap().display_name,
+            "Floor Plan"
+        );
 
         // Events in correct order
         let event_names: Vec<&str> = result.events.iter().map(|e| e.name.as_str()).collect();
-        assert!(event_names.contains(&"input_profiled"));
-        assert!(event_names.contains(&"table_candidates_detected"));
-        assert!(event_names.contains(&"table_candidate_selected"));
-        assert!(event_names.contains(&"header_selected"));
-        assert!(event_names.contains(&"body_rows_classified"));
-        assert!(event_names.contains(&"intent_recognized"));
-        assert!(event_names.contains(&"plan_validated"));
-        assert!(event_names.contains(&"materialization_completed"));
-
-        // Verify event ordering
-        let idx_profiled = event_names
-            .iter()
-            .position(|&n| n == "input_profiled")
-            .unwrap();
-        let idx_candidates = event_names
-            .iter()
-            .position(|&n| n == "table_candidates_detected")
-            .unwrap();
-        let idx_selected = event_names
-            .iter()
-            .position(|&n| n == "table_candidate_selected")
-            .unwrap();
-        let idx_intent = event_names
-            .iter()
-            .position(|&n| n == "intent_recognized")
-            .unwrap();
-        let idx_plan = event_names
-            .iter()
-            .position(|&n| n == "plan_validated")
-            .unwrap();
-        let idx_materialized = event_names
-            .iter()
-            .position(|&n| n == "materialization_completed")
-            .unwrap();
-        assert!(idx_profiled < idx_candidates);
-        assert!(idx_candidates < idx_selected);
-        assert!(idx_selected < idx_intent);
-        assert!(idx_intent < idx_plan);
-        assert!(idx_plan < idx_materialized);
+        assert_eq!(
+            event_names,
+            [
+                "input_profiled",
+                "table_candidates_detected",
+                "table_candidate_selected",
+                "header_selected",
+                "body_rows_classified",
+                "intent_recognized",
+                "plan_validated",
+                "materialization_completed",
+            ]
+        );
     }
 
     #[test]
@@ -1982,6 +2098,59 @@ ID,Name
         assert!(
             evidence.matched_column.as_ref().is_some(),
             "success evidence must carry the matched column"
+        );
+    }
+
+    #[test]
+    fn unsupported_intent_preserves_opening_events_and_refusal_evidence() {
+        let csv = "ID,Name\n1,Ada\n2,Bob\n3,Carol\n";
+        let file = write_temp_csv(csv);
+        let result = run_pipeline(file.path(), "Calculate an average");
+
+        assert_eq!(result.outcome, CoreOutcome::Failed);
+        assert!(result.intent.is_none());
+        assert!(result.plan.is_none());
+        assert!(result.output.is_none());
+        assert_eq!(
+            result
+                .events
+                .iter()
+                .map(|event| event.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "input_profiled",
+                "table_candidates_detected",
+                "table_candidate_selected",
+                "header_selected",
+                "body_rows_classified",
+            ]
+        );
+
+        let evidence = result
+            .intent_evidence
+            .as_ref()
+            .expect("refusal must retain recognition evidence");
+        assert_eq!(
+            evidence.refusal_reason.as_deref(),
+            Some("intent.unsupported")
+        );
+        assert_eq!(
+            evidence
+                .prompt_tokens
+                .iter()
+                .map(|token| token.text.as_str())
+                .collect::<Vec<_>>(),
+            ["calculate", "an", "average"]
+        );
+        assert!(evidence.action.is_none());
+        assert!(evidence.matched_column.is_none());
+        assert!(evidence.canonical_operation.is_none());
+        assert!(evidence.competing_parses.is_empty());
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "intent.unsupported")
         );
     }
 

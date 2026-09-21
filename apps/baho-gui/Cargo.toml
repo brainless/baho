@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow = "1.0"
 baho-core = { path = "../../crates/baho-core" }
 baho-model = { path = "../../crates/baho-model" }
+baho-run = { path = "../../crates/baho-run" }
 clap = { version = "4.5", features = ["derive"] }
 thiserror = "2.0"
 

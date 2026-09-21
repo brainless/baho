@@ -216,9 +216,41 @@ fn unsupported_intent_returns_failure() {
         serde_json::from_slice(&fs::read(run.join("manifest.json")).expect("read manifest"))
             .expect("valid manifest JSON");
     let artifacts = manifest["artifacts"].as_array().unwrap();
-    assert!(
-        !artifacts.iter().any(|a| a == "output/result.json"),
-        "artifact index must not list output/result.json"
+    let expected_artifacts = serde_json::json!([
+        "manifest.json",
+        "intent.txt",
+        "events.jsonl",
+        "diagnostics.json",
+        "input-profile.json",
+        "parser-config.json",
+        "candidates.json",
+        "plan.json"
+    ]);
+    assert_eq!(
+        artifacts,
+        expected_artifacts
+            .as_array()
+            .expect("expected artifact array")
+    );
+
+    let event_names = fs::read_to_string(run.join("events.jsonl"))
+        .expect("read events")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid event JSON"))
+        .map(|event| event["event"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_names,
+        [
+            "run_started",
+            "input_identified",
+            "input_profiled",
+            "table_candidates_detected",
+            "table_candidate_selected",
+            "header_selected",
+            "body_rows_classified",
+            "run_finished",
+        ]
     );
 }
 

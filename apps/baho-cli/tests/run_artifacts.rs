@@ -69,12 +69,22 @@ fn run_records_the_request_and_input_identity() {
         .map(|line| serde_json::from_str::<Value>(line).expect("valid event JSON"))
         .map(|event| event["event"].as_str().unwrap().to_owned())
         .collect();
-    assert!(event_names.contains(&"run_started".to_owned()));
-    assert!(event_names.contains(&"input_identified".to_owned()));
-    assert!(event_names.contains(&"input_profiled".to_owned()));
-    assert!(event_names.contains(&"table_candidates_detected".to_owned()));
-    assert!(event_names.contains(&"run_finished".to_owned()));
-    assert!(!event_names.contains(&"processing_unavailable".to_owned()));
+    assert_eq!(
+        event_names,
+        [
+            "run_started",
+            "input_identified",
+            "input_profiled",
+            "table_candidates_detected",
+            "table_candidate_selected",
+            "header_selected",
+            "body_rows_classified",
+            "intent_recognized",
+            "plan_validated",
+            "materialization_completed",
+            "run_finished",
+        ]
+    );
 
     let diagnostics: Value =
         serde_json::from_slice(&fs::read(run.join("diagnostics.json")).expect("read diagnostics"))
@@ -94,7 +104,11 @@ fn run_records_the_request_and_input_identity() {
     assert_eq!(result["result"]["rows"].as_array().unwrap().len(), 1);
     let provenance = &result["result"]["provenance"][0];
     assert!(provenance.get("source_address").is_none());
-    assert_eq!(provenance["source_addresses"].as_array().unwrap().len(), 1);
+    assert_eq!(provenance["source_row"], 1);
+    assert_eq!(
+        provenance["source_addresses"],
+        serde_json::json!([{"sheet_index": 0, "row": 1, "col": 0}])
+    );
 
     let parser_config: Value = serde_json::from_slice(
         &fs::read(run.join("parser-config.json")).expect("read parser-config"),
@@ -160,6 +174,16 @@ fn run_records_the_request_and_input_identity() {
         .expect("valid plan JSON");
     assert_eq!(plan["schema_version"], 3);
     assert_eq!(plan["plan"]["schema_version"], 1);
+    assert_eq!(
+        plan["recognition_evidence"]["canonical_operation"],
+        "distinct"
+    );
+    assert_eq!(plan["recognition_evidence"]["action"]["alias"], "extract");
+    assert_eq!(plan["recognition_evidence"]["modifier"]["alias"], "unique");
+    assert_eq!(
+        plan["recognition_evidence"]["matched_column"]["display_name"],
+        "name"
+    );
 
     assert_eq!(
         manifest["artifacts"],

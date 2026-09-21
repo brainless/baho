@@ -18,5 +18,5 @@ pub use intent::{
 };
 pub use orchestration::{
     CoreEvent, CoreOutcome, CoreResult, OpenTableFailure, OpenedRow, OpenedTable, RawCell,
-    dispatch_format, open_table, run_pipeline,
+    dispatch_format, execute_prompt, open_table, run_pipeline,
 };
