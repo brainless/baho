@@ -7,7 +7,9 @@ use baho_ingest::profile::InputProfile;
 use baho_ingest::{DetectedFormat, ImportError, InspectOptions, detect_format};
 use baho_ingest_csv::header::build_header_with_config;
 use baho_ingest_csv::row_features::compute_row_features_with_config;
-use baho_ingest_csv::typed_values::{ParseVerdict, parse_compared_column};
+use baho_ingest_csv::typed_values::{
+    MIXED_COLUMN_MALFORMED_SHARE_PERCENT, ParseVerdict, parse_compared_column,
+};
 use baho_ingest_csv::{
     CsvImporter, DialectDetectionError, ParserConfig, SelectedRegionError,
     detect_candidates_with_config, read_selected_region,
@@ -659,11 +661,33 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
             .filter(|parsed| matches!(parsed.verdict, ParseVerdict::Mixed { .. }))
             .map(|parsed| parsed.column.column_id.clone())
             .collect();
+        let column_evidence: Vec<_> = parsed_columns
+            .iter()
+            .map(|parsed| {
+                serde_json::json!({
+                    "column_id": parsed.column.column_id,
+                    "column_ordinal": parsed.column_ordinal,
+                    "policy": parsed.column.policy,
+                    "inferred_type": parsed.column.inferred_type(),
+                    "decimal_comparison_required": decimal_column_ids.contains(&parsed.column.column_id),
+                    "verdict": parsed.verdict,
+                    "counts": parsed.counts(),
+                })
+            })
+            .collect();
+        // Version 1 of this event had only `columns` and `mixed`; historical
+        // event lines remain readable without reinterpretation.
         push_event(
             &mut result.events,
             "compared_columns_parsed",
             "ingest-csv",
-            serde_json::json!({ "columns": all_compared_column_ids, "mixed": mixed_ids }),
+            serde_json::json!({
+                "schema_version": 2,
+                "columns": all_compared_column_ids,
+                "mixed": mixed_ids,
+                "mixed_limit_percent": MIXED_COLUMN_MALFORMED_SHARE_PERCENT,
+                "column_evidence": column_evidence,
+            }),
         );
         if !mixed_ids.is_empty() {
             result.outcome = CoreOutcome::Failed;

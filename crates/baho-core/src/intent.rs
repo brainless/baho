@@ -604,6 +604,15 @@ pub fn recognize_request(
                     complete,
                     committed,
                 } => {
+                    // Enumeration omits duplicate header lengths. Keep the
+                    // deterministic longest-header refusal authoritative so
+                    // a shorter complete parse cannot hide that ambiguity.
+                    let committed = match committed {
+                        CommittedRowFilter::Refusal(
+                            error @ IntentError::ColumnAmbiguous { .. },
+                        ) => return Err(error),
+                        other => other,
+                    };
                     if complete.is_empty() {
                         return match recognize_intent(prompt, columns) {
                             Ok(retrieval) => Ok(RecognizedRequest::Retrieval(retrieval)),
@@ -3605,6 +3614,43 @@ mod tests {
         assert!(competing.iter().all(|parse| parse.modifier.is_none()));
         assert_eq!(competing[0].column_span, (1, 3));
         assert_eq!(competing[1].column_span, (1, 2));
+    }
+
+    #[test]
+    fn compact_duplicate_longest_header_refuses_before_shorter_complete_parse() {
+        let cols = vec![
+            ColumnDefinition {
+                id: "col-job".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Job".to_string()),
+                source_header_normalized: Some("job".to_string()),
+                display_name: "Job".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-job-title-1".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("Job Title".to_string()),
+                source_header_normalized: Some("job title".to_string()),
+                display_name: "Job Title".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-job-title-2".to_string(),
+                ordinal: 2,
+                source_header_raw: Some("job title".to_string()),
+                source_header_normalized: Some("job title".to_string()),
+                display_name: "job title".to_string(),
+            },
+        ];
+        let err = recognize_request("List Job Title unemployed", &cols).unwrap_err();
+        assert!(matches!(err, IntentError::ColumnAmbiguous { .. }));
+        assert_eq!(refusal_reason_of(&err), "intent.column_ambiguous");
+        let IntentError::ColumnAmbiguous { evidence, .. } = err else {
+            unreachable!()
+        };
+        let competing = evidence.unwrap().competing_parses;
+        assert_eq!(competing.len(), 1);
+        assert_eq!(competing[0].column_span, (1, 3));
+        assert_eq!(competing[0].column_display_name, "Job Title");
     }
 
     #[test]

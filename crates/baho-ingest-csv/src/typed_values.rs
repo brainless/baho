@@ -252,30 +252,26 @@ fn collect_malformed_evidence(
     column_id: &str,
     cells: &[SourcedCell],
 ) -> Vec<MalformedValuesEvidence> {
-    let mut kinds: Vec<(DecimalParseError, Vec<CellAddress>)> = Vec::new();
+    let mut kinds: Vec<MalformedValuesEvidence> = Vec::new();
     for cell in cells {
         if let ParsedCell::Malformed { reason, .. } = cell.parsed {
-            match kinds.iter_mut().find(|(kind, _)| kind == &reason) {
-                Some((_, addresses)) => addresses.push(cell.address.clone()),
-                None => kinds.push((reason, vec![cell.address.clone()])),
+            match kinds.iter_mut().find(|evidence| evidence.reason == reason) {
+                Some(evidence) => {
+                    evidence.total_count += 1;
+                    if evidence.sample_cells.len() < MAX_MALFORMED_SAMPLE_CELLS {
+                        evidence.sample_cells.push(cell.address.clone());
+                    }
+                }
+                None => kinds.push(MalformedValuesEvidence {
+                    column_id: column_id.to_string(),
+                    reason,
+                    total_count: 1,
+                    sample_cells: vec![cell.address.clone()],
+                }),
             }
         }
     }
     kinds
-        .into_iter()
-        .map(|(reason, addresses)| {
-            let total_count = addresses.len();
-            MalformedValuesEvidence {
-                column_id: column_id.to_string(),
-                reason,
-                total_count,
-                sample_cells: addresses
-                    .into_iter()
-                    .take(MAX_MALFORMED_SAMPLE_CELLS)
-                    .collect(),
-            }
-        })
-        .collect()
 }
 
 fn parse_counts(rows: usize, cells: &[SourcedCell]) -> ColumnParseCounts {
@@ -709,6 +705,44 @@ mod tests {
             evidence.sample_cells.first().cloned(),
             "cell remains the first sample for backward compatibility"
         );
+    }
+
+    #[test]
+    fn interleaved_failure_kinds_keep_full_counts_and_first_samples() {
+        let records: Vec<_> = [
+            "10,000", ".5", "20,000", ".6", "30,000", ".7", "40,000", ".8",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(offset, value)| record(10 + offset, &["row", value]))
+        .collect();
+
+        let parsed = parse_income(&records);
+
+        assert_eq!(parsed.malformed_evidence.len(), 2);
+        for (evidence, reason, rows) in [
+            (
+                &parsed.malformed_evidence[0],
+                DecimalParseError::InvalidCharacter,
+                [10, 12, 14],
+            ),
+            (
+                &parsed.malformed_evidence[1],
+                DecimalParseError::MissingIntegerDigits,
+                [11, 13, 15],
+            ),
+        ] {
+            assert_eq!(evidence.reason, reason);
+            assert_eq!(evidence.total_count, 4);
+            assert_eq!(
+                evidence.sample_cells,
+                rows.map(|row| CellAddress {
+                    sheet_index: 0,
+                    row,
+                    col: 1,
+                })
+            );
+        }
     }
 
     #[test]

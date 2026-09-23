@@ -607,6 +607,30 @@ fn row_filter_records_plan_v2_with_all_columns_and_provenance() {
         "every compared column is profiled"
     );
     assert_eq!(parsed["fields"]["fields"]["mixed"], serde_json::json!([]));
+    assert_eq!(parsed["fields"]["fields"]["schema_version"], 2);
+    assert_eq!(
+        parsed["fields"]["fields"]["column_evidence"],
+        serde_json::json!([
+            {
+                "column_id": "column-1",
+                "column_ordinal": 1,
+                "policy": "strict_decimal",
+                "inferred_type": "text",
+                "decimal_comparison_required": false,
+                "verdict": { "status": "mixed", "reason": "no_parseable_values" },
+                "counts": { "rows": 5, "missing": 0, "blank": 0, "valid": 0, "malformed": 5 }
+            },
+            {
+                "column_id": "column-2",
+                "column_ordinal": 2,
+                "policy": "strict_decimal",
+                "inferred_type": "numeric",
+                "decimal_comparison_required": true,
+                "verdict": { "status": "accepted" },
+                "counts": { "rows": 5, "missing": 1, "blank": 1, "valid": 3, "malformed": 0 }
+            }
+        ])
+    );
 
     // Structured events carry no full-document dumps of the source records.
     for record in [
@@ -749,6 +773,19 @@ fn mixed_compared_column_refusal_writes_parse_diagnostics() {
     assert_eq!(
         parsed["fields"]["fields"]["mixed"],
         serde_json::json!(["column-1"])
+    );
+    assert_eq!(parsed["fields"]["fields"]["schema_version"], 2);
+    assert_eq!(
+        parsed["fields"]["fields"]["column_evidence"],
+        serde_json::json!([{
+            "column_id": "column-1",
+            "column_ordinal": 1,
+            "policy": "strict_decimal",
+            "inferred_type": "mixed",
+            "decimal_comparison_required": true,
+            "verdict": { "status": "mixed", "reason": "malformed_share_exceeded" },
+            "counts": { "rows": 3, "missing": 0, "blank": 0, "valid": 2, "malformed": 1 }
+        }])
     );
 }
 
