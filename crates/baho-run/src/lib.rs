@@ -19,6 +19,12 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const RUN_SCHEMA_VERSION: u32 = 1;
 const RUN_ID_WIDTH: usize = 6;
+/// `plan.json` envelope schema version.
+///
+/// Version 4 covers the recognition-evidence envelope with its own
+/// `schema_version` and row-filter evidence (Epic 006). Historical envelopes
+/// are never rewritten or reinterpreted.
+const PLAN_ARTIFACT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Error)]
 pub enum RunRecordError {
@@ -230,7 +236,7 @@ impl PendingRun {
             write_json(
                 &self.absolute_path.join("plan.json"),
                 &PlanArtifact {
-                    schema_version: 3,
+                    schema_version: PLAN_ARTIFACT_SCHEMA_VERSION,
                     plan: result.plan.as_ref(),
                     recognition_evidence: Some(evidence),
                 },

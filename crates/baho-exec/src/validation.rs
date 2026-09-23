@@ -27,7 +27,9 @@ pub fn validate_execution_context(
     for step in &plan.steps {
         match step {
             PlanStep::Filter { predicate } => {
-                check_column_ref(predicate.column(), &available)?;
+                for column in predicate.columns() {
+                    check_column_ref(column, &available)?;
+                }
             }
             PlanStep::Select { columns: cols } => {
                 for col in cols {

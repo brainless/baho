@@ -1,9 +1,16 @@
 use baho_model::column::ColumnDefinition;
+use baho_model::{ExactDecimal, NumericParsePolicy};
 use baho_plan::evidence::{
-    ActionEvidence, ColumnPhraseEvidence, CompetingParseEvidence, MatchedColumn, ModifierEvidence,
-    PromptToken, RecognitionEvidence,
+    ActionEvidence, ColumnPhraseEvidence, CompetingParseEvidence, ConnectorEvidence,
+    HeaderEvidence, LiteralEvidence, MatchedColumn, ModifierEvidence, OperatorEvidence,
+    ParenthesisEvidence, PromptToken, RECOGNITION_EVIDENCE_SCHEMA_VERSION, RecognitionEvidence,
+    RowFilterEvidence,
 };
-use baho_plan::plan::{DistinctKeep, Expression, Plan, PlanSource, PlanStep};
+use baho_plan::plan::{
+    ComparisonOperator, DistinctKeep, Expression, Literal, PLAN_SCHEMA_VERSION_2, Plan, PlanSource,
+    PlanStep,
+};
+use baho_plan::validation::{MAX_PREDICATE_DEPTH, MAX_PREDICATE_NODES};
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +20,16 @@ use crate::error::IntentError;
 const FILLER_TOKENS: &[&str] = &["all", "the", "a", "an", "of", "from", "values", "value"];
 
 const AMBIGUITY_MARGIN: f64 = 0.1;
+
+/// First-token aliases that begin an explicit row-filter request. Every other
+/// first token goes straight to Epic 002 retrieval recognition.
+const ROW_ACTION_TOKENS: &[&str] = &["list", "show", "filter"];
+
+const ROW_ACTION_KEYWORD_TOKENS: &[&str] = &["rows", "where"];
+
+/// Boolean connectors, including unary negation; an unquoted literal run ends
+/// at any of these.
+const BOOLEAN_CONNECTOR_TOKENS: &[&str] = &["and", "but", "or", "not"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CanonicalAction {
@@ -286,6 +303,7 @@ fn refusal_evidence(
     competing_parses: Vec<CompetingParseEvidence>,
 ) -> RecognitionEvidence {
     RecognitionEvidence {
+        schema_version: RECOGNITION_EVIDENCE_SCHEMA_VERSION,
         prompt_tokens,
         action,
         modifier: None,
@@ -295,6 +313,7 @@ fn refusal_evidence(
         canonical_operation: None,
         refusal_reason: Some(refusal_reason.to_string()),
         competing_parses,
+        row_filter: None,
     }
 }
 
@@ -476,6 +495,7 @@ pub fn recognize_intent(
     };
 
     let evidence = RecognitionEvidence {
+        schema_version: RECOGNITION_EVIDENCE_SCHEMA_VERSION,
         prompt_tokens: prompt_token_evidence,
         action: action_evidence,
         modifier: modifier_evidence,
@@ -490,6 +510,7 @@ pub fn recognize_intent(
         canonical_operation: Some(canonical_op_str),
         refusal_reason: None,
         competing_parses: Vec::new(),
+        row_filter: None,
     };
 
     Ok(RecognizedIntent {
@@ -539,9 +560,836 @@ pub fn compile_intent_to_plan(
     }
 }
 
+// ==== Epic 006: constrained row-filter grammar ====
+
+/// A recognized user request: an Epic 002 retrieval, or an Epic 006
+/// explicit-column Boolean row filter.
+#[derive(Debug, Clone)]
+pub enum RecognizedRequest {
+    Retrieval(RecognizedIntent),
+    RowFilter(RowFilterIntent),
+}
+
+/// A recognized explicit-column row filter with its compiled predicate and
+/// full recognition evidence.
+#[derive(Debug, Clone)]
+pub struct RowFilterIntent {
+    pub predicate: Expression,
+    pub evidence: RecognitionEvidence,
+}
+
+/// Recognize a prompt as either a row filter or a retrieval request.
+///
+/// A request is a row filter if and only if a predicate follows a
+/// `list`/`show`/`filter` action. When no predicate is present the request
+/// falls back to the Epic 002 retrieval recognizer, which retains its
+/// projection and distinct meanings. When the action words `rows`/`where`
+/// announce a row filter but the predicate fails to parse, the row-filter
+/// refusal is reported instead of a retrieval reinterpretation.
+pub fn recognize_request(
+    prompt: &str,
+    columns: &[ColumnDefinition],
+) -> Result<RecognizedRequest, IntentError> {
+    let words = tokenize_prompt(prompt);
+    if let Some(first) = words.first() {
+        if ROW_ACTION_TOKENS.contains(&first.normalized.as_str()) {
+            if let Some(attempted) = attempt_row_filter(&words, columns) {
+                return attempted.map(RecognizedRequest::RowFilter);
+            }
+        }
+    }
+    recognize_intent(prompt, columns).map(RecognizedRequest::Retrieval)
+}
+
+/// Compile a recognized request into a plan.
+///
+/// Retrieval requests compile to version 1 plans exactly as before; row
+/// filters compile to a version 2 plan with a single filter step that
+/// retains every source column in source order.
+pub fn compile_request_to_plan(
+    request: &RecognizedRequest,
+    source_revision: &str,
+    table_id: &str,
+) -> Plan {
+    match request {
+        RecognizedRequest::Retrieval(intent) => {
+            compile_intent_to_plan(intent, source_revision, table_id)
+        }
+        RecognizedRequest::RowFilter(intent) => Plan {
+            schema_version: PLAN_SCHEMA_VERSION_2,
+            source: PlanSource {
+                revision: source_revision.to_string(),
+                table_id: table_id.to_string(),
+            },
+            steps: vec![PlanStep::Filter {
+                predicate: intent.predicate.clone(),
+            }],
+        },
+    }
+}
+
+/// A prompt word after tokenization. `raw` preserves the recognized source
+/// text (quotes stripped on quoted spans); `normalized` is the lowercased
+/// form used for header matching and prompt-token evidence.
+#[derive(Debug, Clone)]
+struct PromptWord {
+    raw: String,
+    normalized: String,
+    quoted: bool,
+}
+
+fn unquoted_word(raw: String) -> PromptWord {
+    let normalized = raw.to_lowercase();
+    PromptWord {
+        raw,
+        normalized,
+        quoted: false,
+    }
+}
+
+/// Tokenize a prompt into words. Whitespace separates words, parentheses are
+/// split from adjacent text so `(job` and `1)` always yield separate tokens,
+/// and a quoted span — including any interior whitespace — becomes one token
+/// with its quotes stripped. An unterminated quote degrades to an ordinary
+/// unquoted word so tokenization stays total over input-controlled text.
+fn tokenize_prompt(prompt: &str) -> Vec<PromptWord> {
+    let mut words = Vec::new();
+    let mut chars = prompt.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        let Some(&first) = chars.peek() else {
+            break;
+        };
+        if first == '(' || first == ')' {
+            chars.next();
+            words.push(unquoted_word(first.to_string()));
+            continue;
+        }
+        if first == '"' {
+            chars.next();
+            let mut content = String::new();
+            let mut closed = false;
+            for c in chars.by_ref() {
+                if c == '"' {
+                    closed = true;
+                    break;
+                }
+                content.push(c);
+            }
+            if closed {
+                words.push(PromptWord {
+                    normalized: content.to_lowercase(),
+                    raw: content,
+                    quoted: true,
+                });
+            } else {
+                words.push(unquoted_word(format!("\"{content}")));
+            }
+            continue;
+        }
+        let mut raw = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() || c == '(' || c == ')' || c == '"' {
+                break;
+            }
+            raw.push(c);
+            chars.next();
+        }
+        if !raw.is_empty() {
+            words.push(unquoted_word(raw));
+        }
+    }
+    words
+}
+
+fn comparison_operator_token(normalized: &str) -> Option<ComparisonOperator> {
+    match normalized {
+        "=" => Some(ComparisonOperator::Equal),
+        "!=" => Some(ComparisonOperator::NotEqual),
+        "<" => Some(ComparisonOperator::Less),
+        "<=" => Some(ComparisonOperator::LessOrEqual),
+        ">" => Some(ComparisonOperator::Greater),
+        ">=" => Some(ComparisonOperator::GreaterOrEqual),
+        _ => None,
+    }
+}
+
+fn is_boundary_token(word: &PromptWord) -> bool {
+    !word.quoted
+        && (BOOLEAN_CONNECTOR_TOKENS.contains(&word.normalized.as_str())
+            || word.normalized == "("
+            || word.normalized == ")"
+            || comparison_operator_token(&word.normalized).is_some())
+}
+
+struct HeaderPhrase {
+    tokens: Vec<String>,
+    column_id: String,
+    display_name: String,
+}
+
+/// The complete normalized header phrases for binding, ordered longest first
+/// and then by stable column ID, so candidate discovery is deterministic.
+fn header_phrases(columns: &[ColumnDefinition]) -> Vec<HeaderPhrase> {
+    let mut phrases: Vec<HeaderPhrase> = columns
+        .iter()
+        .filter_map(|column| {
+            let normalized = normalize_for_match(&column.display_name);
+            let tokens: Vec<String> = normalized
+                .split(' ')
+                .filter(|token| !token.is_empty())
+                .map(str::to_string)
+                .collect();
+            (!tokens.is_empty()).then(|| HeaderPhrase {
+                tokens,
+                column_id: column.id.clone(),
+                display_name: column.display_name.clone(),
+            })
+        })
+        .collect();
+    phrases.sort_by(|a, b| {
+        b.tokens
+            .len()
+            .cmp(&a.tokens.len())
+            .then_with(|| a.column_id.cmp(&b.column_id))
+    });
+    phrases
+}
+
+enum HeaderBinding {
+    None,
+    Unique {
+        column_id: String,
+        display_name: String,
+        token_count: usize,
+    },
+    /// One normalized phrase claimed by more than one column: a duplicate
+    /// header that cannot be bound to a single identity.
+    Duplicate {
+        display_names: Vec<String>,
+        span: (usize, usize),
+    },
+    /// Complete header phrases of different lengths start at the same
+    /// position, so more than one parse survives.
+    Overlapping {
+        display_names: Vec<String>,
+        matches: Vec<(usize, String)>,
+    },
+}
+
+enum Bail {
+    NoPredicate,
+    Unsupported(String),
+    ColumnNotFound { prompt_term: String },
+    LiteralInvalid { detail: String },
+    Refused(IntentError),
+}
+
+struct RowFilterParser<'a> {
+    words: &'a [PromptWord],
+    phrases: &'a [HeaderPhrase],
+    start: usize,
+    pos: usize,
+    group_depth: usize,
+    guard_depth: usize,
+    node_count: usize,
+    atomics_parsed: usize,
+    headers: Vec<HeaderEvidence>,
+    operators: Vec<OperatorEvidence>,
+    connectors: Vec<ConnectorEvidence>,
+    literals: Vec<LiteralEvidence>,
+    parentheses: Vec<ParenthesisEvidence>,
+    prompt_tokens: Vec<PromptToken>,
+    action: Option<ActionEvidence>,
+}
+
+impl<'a> RowFilterParser<'a> {
+    fn new(
+        words: &'a [PromptWord],
+        phrases: &'a [HeaderPhrase],
+        start: usize,
+        prompt_tokens: Vec<PromptToken>,
+        action: Option<ActionEvidence>,
+    ) -> Self {
+        Self {
+            words,
+            phrases,
+            start,
+            pos: start,
+            group_depth: 0,
+            guard_depth: 0,
+            node_count: 0,
+            atomics_parsed: 0,
+            headers: Vec::new(),
+            operators: Vec::new(),
+            connectors: Vec::new(),
+            literals: Vec::new(),
+            parentheses: Vec::new(),
+            prompt_tokens,
+            action,
+        }
+    }
+
+    fn normalized_at(&self, pos: usize) -> Option<&str> {
+        self.words.get(pos).map(|word| word.normalized.as_str())
+    }
+
+    fn push_node(&mut self) -> Result<(), Bail> {
+        self.node_count += 1;
+        if self.node_count > MAX_PREDICATE_NODES {
+            return Err(Bail::Unsupported(format!(
+                "predicate exceeds the maximum of {MAX_PREDICATE_NODES} nodes"
+            )));
+        }
+        Ok(())
+    }
+
+    fn enter_guard(&mut self) -> Result<(), Bail> {
+        self.guard_depth += 1;
+        if self.guard_depth > MAX_PREDICATE_DEPTH {
+            return Err(Bail::Unsupported(format!(
+                "predicate exceeds the maximum depth of {MAX_PREDICATE_DEPTH}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn refusal(&self, reason: &str, competing: Vec<CompetingParseEvidence>) -> RecognitionEvidence {
+        refusal_evidence(
+            self.prompt_tokens.clone(),
+            self.action.clone(),
+            reason,
+            competing,
+        )
+    }
+
+    fn bind_header(&self, pos: usize) -> HeaderBinding {
+        let mut matches: Vec<&HeaderPhrase> = Vec::new();
+        for phrase in self.phrases {
+            let end = pos + phrase.tokens.len();
+            if end > self.words.len() {
+                continue;
+            }
+            if (0..phrase.tokens.len())
+                .all(|offset| self.words[pos + offset].normalized == phrase.tokens[offset])
+            {
+                matches.push(phrase);
+            }
+        }
+        if matches.is_empty() {
+            return HeaderBinding::None;
+        }
+        let last = matches.len() - 1;
+        if matches[0].tokens.len() != matches[last].tokens.len() {
+            let display_names = display_names_deduped(matches.iter().map(|m| &m.display_name));
+            let match_spans = matches
+                .iter()
+                .map(|m| (m.tokens.len(), m.display_name.clone()))
+                .collect();
+            return HeaderBinding::Overlapping {
+                display_names,
+                matches: match_spans,
+            };
+        }
+        if matches.len() > 1 {
+            let display_names = display_names_deduped(matches.iter().map(|m| &m.display_name));
+            return HeaderBinding::Duplicate {
+                display_names,
+                span: (pos, pos + matches[0].tokens.len()),
+            };
+        }
+        HeaderBinding::Unique {
+            column_id: matches[0].column_id.clone(),
+            display_name: matches[0].display_name.clone(),
+            token_count: matches[0].tokens.len(),
+        }
+    }
+
+    fn column_ambiguous_error(
+        &self,
+        display_names: Vec<String>,
+        span: (usize, usize),
+    ) -> IntentError {
+        let competing: Vec<CompetingParseEvidence> = display_names
+            .iter()
+            .map(|display_name| CompetingParseEvidence {
+                column_display_name: display_name.clone(),
+                score: 1.0,
+                column_span: span,
+                modifier: None,
+            })
+            .collect();
+        IntentError::ColumnAmbiguous {
+            candidates: display_names,
+            evidence: Some(self.refusal("intent.column_ambiguous", competing)),
+        }
+    }
+
+    fn parse_ambiguous_error(
+        &self,
+        display_names: Vec<String>,
+        matches: &[(usize, String)],
+    ) -> IntentError {
+        let competing: Vec<CompetingParseEvidence> = matches
+            .iter()
+            .map(|(token_count, display_name)| CompetingParseEvidence {
+                column_display_name: display_name.clone(),
+                score: 1.0,
+                column_span: (self.pos, self.pos + token_count),
+                modifier: None,
+            })
+            .collect();
+        IntentError::ParseAmbiguous {
+            candidates: display_names,
+            evidence: Some(self.refusal("intent.parse_ambiguous", competing)),
+        }
+    }
+
+    fn parse_or(&mut self) -> Result<Expression, Bail> {
+        let mut predicates = vec![self.parse_and()?];
+        while self.normalized_at(self.pos) == Some("or") {
+            self.connectors.push(ConnectorEvidence {
+                alias: "or".to_string(),
+                span: (self.pos, self.pos + 1),
+            });
+            self.pos += 1;
+            predicates.push(self.parse_and()?);
+        }
+        self.finish_nary(predicates, false)
+    }
+
+    fn parse_and(&mut self) -> Result<Expression, Bail> {
+        let mut predicates = vec![self.parse_unary()?];
+        while matches!(self.normalized_at(self.pos), Some("and") | Some("but")) {
+            let alias = self.normalized_at(self.pos).unwrap_or_default().to_string();
+            self.connectors.push(ConnectorEvidence {
+                alias,
+                span: (self.pos, self.pos + 1),
+            });
+            self.pos += 1;
+            predicates.push(self.parse_unary()?);
+        }
+        self.finish_nary(predicates, true)
+    }
+
+    fn finish_nary(
+        &mut self,
+        predicates: Vec<Expression>,
+        is_and: bool,
+    ) -> Result<Expression, Bail> {
+        let Some(first) = predicates.first() else {
+            return Err(Bail::Unsupported("empty boolean expression".to_string()));
+        };
+        if predicates.len() == 1 {
+            return Ok(first.clone());
+        }
+        self.push_node()?;
+        Ok(if is_and {
+            Expression::And { predicates }
+        } else {
+            Expression::Or { predicates }
+        })
+    }
+
+    fn parse_unary(&mut self) -> Result<Expression, Bail> {
+        let mut negations = 0;
+        while self.normalized_at(self.pos) == Some("not") {
+            self.connectors.push(ConnectorEvidence {
+                alias: "not".to_string(),
+                span: (self.pos, self.pos + 1),
+            });
+            self.pos += 1;
+            self.enter_guard()?;
+            negations += 1;
+        }
+        if self.pos >= self.words.len() {
+            if negations == 0 && self.atomics_parsed == 0 && self.pos == self.start {
+                return Err(Bail::NoPredicate);
+            }
+            return Err(Bail::Unsupported("expected a condition".to_string()));
+        }
+        let mut expression = if self.normalized_at(self.pos) == Some("(") {
+            self.parse_group()?
+        } else {
+            self.parse_atomic()?
+        };
+        for _ in 0..negations {
+            self.push_node()?;
+            expression = Expression::Not {
+                predicate: Box::new(expression),
+            };
+        }
+        Ok(expression)
+    }
+
+    fn parse_group(&mut self) -> Result<Expression, Bail> {
+        self.parentheses.push(ParenthesisEvidence {
+            text: "(".to_string(),
+            span: (self.pos, self.pos + 1),
+        });
+        self.pos += 1;
+        self.group_depth += 1;
+        self.enter_guard()?;
+        let parsed = self.parse_or();
+        self.group_depth -= 1;
+        let expression = parsed?;
+        if self.normalized_at(self.pos) != Some(")") {
+            return Err(Bail::Unsupported(
+                "expected ')' to close the parenthesized predicate".to_string(),
+            ));
+        }
+        self.parentheses.push(ParenthesisEvidence {
+            text: ")".to_string(),
+            span: (self.pos, self.pos + 1),
+        });
+        self.pos += 1;
+        Ok(expression)
+    }
+
+    /// Whether the parse so far is exactly one bare header phrase at the
+    /// predicate start: nothing predicate-shaped is present and the request
+    /// belongs to the retrieval grammar.
+    fn at_bare_start(&self) -> bool {
+        self.atomics_parsed == 1
+            && self.headers.len() == 1
+            && self.operators.is_empty()
+            && self.literals.is_empty()
+            && self.connectors.is_empty()
+            && self.parentheses.is_empty()
+            && self.group_depth == 0
+    }
+
+    fn parse_atomic(&mut self) -> Result<Expression, Bail> {
+        match self.bind_header(self.pos) {
+            HeaderBinding::None => {
+                let prompt_term = self.words[self.pos..]
+                    .iter()
+                    .map(|word| word.normalized.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Err(Bail::ColumnNotFound { prompt_term })
+            }
+            HeaderBinding::Duplicate {
+                display_names,
+                span,
+            } => Err(Bail::Refused(
+                self.column_ambiguous_error(display_names, span),
+            )),
+            HeaderBinding::Overlapping {
+                display_names,
+                matches,
+            } => Err(Bail::Refused(
+                self.parse_ambiguous_error(display_names, &matches),
+            )),
+            HeaderBinding::Unique {
+                column_id,
+                display_name,
+                token_count,
+            } => {
+                self.push_node()?;
+                let span = (self.pos, self.pos + token_count);
+                self.headers.push(HeaderEvidence {
+                    tokens: (0..token_count)
+                        .map(|offset| self.words[self.pos + offset].normalized.clone())
+                        .collect(),
+                    span,
+                    column_id: column_id.clone(),
+                    display_name,
+                });
+                self.pos += token_count;
+                self.atomics_parsed += 1;
+
+                if let Some(operator) = self
+                    .normalized_at(self.pos)
+                    .and_then(comparison_operator_token)
+                {
+                    self.operators.push(OperatorEvidence {
+                        operator,
+                        span: (self.pos, self.pos + 1),
+                    });
+                    self.pos += 1;
+                    let literal = self.parse_literal(false)?;
+                    return Ok(Expression::Compare {
+                        column: column_id,
+                        operator,
+                        literal,
+                    });
+                }
+                if self.pos >= self.words.len() {
+                    if self.at_bare_start() {
+                        return Err(Bail::NoPredicate);
+                    }
+                    return Err(Bail::Unsupported(
+                        "expected a comparison or a text literal after the column".to_string(),
+                    ));
+                }
+                if is_boundary_token(&self.words[self.pos]) {
+                    return Err(Bail::Unsupported(
+                        "expected a comparison operator or a text literal after the column"
+                            .to_string(),
+                    ));
+                }
+                let literal = self.parse_literal(true)?;
+                Ok(Expression::Compare {
+                    column: column_id,
+                    operator: ComparisonOperator::Equal,
+                    literal,
+                })
+            }
+        }
+    }
+
+    /// Parse one literal at the current position and record its evidence.
+    ///
+    /// A quoted span is one text token. An unquoted literal run ends at the
+    /// next Boolean connector, parenthesis, or comparison operator. With the
+    /// explicit comparison forms an unquoted single token containing an ASCII
+    /// digit must be a strict exact decimal, so `10,000` or `1.2.3` refuse as
+    /// invalid literals. The implicit-equality form is sugar for `=` with a
+    /// quoted text literal, so it never produces decimals or literal
+    /// refusals.
+    fn parse_literal(&mut self, force_text: bool) -> Result<Literal, Bail> {
+        let start = self.pos;
+        if start >= self.words.len() {
+            return Err(Bail::Unsupported(
+                "expected a literal after the comparison operator".to_string(),
+            ));
+        }
+        if is_boundary_token(&self.words[start]) {
+            return Err(Bail::Unsupported(
+                "expected a literal after the comparison operator".to_string(),
+            ));
+        }
+        let end = if self.words[start].quoted {
+            start + 1
+        } else {
+            let mut run_end = start;
+            while run_end < self.words.len() && !is_boundary_token(&self.words[run_end]) {
+                run_end += 1;
+            }
+            run_end
+        };
+        let raw_text = self.words[start..end]
+            .iter()
+            .map(|word| word.raw.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let first = &self.words[start];
+        let (literal, parser_policy) = if first.quoted || force_text {
+            (Literal::Text(raw_text.clone()), None)
+        } else if first.raw.bytes().any(|byte| byte.is_ascii_digit()) {
+            if end != start + 1 {
+                return Err(Bail::LiteralInvalid {
+                    detail: format!("numeric literal '{raw_text}' must be a single token"),
+                });
+            }
+            match ExactDecimal::parse(&first.raw) {
+                Ok(value) => (
+                    Literal::Decimal(value),
+                    Some(NumericParsePolicy::StrictDecimal),
+                ),
+                Err(error) => {
+                    return Err(Bail::LiteralInvalid {
+                        detail: format!("decimal literal '{raw_text}': {error}"),
+                    });
+                }
+            }
+        } else {
+            (Literal::Text(raw_text.clone()), None)
+        };
+        self.literals.push(LiteralEvidence {
+            raw_text,
+            literal: literal.clone(),
+            parser_policy,
+            span: (start, end),
+        });
+        self.pos = end;
+        Ok(literal)
+    }
+}
+
+fn display_names_deduped<'a, I: Iterator<Item = &'a String>>(names: I) -> Vec<String> {
+    let mut deduped: Vec<String> = Vec::new();
+    for name in names {
+        let normalized = normalize_for_match(name);
+        if !deduped
+            .iter()
+            .any(|existing: &String| normalize_for_match(existing) == normalized)
+        {
+            deduped.push(name.clone());
+        }
+    }
+    deduped
+}
+
+/// Attempt recognition of an explicit row-filter request.
+///
+/// Returns `None` when the tokens after the action hold nothing
+/// predicate-shaped (no `rows`/`where` keywords and only a bare header
+/// phrase), so the caller must fall back to retrieval recognition. A `Some`
+/// result is the row-filter outcome, including every refusal.
+fn attempt_row_filter(
+    words: &[PromptWord],
+    columns: &[ColumnDefinition],
+) -> Option<Result<RowFilterIntent, IntentError>> {
+    let prompt_tokens: Vec<PromptToken> = words
+        .iter()
+        .enumerate()
+        .map(|(index, word)| PromptToken {
+            index,
+            text: word.normalized.clone(),
+        })
+        .collect();
+    let action = Some(ActionEvidence {
+        alias: words[0].normalized.clone(),
+        span: (0, 1),
+    });
+
+    let mut pos = 1;
+    let mut keywords = 0;
+    while pos < words.len() && ROW_ACTION_KEYWORD_TOKENS.contains(&words[pos].normalized.as_str()) {
+        keywords += 1;
+        pos += 1;
+    }
+
+    let phrases = header_phrases(columns);
+    let mut parser =
+        RowFilterParser::new(words, &phrases, pos, prompt_tokens.clone(), action.clone());
+    let predicate = match parser.parse_or() {
+        Ok(predicate) => predicate,
+        Err(Bail::NoPredicate) => {
+            if keywords > 0 {
+                return Some(Err(IntentError::PredicateUnsupported(
+                    "expected a predicate condition after 'rows' or 'where'".to_string(),
+                    Some(refusal_evidence(
+                        prompt_tokens,
+                        action,
+                        "intent.predicate_unsupported",
+                        Vec::new(),
+                    )),
+                )));
+            }
+            return None;
+        }
+        Err(bail) => {
+            // Without the `rows`/`where` keywords the row-filter attempt is
+            // silent: any refusal defers to retrieval recognition so the
+            // Epic 002 projection meanings are never reinterpreted.
+            if keywords > 0 {
+                return Some(Err(intent_error_from_bail(bail, prompt_tokens, action)));
+            }
+            return None;
+        }
+    };
+    if parser.pos < words.len() {
+        return Some(Err(IntentError::PredicateUnsupported(
+            format!(
+                "unexpected token '{}' after the predicate",
+                words[parser.pos].raw
+            ),
+            Some(refusal_evidence(
+                prompt_tokens,
+                action,
+                "intent.predicate_unsupported",
+                Vec::new(),
+            )),
+        )));
+    }
+
+    let RowFilterParser {
+        headers,
+        operators,
+        connectors,
+        literals,
+        parentheses,
+        ..
+    } = parser;
+    let evidence = RecognitionEvidence {
+        schema_version: RECOGNITION_EVIDENCE_SCHEMA_VERSION,
+        prompt_tokens,
+        action: action.clone(),
+        modifier: None,
+        column_phrase: None,
+        matched_column: None,
+        match_class: None,
+        canonical_operation: Some("row_filter".to_string()),
+        refusal_reason: None,
+        competing_parses: Vec::new(),
+        row_filter: Some(RowFilterEvidence {
+            action,
+            headers,
+            operators,
+            connectors,
+            literals,
+            parentheses,
+            predicate: Some(predicate.clone()),
+            plan_schema_version: PLAN_SCHEMA_VERSION_2,
+        }),
+    };
+    Some(Ok(RowFilterIntent {
+        predicate,
+        evidence,
+    }))
+}
+
+fn intent_error_from_bail(
+    bail: Bail,
+    prompt_tokens: Vec<PromptToken>,
+    action: Option<ActionEvidence>,
+) -> IntentError {
+    match bail {
+        Bail::Unsupported(detail) => IntentError::PredicateUnsupported(
+            detail,
+            Some(refusal_evidence(
+                prompt_tokens,
+                action,
+                "intent.predicate_unsupported",
+                Vec::new(),
+            )),
+        ),
+        Bail::ColumnNotFound { prompt_term } => IntentError::ColumnNotFound {
+            prompt_term,
+            evidence: Some(refusal_evidence(
+                prompt_tokens,
+                action,
+                "intent.column_not_found",
+                Vec::new(),
+            )),
+        },
+        Bail::LiteralInvalid { detail } => IntentError::LiteralInvalid {
+            detail,
+            evidence: Some(refusal_evidence(
+                prompt_tokens,
+                action,
+                "intent.literal_invalid",
+                Vec::new(),
+            )),
+        },
+        Bail::Refused(error) => error,
+        Bail::NoPredicate => IntentError::PredicateUnsupported(
+            "expected a predicate condition".to_string(),
+            Some(refusal_evidence(
+                prompt_tokens,
+                action,
+                "intent.predicate_unsupported",
+                Vec::new(),
+            )),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baho_model::ExactDecimal;
+    use baho_plan::plan::PLAN_SCHEMA_VERSION_1;
+    use baho_plan::validation::{validate_plan_references, validate_plan_structure};
+
+    fn dec(text: &str) -> ExactDecimal {
+        ExactDecimal::parse(text).unwrap()
+    }
 
     fn columns() -> Vec<ColumnDefinition> {
         vec![
@@ -1033,6 +1881,7 @@ mod tests {
             column_id: column_id.to_string(),
             column_display_name: column_id.to_string(),
             evidence: RecognitionEvidence {
+                schema_version: RECOGNITION_EVIDENCE_SCHEMA_VERSION,
                 prompt_tokens: Vec::new(),
                 action: None,
                 modifier: None,
@@ -1042,6 +1891,7 @@ mod tests {
                 canonical_operation: None,
                 refusal_reason: None,
                 competing_parses: Vec::new(),
+                row_filter: None,
             },
         }
     }
@@ -1303,5 +2153,1015 @@ mod tests {
         assert_eq!(intent.column_id, "column-1");
         assert_eq!(intent.column_display_name, "Floor Plan");
         assert_eq!(intent.evidence.column_phrase.as_ref().unwrap().span, (3, 5));
+    }
+
+    // ==== Epic 006: constrained grammar, exact header binding, and plans ====
+
+    fn job_columns() -> Vec<ColumnDefinition> {
+        vec![
+            ColumnDefinition {
+                id: "column-0".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Job".to_string()),
+                source_header_normalized: Some("job".to_string()),
+                display_name: "Job".to_string(),
+            },
+            ColumnDefinition {
+                id: "column-1".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("Annual Income".to_string()),
+                source_header_normalized: Some("annual income".to_string()),
+                display_name: "Annual Income".to_string(),
+            },
+        ]
+    }
+
+    fn income_annual_income_columns() -> Vec<ColumnDefinition> {
+        vec![
+            ColumnDefinition {
+                id: "column-0".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Income".to_string()),
+                source_header_normalized: Some("income".to_string()),
+                display_name: "Income".to_string(),
+            },
+            ColumnDefinition {
+                id: "column-1".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("Annual Income".to_string()),
+                source_header_normalized: Some("annual income".to_string()),
+                display_name: "Annual Income".to_string(),
+            },
+        ]
+    }
+
+    fn predicate_columns() -> Vec<ColumnDefinition> {
+        vec![
+            ColumnDefinition {
+                id: "column-0".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Job".to_string()),
+                source_header_normalized: Some("job".to_string()),
+                display_name: "Job".to_string(),
+            },
+            ColumnDefinition {
+                id: "column-1".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("Status".to_string()),
+                source_header_normalized: Some("status".to_string()),
+                display_name: "Status".to_string(),
+            },
+            ColumnDefinition {
+                id: "column-2".to_string(),
+                ordinal: 2,
+                source_header_raw: Some("City".to_string()),
+                source_header_normalized: Some("city".to_string()),
+                display_name: "City".to_string(),
+            },
+        ]
+    }
+
+    fn expect_row_filter(
+        request: Result<RecognizedRequest, IntentError>,
+    ) -> Result<RowFilterIntent, IntentError> {
+        match request {
+            Ok(RecognizedRequest::RowFilter(intent)) => Ok(intent),
+            Err(error) => Err(error),
+            Ok(RecognizedRequest::Retrieval(intent)) => {
+                panic!("expected a row filter request, got retrieval {intent:?}")
+            }
+        }
+    }
+
+    fn expect_row_filter_ok(request: Result<RecognizedRequest, IntentError>) -> RowFilterIntent {
+        expect_row_filter(request).unwrap_or_else(|e| panic!("expected success, got {e:?}"))
+    }
+
+    fn refusal_reason_of(error: &IntentError) -> String {
+        match error {
+            IntentError::Unsupported(_, evidence)
+            | IntentError::PredicateUnsupported(_, evidence) => {
+                evidence.as_ref().and_then(|e| e.refusal_reason.clone())
+            }
+            IntentError::ColumnNotFound { evidence, .. }
+            | IntentError::ColumnAmbiguous { evidence, .. }
+            | IntentError::ParseAmbiguous { evidence, .. }
+            | IntentError::LiteralInvalid { evidence, .. } => {
+                evidence.as_ref().and_then(|e| e.refusal_reason.clone())
+            }
+        }
+        .unwrap_or_else(|| panic!("refusal must carry evidence"))
+    }
+
+    fn canonical_row_filter_expected_evidence() -> RecognitionEvidence {
+        RecognitionEvidence {
+            schema_version: RECOGNITION_EVIDENCE_SCHEMA_VERSION,
+            prompt_tokens: [
+                "list",
+                "rows",
+                "where",
+                "job",
+                "=",
+                "unemployed",
+                "or",
+                "annual",
+                "income",
+                "<",
+                "10000",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(index, text)| PromptToken {
+                index,
+                text: text.to_string(),
+            })
+            .collect(),
+            action: Some(ActionEvidence {
+                alias: "list".to_string(),
+                span: (0, 1),
+            }),
+            modifier: None,
+            column_phrase: None,
+            matched_column: None,
+            match_class: None,
+            canonical_operation: Some("row_filter".to_string()),
+            refusal_reason: None,
+            competing_parses: Vec::new(),
+            row_filter: Some(RowFilterEvidence {
+                action: Some(ActionEvidence {
+                    alias: "list".to_string(),
+                    span: (0, 1),
+                }),
+                headers: vec![
+                    HeaderEvidence {
+                        tokens: vec!["job".to_string()],
+                        span: (3, 4),
+                        column_id: "column-0".to_string(),
+                        display_name: "Job".to_string(),
+                    },
+                    HeaderEvidence {
+                        tokens: vec!["annual".to_string(), "income".to_string()],
+                        span: (7, 9),
+                        column_id: "column-1".to_string(),
+                        display_name: "Annual Income".to_string(),
+                    },
+                ],
+                operators: vec![
+                    OperatorEvidence {
+                        operator: ComparisonOperator::Equal,
+                        span: (4, 5),
+                    },
+                    OperatorEvidence {
+                        operator: ComparisonOperator::Less,
+                        span: (9, 10),
+                    },
+                ],
+                connectors: vec![ConnectorEvidence {
+                    alias: "or".to_string(),
+                    span: (6, 7),
+                }],
+                literals: vec![
+                    LiteralEvidence {
+                        raw_text: "unemployed".to_string(),
+                        literal: Literal::Text("unemployed".to_string()),
+                        parser_policy: None,
+                        span: (5, 6),
+                    },
+                    LiteralEvidence {
+                        raw_text: "10000".to_string(),
+                        literal: Literal::Decimal(dec("10000")),
+                        parser_policy: Some(NumericParsePolicy::StrictDecimal),
+                        span: (10, 11),
+                    },
+                ],
+                parentheses: Vec::new(),
+                predicate: Some(Expression::Or {
+                    predicates: vec![
+                        Expression::Compare {
+                            column: "column-0".to_string(),
+                            operator: ComparisonOperator::Equal,
+                            literal: Literal::Text("unemployed".to_string()),
+                        },
+                        Expression::Compare {
+                            column: "column-1".to_string(),
+                            operator: ComparisonOperator::Less,
+                            literal: Literal::Decimal(dec("10000")),
+                        },
+                    ],
+                }),
+                plan_schema_version: RowFilterEvidence::PLAN_SCHEMA_VERSION,
+            }),
+        }
+    }
+
+    #[test]
+    fn canonical_row_filter_prompt_compiles_to_version_2_plan() {
+        let cols = job_columns();
+        let request = recognize_request(
+            "List rows where Job = unemployed or Annual Income < 10000",
+            &cols,
+        )
+        .unwrap();
+        let intent = expect_row_filter_ok(Ok(request.clone()));
+
+        assert_eq!(
+            intent.predicate,
+            Expression::Or {
+                predicates: vec![
+                    Expression::Compare {
+                        column: "column-0".to_string(),
+                        operator: ComparisonOperator::Equal,
+                        literal: Literal::Text("unemployed".to_string()),
+                    },
+                    Expression::Compare {
+                        column: "column-1".to_string(),
+                        operator: ComparisonOperator::Less,
+                        literal: Literal::Decimal(dec("10000")),
+                    },
+                ],
+            }
+        );
+        assert_eq!(intent.evidence, canonical_row_filter_expected_evidence());
+
+        let plan = compile_request_to_plan(&request, "rev-1", "table-0");
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_2);
+        assert_eq!(
+            plan.steps,
+            vec![PlanStep::Filter {
+                predicate: intent.predicate.clone()
+            }]
+        );
+        assert!(validate_plan_structure(&plan).is_ok());
+        assert!(
+            validate_plan_references(&plan, &["column-0".to_string(), "column-1".to_string()])
+                .is_ok()
+        );
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, PlanStep::Select { .. })),
+            "row filter retains all columns and needs no select step"
+        );
+    }
+
+    #[test]
+    fn compact_implicit_equality_form_is_a_row_filter() {
+        let cols = job_columns();
+        let intent = expect_row_filter_ok(recognize_request(
+            "List job unemployed or annual income < 10000",
+            &cols,
+        ));
+
+        assert_eq!(
+            intent.predicate,
+            Expression::Or {
+                predicates: vec![
+                    Expression::Compare {
+                        column: "column-0".to_string(),
+                        operator: ComparisonOperator::Equal,
+                        literal: Literal::Text("unemployed".to_string()),
+                    },
+                    Expression::Compare {
+                        column: "column-1".to_string(),
+                        operator: ComparisonOperator::Less,
+                        literal: Literal::Decimal(dec("10000")),
+                    },
+                ],
+            }
+        );
+
+        let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+        assert_eq!(row_filter.headers[0].tokens, vec!["job".to_string()]);
+        assert_eq!(row_filter.headers[0].span, (1, 2));
+        assert_eq!(row_filter.headers[0].display_name, "Job");
+        assert_eq!(
+            row_filter.headers[1].tokens,
+            vec!["annual".to_string(), "income".to_string()]
+        );
+        assert_eq!(row_filter.headers[1].span, (4, 6));
+        assert_eq!(row_filter.headers[1].display_name, "Annual Income");
+        assert_eq!(
+            row_filter.connectors,
+            vec![ConnectorEvidence {
+                alias: "or".to_string(),
+                span: (3, 4),
+            }]
+        );
+        assert_eq!(
+            row_filter.operators,
+            vec![OperatorEvidence {
+                operator: ComparisonOperator::Less,
+                span: (6, 7),
+            }]
+        );
+        assert_eq!(row_filter.literals[0].raw_text, "unemployed");
+        assert_eq!(row_filter.literals[0].span, (2, 3));
+        assert_eq!(row_filter.literals[0].parser_policy, None);
+        assert_eq!(row_filter.literals[1].raw_text, "10000");
+        assert_eq!(row_filter.literals[1].span, (7, 8));
+        assert_eq!(
+            row_filter.literals[1].parser_policy,
+            Some(NumericParsePolicy::StrictDecimal)
+        );
+        assert_eq!(
+            intent.evidence.canonical_operation.as_deref(),
+            Some("row_filter")
+        );
+    }
+
+    #[test]
+    fn row_action_aliases_recognize_filters() {
+        let cols = predicate_columns();
+        for alias in ["list", "show", "filter"] {
+            let intent = expect_row_filter_ok(recognize_request(
+                &format!("{alias} rows where job = retired"),
+                &cols,
+            ));
+            assert_eq!(
+                intent.predicate,
+                Expression::Compare {
+                    column: "column-0".to_string(),
+                    operator: ComparisonOperator::Equal,
+                    literal: Literal::Text("retired".to_string()),
+                },
+                "alias {alias}"
+            );
+            assert_eq!(
+                intent.evidence.action.as_ref().unwrap().alias,
+                alias,
+                "alias {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn or_binds_looser_than_and() {
+        let cols = predicate_columns();
+        let intent = expect_row_filter_ok(recognize_request(
+            "List rows where job = 1 or status = 2 and city = 3",
+            &cols,
+        ));
+        assert_eq!(
+            intent.predicate,
+            Expression::Or {
+                predicates: vec![
+                    Expression::Compare {
+                        column: "column-0".to_string(),
+                        operator: ComparisonOperator::Equal,
+                        literal: Literal::Decimal(dec("1")),
+                    },
+                    Expression::And {
+                        predicates: vec![
+                            Expression::Compare {
+                                column: "column-1".to_string(),
+                                operator: ComparisonOperator::Equal,
+                                literal: Literal::Decimal(dec("2")),
+                            },
+                            Expression::Compare {
+                                column: "column-2".to_string(),
+                                operator: ComparisonOperator::Equal,
+                                literal: Literal::Decimal(dec("3")),
+                            },
+                        ],
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn not_binds_tighter_than_and() {
+        let cols = predicate_columns();
+        let intent = expect_row_filter_ok(recognize_request(
+            "List rows where not job = 1 and status = 2",
+            &cols,
+        ));
+        assert_eq!(
+            intent.predicate,
+            Expression::And {
+                predicates: vec![
+                    Expression::Not {
+                        predicate: Box::new(Expression::Compare {
+                            column: "column-0".to_string(),
+                            operator: ComparisonOperator::Equal,
+                            literal: Literal::Decimal(dec("1")),
+                        }),
+                    },
+                    Expression::Compare {
+                        column: "column-1".to_string(),
+                        operator: ComparisonOperator::Equal,
+                        literal: Literal::Decimal(dec("2")),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn but_is_and_and_but_not_negates_the_second_condition() {
+        let cols = predicate_columns();
+        let intent = expect_row_filter_ok(recognize_request(
+            "List rows where job = 1 but not status = 2",
+            &cols,
+        ));
+        assert_eq!(
+            intent.predicate,
+            Expression::And {
+                predicates: vec![
+                    Expression::Compare {
+                        column: "column-0".to_string(),
+                        operator: ComparisonOperator::Equal,
+                        literal: Literal::Decimal(dec("1")),
+                    },
+                    Expression::Not {
+                        predicate: Box::new(Expression::Compare {
+                            column: "column-1".to_string(),
+                            operator: ComparisonOperator::Equal,
+                            literal: Literal::Decimal(dec("2")),
+                        }),
+                    },
+                ],
+            }
+        );
+        let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+        assert_eq!(
+            row_filter.connectors,
+            vec![
+                ConnectorEvidence {
+                    alias: "but".to_string(),
+                    span: (6, 7),
+                },
+                ConnectorEvidence {
+                    alias: "not".to_string(),
+                    span: (7, 8),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parentheses_override_precedence() {
+        let cols = predicate_columns();
+        let intent = expect_row_filter_ok(recognize_request(
+            "List rows where ( job = 1 or status = 2 ) and city = 3",
+            &cols,
+        ));
+        assert_eq!(
+            intent.predicate,
+            Expression::And {
+                predicates: vec![
+                    Expression::Or {
+                        predicates: vec![
+                            Expression::Compare {
+                                column: "column-0".to_string(),
+                                operator: ComparisonOperator::Equal,
+                                literal: Literal::Decimal(dec("1")),
+                            },
+                            Expression::Compare {
+                                column: "column-1".to_string(),
+                                operator: ComparisonOperator::Equal,
+                                literal: Literal::Decimal(dec("2")),
+                            },
+                        ],
+                    },
+                    Expression::Compare {
+                        column: "column-2".to_string(),
+                        operator: ComparisonOperator::Equal,
+                        literal: Literal::Decimal(dec("3")),
+                    },
+                ],
+            }
+        );
+        let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+        assert_eq!(
+            row_filter.parentheses,
+            vec![
+                ParenthesisEvidence {
+                    text: "(".to_string(),
+                    span: (3, 4),
+                },
+                ParenthesisEvidence {
+                    text: ")".to_string(),
+                    span: (11, 12),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizer_splits_parens_attached_to_words() {
+        let cols = predicate_columns();
+        let intent = expect_row_filter_ok(recognize_request(
+            "List rows where (job = 1) and status = 2",
+            &cols,
+        ));
+        assert_eq!(
+            intent.predicate,
+            Expression::And {
+                predicates: vec![
+                    Expression::Compare {
+                        column: "column-0".to_string(),
+                        operator: ComparisonOperator::Equal,
+                        literal: Literal::Decimal(dec("1")),
+                    },
+                    Expression::Compare {
+                        column: "column-1".to_string(),
+                        operator: ComparisonOperator::Equal,
+                        literal: Literal::Decimal(dec("2")),
+                    },
+                ],
+            }
+        );
+        let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+        assert_eq!(row_filter.parentheses[0].span, (3, 4));
+        assert_eq!(row_filter.parentheses[1].span, (7, 8));
+    }
+
+    #[test]
+    fn longest_complete_header_binds_before_shorter() {
+        let cols = job_columns();
+        let intent = expect_row_filter_ok(recognize_request(
+            "List rows where Annual Income < 10000",
+            &cols,
+        ));
+        assert_eq!(
+            intent.predicate,
+            Expression::Compare {
+                column: "column-1".to_string(),
+                operator: ComparisonOperator::Less,
+                literal: Literal::Decimal(dec("10000")),
+            }
+        );
+        let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+        assert_eq!(row_filter.headers.len(), 1);
+        assert_eq!(row_filter.headers[0].display_name, "Annual Income");
+        assert_eq!(row_filter.headers[0].span, (3, 5));
+    }
+
+    #[test]
+    fn shorter_header_binds_alone_when_no_longer_header_covers_the_phrase() {
+        let cols = income_annual_income_columns();
+        let intent =
+            expect_row_filter_ok(recognize_request("List rows where Income < 10000", &cols));
+        assert_eq!(
+            intent.predicate,
+            Expression::Compare {
+                column: "column-0".to_string(),
+                operator: ComparisonOperator::Less,
+                literal: Literal::Decimal(dec("10000")),
+            }
+        );
+    }
+
+    #[test]
+    fn row_prompt_without_bindable_predicate_falls_back_to_retrieval() {
+        let cols = income_columns();
+        let request = recognize_request("List rows where annual income < 10000", &cols);
+        match request {
+            Err(IntentError::ColumnNotFound { prompt_term, .. }) => {
+                assert_eq!(prompt_term, "annual income < 10000");
+            }
+            other => panic!("expected retrieval fallback column_not_found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_normalized_headers_refuse_in_row_filter() {
+        let cols = vec![
+            ColumnDefinition {
+                id: "col-job".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Job".to_string()),
+                source_header_normalized: Some("job".to_string()),
+                display_name: "Job".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-job-2".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("job".to_string()),
+                source_header_normalized: Some("job".to_string()),
+                display_name: "job".to_string(),
+            },
+        ];
+        let err =
+            expect_row_filter(recognize_request("List rows where Job = x", &cols)).unwrap_err();
+        match err {
+            IntentError::ColumnAmbiguous { ref candidates, .. } => {
+                assert_eq!(candidates.as_slice(), ["Job".to_string()]);
+            }
+            other => panic!("expected ColumnAmbiguous, got {other:?}"),
+        }
+        let err = err;
+        assert_eq!(refusal_reason_of(&err), "intent.column_ambiguous");
+        let IntentError::ColumnAmbiguous { evidence, .. } = err else {
+            unreachable!()
+        };
+        let evidence = evidence.unwrap();
+        let competing: Vec<(&str, (usize, usize))> = evidence
+            .competing_parses
+            .iter()
+            .map(|c| (c.column_display_name.as_str(), c.column_span))
+            .collect();
+        assert_eq!(competing, vec![("Job", (3, 4))]);
+    }
+
+    #[test]
+    fn unknown_column_inside_predicate_refuses_column_not_found() {
+        let cols = job_columns();
+        let err = expect_row_filter(recognize_request(
+            "List rows where Job = x or Nonsense = 2",
+            &cols,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, IntentError::ColumnNotFound { .. }));
+        assert_eq!(refusal_reason_of(&err), "intent.column_not_found");
+        let IntentError::ColumnNotFound { prompt_term, .. } = err else {
+            unreachable!()
+        };
+        assert_eq!(prompt_term, "nonsense = 2");
+    }
+
+    #[test]
+    fn malformed_predicate_grammar_refuses_predicate_unsupported() {
+        let cols = job_columns();
+        for prompt in [
+            "List rows where Job =",
+            "List rows where ( Job = 1",
+            "List rows where not",
+            "List rows where Job = 1 or",
+        ] {
+            let err = expect_row_filter(recognize_request(prompt, &cols)).unwrap_err();
+            assert!(
+                matches!(err, IntentError::PredicateUnsupported(_, _)),
+                "expected PredicateUnsupported for {prompt}, got {err:?}"
+            );
+            assert_eq!(
+                refusal_reason_of(&err),
+                "intent.predicate_unsupported",
+                "prompt {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_numeric_literals_refuse_as_invalid() {
+        let cols = job_columns();
+        for prompt in [
+            "List rows where Annual Income < 10,000",
+            "List rows where Job = 10,000",
+            "List rows where Annual Income < 1.2.3",
+        ] {
+            let err = expect_row_filter(recognize_request(prompt, &cols)).unwrap_err();
+            assert!(
+                matches!(err, IntentError::LiteralInvalid { .. }),
+                "expected LiteralInvalid for {prompt}, got {err:?}"
+            );
+            assert_eq!(
+                refusal_reason_of(&err),
+                "intent.literal_invalid",
+                "prompt {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_header_prefixes_refuse_as_parse_ambiguous() {
+        let cols = vec![
+            ColumnDefinition {
+                id: "col-annual".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Annual".to_string()),
+                source_header_normalized: Some("annual".to_string()),
+                display_name: "Annual".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-annual-income".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("Annual Income".to_string()),
+                source_header_normalized: Some("annual income".to_string()),
+                display_name: "Annual Income".to_string(),
+            },
+        ];
+        let err = expect_row_filter(recognize_request(
+            "List rows where Annual Income < 5",
+            &cols,
+        ))
+        .unwrap_err();
+        match err {
+            IntentError::ParseAmbiguous { ref candidates, .. } => {
+                assert_eq!(
+                    candidates.as_slice(),
+                    ["Annual Income".to_string(), "Annual".to_string()]
+                );
+            }
+            other => panic!("expected ParseAmbiguous, got {other:?}"),
+        }
+        assert_eq!(refusal_reason_of(&err), "intent.parse_ambiguous");
+    }
+
+    #[test]
+    fn signed_and_fractional_ordered_literals_are_decimal() {
+        let cols = job_columns();
+        let intent = expect_row_filter_ok(recognize_request(
+            "List rows where Annual Income >= -2.5",
+            &cols,
+        ));
+        assert_eq!(
+            intent.predicate,
+            Expression::Compare {
+                column: "column-1".to_string(),
+                operator: ComparisonOperator::GreaterOrEqual,
+                literal: Literal::Decimal(dec("-2.5")),
+            }
+        );
+        let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+        assert_eq!(
+            row_filter.literals[0].parser_policy,
+            Some(NumericParsePolicy::StrictDecimal)
+        );
+    }
+
+    #[test]
+    fn quoted_text_literal_can_contain_connectors() {
+        let cols = job_columns();
+        let intent = expect_row_filter_ok(recognize_request(
+            "List rows where Job = \"unemployed or retired\"",
+            &cols,
+        ));
+        assert_eq!(
+            intent.predicate,
+            Expression::Compare {
+                column: "column-0".to_string(),
+                operator: ComparisonOperator::Equal,
+                literal: Literal::Text("unemployed or retired".to_string()),
+            }
+        );
+        let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+        assert_eq!(row_filter.literals[0].raw_text, "unemployed or retired");
+        assert_eq!(row_filter.literals[0].parser_policy, None);
+    }
+
+    #[test]
+    fn ordered_comparison_with_text_literal_compiles_but_fails_type_validation() {
+        let cols = job_columns();
+        let request = recognize_request("List rows where Annual Income < retirement", &cols)
+            .unwrap_or_else(|e| panic!("expected a row filter, got {e:?}"));
+        let intent = expect_row_filter_ok(Ok(request.clone()));
+        assert_eq!(
+            intent.predicate,
+            Expression::Compare {
+                column: "column-1".to_string(),
+                operator: ComparisonOperator::Less,
+                literal: Literal::Text("retirement".to_string()),
+            }
+        );
+        let plan = compile_request_to_plan(&request, "rev-1", "table-0");
+        let err = validate_plan_structure(&plan).unwrap_err();
+        assert_eq!(err.diagnostic_code(), "plan.type_mismatch");
+    }
+
+    #[test]
+    fn excessive_predicate_depth_refuses_predicate_unsupported() {
+        let cols = job_columns();
+        let mut prompt = String::from("List rows where ");
+        for _ in 0..9 {
+            prompt.push_str("not ( ");
+        }
+        prompt.push_str("job = 1");
+        for _ in 0..9 {
+            prompt.push_str(" )");
+        }
+        let err = expect_row_filter(recognize_request(&prompt, &cols)).unwrap_err();
+        assert!(matches!(err, IntentError::PredicateUnsupported(_, _)));
+        assert_eq!(refusal_reason_of(&err), "intent.predicate_unsupported");
+    }
+
+    #[test]
+    fn excessive_predicate_node_count_refuses_predicate_unsupported() {
+        let cols = job_columns();
+        let chain = (0..64).map(|_| "job = 1").collect::<Vec<_>>().join(" and ");
+        let prompt = format!("List rows where {chain}");
+        let err = expect_row_filter(recognize_request(&prompt, &cols)).unwrap_err();
+        assert!(matches!(err, IntentError::PredicateUnsupported(_, _)));
+    }
+
+    #[test]
+    fn epic_002_prompts_keep_their_meaning_through_request_recognition() {
+        let income_cols = income_time_columns();
+        let request = recognize_request("List income", &income_cols).unwrap();
+        let retrieval = match request {
+            RecognizedRequest::Retrieval(intent) => intent,
+            other => panic!("expected retrieval, got {other:?}"),
+        };
+        assert_eq!(retrieval.operation, CanonicalOperation::Select);
+        assert_eq!(retrieval.column_id, "col-income");
+        assert!(retrieval.evidence.row_filter.is_none());
+        assert_eq!(
+            retrieval.evidence.canonical_operation.as_deref(),
+            Some("select")
+        );
+        let plan = compile_intent_to_plan(&retrieval, "rev-1", "table-0");
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_1);
+        assert_eq!(plan.steps.len(), 1);
+
+        let plan_cols = columns();
+        let request = recognize_request("Extract all the unique floor plans", &plan_cols).unwrap();
+        let retrieval = match request {
+            RecognizedRequest::Retrieval(intent) => intent,
+            other => panic!("expected retrieval, got {other:?}"),
+        };
+        assert_eq!(retrieval.operation, CanonicalOperation::Distinct);
+        assert_eq!(retrieval.column_id, "column-1");
+        let plan = compile_intent_to_plan(&retrieval, "rev-1", "table-0");
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_1);
+        assert_eq!(plan.steps.len(), 3);
+
+        let plan_cols = columns();
+        let err = recognize_request("do something random", &plan_cols).unwrap_err();
+        assert!(matches!(err, IntentError::Unsupported(_, _)));
+    }
+
+    #[test]
+    fn epic_002_ambiguities_are_not_reinterpreted_as_predicates() {
+        let cols = vec![
+            ColumnDefinition {
+                id: "col-unique-income".to_string(),
+                ordinal: 0,
+                source_header_raw: Some("Unique Income".to_string()),
+                source_header_normalized: Some("unique income".to_string()),
+                display_name: "Unique Income".to_string(),
+            },
+            ColumnDefinition {
+                id: "col-income".to_string(),
+                ordinal: 1,
+                source_header_raw: Some("Income".to_string()),
+                source_header_normalized: Some("income".to_string()),
+                display_name: "Income".to_string(),
+            },
+        ];
+        let err = recognize_request("list unique income", &cols).unwrap_err();
+        assert!(matches!(err, IntentError::ParseAmbiguous { .. }));
+
+        let dup_cols = vec![ColumnDefinition {
+            id: "col-income".to_string(),
+            ordinal: 0,
+            source_header_raw: Some("Income".to_string()),
+            source_header_normalized: Some("income".to_string()),
+            display_name: "Income".to_string(),
+        }];
+        let request = recognize_request("List incomes", &dup_cols).unwrap();
+        let RecognizedRequest::Retrieval(retrieval) = request else {
+            panic!("expected retrieval")
+        };
+        assert_eq!(retrieval.operation, CanonicalOperation::Select);
+    }
+
+    #[test]
+    fn remaining_comparison_operators_recognize() {
+        let cols = predicate_columns();
+        for (symbol, expected) in [
+            ("!=", ComparisonOperator::NotEqual),
+            ("<=", ComparisonOperator::LessOrEqual),
+            (">", ComparisonOperator::Greater),
+            (">=", ComparisonOperator::GreaterOrEqual),
+        ] {
+            let intent = expect_row_filter_ok(recognize_request(
+                &format!("List rows where job {symbol} 2"),
+                &cols,
+            ));
+            assert_eq!(
+                intent.predicate,
+                Expression::Compare {
+                    column: "column-0".to_string(),
+                    operator: expected,
+                    literal: Literal::Decimal(dec("2")),
+                },
+                "symbol {symbol}"
+            );
+            let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+            assert_eq!(
+                row_filter.operators[0].operator, expected,
+                "symbol {symbol}"
+            );
+            assert_eq!(row_filter.operators[0].span, (4, 5), "symbol {symbol}");
+        }
+    }
+
+    #[test]
+    fn bare_row_action_keywords_refuse_predicate_unsupported() {
+        let cols = job_columns();
+        for prompt in ["List rows", "List rows where", "Show rows where"] {
+            let err = expect_row_filter(recognize_request(prompt, &cols)).unwrap_err();
+            assert!(
+                matches!(err, IntentError::PredicateUnsupported(_, _)),
+                "prompt {prompt}, got {err:?}"
+            );
+            assert_eq!(
+                refusal_reason_of(&err),
+                "intent.predicate_unsupported",
+                "prompt {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn unquoted_text_literal_extends_to_the_next_connector() {
+        let cols = job_columns();
+        let intent = expect_row_filter_ok(recognize_request(
+            "List rows where job = x extra or job = y",
+            &cols,
+        ));
+        assert_eq!(
+            intent.predicate,
+            Expression::Or {
+                predicates: vec![
+                    Expression::Compare {
+                        column: "column-0".to_string(),
+                        operator: ComparisonOperator::Equal,
+                        literal: Literal::Text("x extra".to_string()),
+                    },
+                    Expression::Compare {
+                        column: "column-0".to_string(),
+                        operator: ComparisonOperator::Equal,
+                        literal: Literal::Text("y".to_string()),
+                    },
+                ],
+            }
+        );
+        let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+        assert_eq!(row_filter.literals[0].raw_text, "x extra");
+        assert_eq!(row_filter.literals[0].span, (5, 7));
+        assert_eq!(row_filter.connectors[0].span, (7, 8));
+    }
+
+    #[test]
+    fn unmatched_closing_paren_refuses_predicate_unsupported() {
+        let cols = predicate_columns();
+        let err = expect_row_filter(recognize_request(
+            "List rows where job = 1 ) and status = 2",
+            &cols,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, IntentError::PredicateUnsupported(_, _)));
+        assert_eq!(refusal_reason_of(&err), "intent.predicate_unsupported");
+    }
+
+    #[test]
+    fn compact_quoted_implicit_equality_literal() {
+        let cols = job_columns();
+        let intent = expect_row_filter_ok(recognize_request("List job \"retired worker\"", &cols));
+        assert_eq!(
+            intent.predicate,
+            Expression::Compare {
+                column: "column-0".to_string(),
+                operator: ComparisonOperator::Equal,
+                literal: Literal::Text("retired worker".to_string()),
+            }
+        );
+        let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+        assert_eq!(row_filter.literals[0].raw_text, "retired worker");
+        assert_eq!(row_filter.literals[0].parser_policy, None);
+        assert_eq!(row_filter.literals[0].span, (2, 3));
+    }
+
+    #[test]
+    fn compact_numeric_literal_stays_text_like_the_equality_sugar() {
+        let cols = job_columns();
+        let intent = expect_row_filter_ok(recognize_request("List job 5", &cols));
+        assert_eq!(
+            intent.predicate,
+            Expression::Compare {
+                column: "column-0".to_string(),
+                operator: ComparisonOperator::Equal,
+                literal: Literal::Text("5".to_string()),
+            }
+        );
+        let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+        assert_eq!(row_filter.literals[0].parser_policy, None);
+    }
+
+    #[test]
+    fn row_filter_prompt_tokens_preserve_index_and_lowercase() {
+        let cols = job_columns();
+        let intent =
+            expect_row_filter_ok(recognize_request("List rows where Job = unemployed", &cols));
+        let tokens: Vec<(usize, &str)> = intent
+            .evidence
+            .prompt_tokens
+            .iter()
+            .map(|token| (token.index, token.text.as_str()))
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                (0, "list"),
+                (1, "rows"),
+                (2, "where"),
+                (3, "job"),
+                (4, "="),
+                (5, "unemployed"),
+            ]
+        );
     }
 }

@@ -172,7 +172,7 @@ fn run_records_the_request_and_input_identity() {
 
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    assert_eq!(plan["schema_version"], 3);
+    assert_eq!(plan["schema_version"], 4);
     assert_eq!(plan["plan"]["schema_version"], 1);
     assert_eq!(
         plan["recognition_evidence"]["canonical_operation"],
@@ -321,10 +321,17 @@ fn select_only_run_writes_correct_plan() {
 
     let run = workspace.path().join(".baho/runs/000001");
 
-    // Plan artifact has schema_version 3
+    // Plan artifact has schema_version 4
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    assert_eq!(plan["schema_version"], 3);
+    assert_eq!(plan["schema_version"], 4);
+
+    // A retrieval request (`List <column>`) still emits a plan schema
+    // version 1 plan inside the envelope, with no row-filter evidence.
+    assert_eq!(plan["plan"]["schema_version"], 1);
+    let recognition = &plan["recognition_evidence"];
+    assert_eq!(recognition["schema_version"], 2);
+    assert!(recognition["row_filter"].is_null());
 
     // Plan has exactly 1 step (select only)
     let steps = plan["plan"]["steps"].as_array().unwrap();
@@ -347,4 +354,523 @@ fn select_only_run_writes_correct_plan() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
     let lines: Vec<&str> = stdout.trim().lines().collect();
     assert_eq!(lines, vec!["Ada", "Bob", "Carol"]);
+}
+
+// ==== Epic 006 Task 7: row-filter run-artifact regressions ====
+//
+// Synthetic fixtures only (no user data): the motivating epic shape
+// `Job = unemployed or Annual Income < 10000` over a four-column table.
+
+fn read_artifact(run: &std::path::Path, name: &str) -> Value {
+    let path = run.join(name);
+    serde_json::from_slice(&fs::read(&path).unwrap_or_else(|error| {
+        panic!("could not read {name}: {error}");
+    }))
+    .unwrap_or_else(|error| panic!("{name} must be valid JSON: {error}"))
+}
+
+fn artifact_diagnostic_codes(document: &Value) -> Vec<&str> {
+    document["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .map(|d| d["code"].as_str().expect("stable diagnostic code"))
+        .collect()
+}
+
+fn write_job_income_csv(workspace: &std::path::Path) -> std::path::PathBuf {
+    let input = workspace.join("job_income.csv");
+    fs::write(
+        &input,
+        "ID,Job,Annual Income,Note\n\
+         1,unemployed,12000,full\n\
+         2,teacher,9999.99,part\n\
+         3,teacher,12000,long\n\
+         4,,,\n\
+         5,unemployed,,row5-note\n\
+         6,unemployed\n",
+    )
+    .expect("write input");
+    input
+}
+
+#[test]
+fn row_filter_records_plan_v2_with_all_columns_and_provenance() {
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = write_job_income_csv(workspace.path());
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List rows where Job = unemployed or Annual Income < 10000",
+        ])
+        .output()
+        .expect("run baho");
+
+    assert!(output.status.success(), "{output:?}");
+
+    let run = workspace.path().join(".baho/runs/000001");
+    assert_eq!(
+        fs::read_to_string(run.join("intent.txt")).expect("read intent"),
+        "List rows where Job = unemployed or Annual Income < 10000"
+    );
+
+    let manifest = read_artifact(&run, "manifest.json");
+    assert_eq!(manifest["outcome"], "materialized");
+
+    // The plan.json envelope is schema version 4 and carries a schema
+    // version 2 row-filter plan with a single Filter step.
+    let plan = read_artifact(&run, "plan.json");
+    assert_eq!(plan["schema_version"], 4);
+    assert_eq!(plan["plan"]["schema_version"], 2);
+    let steps = plan["plan"]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["op"], "filter");
+
+    // Recognition evidence is schema version 2 and records the row-filter
+    // recognition decision, including the plan schema version it emitted.
+    let recognition = &plan["recognition_evidence"];
+    assert_eq!(recognition["schema_version"], 2);
+    assert!(recognition["refusal_reason"].is_null());
+    assert_eq!(recognition["canonical_operation"], "row_filter");
+    let row_filter = &recognition["row_filter"];
+    assert_eq!(row_filter["plan_schema_version"], 2);
+    assert_eq!(row_filter["action"]["alias"], "list");
+    let headers = row_filter["headers"].as_array().unwrap();
+    let header_names: Vec<&str> = headers
+        .iter()
+        .map(|header| header["display_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(header_names, ["Job", "Annual Income"]);
+    assert_eq!(
+        headers[0],
+        serde_json::json!({
+            "tokens": ["job"], "span": [3, 4],
+            "column_id": "column-1", "display_name": "Job"
+        })
+    );
+    assert_eq!(
+        headers[1],
+        serde_json::json!({
+            "tokens": ["annual", "income"], "span": [7, 9],
+            "column_id": "column-2", "display_name": "Annual Income"
+        })
+    );
+    let literals = row_filter["literals"].as_array().unwrap();
+    assert_eq!(literals[0]["raw_text"], "unemployed");
+    assert_eq!(
+        literals[0]["literal"],
+        serde_json::json!({"text": "unemployed"})
+    );
+    assert!(literals[0]["parser_policy"].is_null());
+    assert_eq!(literals[1]["raw_text"], "10000");
+    assert_eq!(
+        literals[1]["literal"],
+        serde_json::json!({"decimal": "10000"})
+    );
+    assert_eq!(literals[1]["parser_policy"], "strict_decimal");
+    let predicate = &row_filter["predicate"];
+    assert_eq!(predicate["op"], "or");
+
+    // A predicate-only row request retains all four source columns; only
+    // rows whose predicate evaluated true are kept, in source order.
+    let result = read_artifact(&run, "output/result.json");
+    assert_eq!(result["schema_version"], 2);
+    let columns = result["result"]["columns"].as_array().unwrap();
+    let column_ids: Vec<&str> = columns
+        .iter()
+        .map(|column| column["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(column_ids, ["column-0", "column-1", "column-2", "column-3"]);
+    let rows = result["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    let provenance = result["result"]["provenance"].as_array().unwrap();
+    let source_rows: Vec<u64> = provenance
+        .iter()
+        .map(|row| row["source_row"].as_u64().unwrap())
+        .collect();
+    assert_eq!(source_rows, [1, 2, 5, 6]);
+
+    // Blank and missing raw evidence survive in the materialized cells, with
+    // per-cell source coordinates aligned to the retained columns.
+    let blank_row_values = rows[2]["values"].as_array().unwrap();
+    assert_eq!(
+        blank_row_values[2],
+        serde_json::json!("Blank"),
+        "blank Annual Income cell"
+    );
+    assert_eq!(
+        blank_row_values[3],
+        serde_json::json!({"Text": "row5-note"})
+    );
+    let ragged_row_values = rows[3]["values"].as_array().unwrap();
+    assert!(
+        ragged_row_values[2].is_null(),
+        "missing cells materialize as absent values"
+    );
+    for row_index in 0..rows.len() {
+        let values = rows[row_index]["values"].as_array().unwrap();
+        let addresses = provenance[row_index]["source_addresses"]
+            .as_array()
+            .unwrap();
+        assert_eq!(values.len(), 4, "all source columns are retained");
+        assert_eq!(
+            values.len(),
+            addresses.len(),
+            "row {row_index} provenance must be column-aligned"
+        );
+        assert_eq!(addresses[0]["col"], 0);
+        assert_eq!(addresses[0]["sheet_index"], 0);
+    }
+    assert_eq!(
+        provenance[0]["source_addresses"][1],
+        serde_json::json!({"sheet_index": 0, "row": 1, "col": 1})
+    );
+
+    // The CLI prints every retained row's every cell in source order; blank
+    // and missing cells print as empty lines.
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let printed = stdout
+        .strip_suffix('\n')
+        .expect("stdout ends with a newline");
+    let lines: Vec<&str> = printed.split('\n').collect();
+    assert_eq!(
+        lines,
+        [
+            "1",
+            "unemployed",
+            "12000",
+            "full", //
+            "2",
+            "teacher",
+            "9999.99",
+            "part", //
+            "5",
+            "unemployed",
+            "",
+            "row5-note", //
+            "6",
+            "unemployed",
+            "",
+            "",
+        ]
+    );
+
+    // Events use stable names: the row-filter recognition, the observable
+    // typed parse of compared columns, then materialization.
+    let events_raw = fs::read_to_string(run.join("events.jsonl")).expect("read events");
+    let events: Vec<Value> = events_raw
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid event JSON"))
+        .collect();
+    let event_names: Vec<&str> = events
+        .iter()
+        .map(|event| event["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        event_names,
+        [
+            "run_started",
+            "input_identified",
+            "input_profiled",
+            "table_candidates_detected",
+            "table_candidate_selected",
+            "header_selected",
+            "body_rows_classified",
+            "intent_recognized",
+            "plan_validated",
+            "compared_columns_parsed",
+            "materialization_completed",
+            "run_finished",
+        ]
+    );
+    let recognized = events
+        .iter()
+        .find(|event| event["event"] == "intent_recognized")
+        .unwrap();
+    assert_eq!(recognized["fields"]["fields"]["operation"], "row_filter");
+    assert_eq!(recognized["fields"]["fields"]["action"], "list");
+    assert_eq!(
+        recognized["fields"]["fields"]["column_ids"],
+        serde_json::json!(["column-1", "column-2"])
+    );
+    let parsed = events
+        .iter()
+        .find(|event| event["event"] == "compared_columns_parsed")
+        .unwrap();
+    assert_eq!(
+        parsed["fields"]["fields"]["columns"],
+        serde_json::json!(["column-2"]),
+        "only the decimal-compared column is typed-parsed"
+    );
+    assert_eq!(parsed["fields"]["fields"]["mixed"], serde_json::json!([]));
+
+    // Structured events carry no full-document dumps of the source records.
+    for record in [
+        "1,unemployed,12000,full",
+        "2,teacher,9999.99,part",
+        "3,teacher,12000,long",
+        "5,unemployed,,row5-note",
+    ] {
+        assert!(
+            !events_raw.contains(record),
+            "events must not dump the full document record {record:?}"
+        );
+    }
+}
+
+#[test]
+fn mixed_compared_column_refusal_writes_parse_diagnostics() {
+    // 2 valid and 1 malformed nonblank values: a 1/3 malformed share exceeds
+    // the 10% limit, so the compared column refuses before execution.
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = workspace.path().join("mixed.csv");
+    fs::write(&input, "ID,Annual Income\n1,500\n2,abc\n3,600\n").expect("write input");
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List rows where Annual Income < 1000",
+        ])
+        .output()
+        .expect("run baho");
+
+    assert!(!output.status.success(), "expected failure: {output:?}");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(
+        stderr.contains("exceeding the 10% limit"),
+        "stderr: {stderr}"
+    );
+
+    let run = workspace.path().join(".baho/runs/000001");
+    let diagnostics = read_artifact(&run, "diagnostics.json");
+    let codes = artifact_diagnostic_codes(&diagnostics);
+    assert!(
+        codes.contains(&"parse.column_mixed"),
+        "expected column_mixed diagnostic, got: {codes:?}"
+    );
+    assert!(
+        codes.contains(&"parse.value_malformed"),
+        "expected value_malformed diagnostic, got: {codes:?}"
+    );
+    let mixed = diagnostics["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"].as_str() == Some("parse.column_mixed"))
+        .unwrap();
+    assert_eq!(mixed["severity"], "Error");
+    assert_eq!(mixed["stage"], "ingest-csv");
+    assert_eq!(
+        mixed["message"],
+        "column 'column-1': 1 of 3 nonblank values are malformed, exceeding the 10% limit"
+    );
+    assert_eq!(
+        mixed["location"]["col"], 1,
+        "mixed-column refusal locates the compared column"
+    );
+
+    // Recognition evidence and the refused plan stay inspectable in
+    // plan.json, with the run stuck before execution.
+    let plan = read_artifact(&run, "plan.json");
+    assert_eq!(plan["schema_version"], 4);
+    assert_eq!(plan["plan"]["schema_version"], 2);
+    assert_eq!(plan["plan"]["steps"][0]["op"], "filter");
+    let recognition = &plan["recognition_evidence"];
+    assert_eq!(recognition["schema_version"], 2);
+    assert!(recognition["refusal_reason"].is_null());
+    assert_eq!(recognition["row_filter"]["plan_schema_version"], 2);
+
+    // No output is materialized; the refusal is visible in the manifest and
+    // the output artifact is absent from the artifact index.
+    assert!(!run.join("output/result.json").exists());
+    let manifest = read_artifact(&run, "manifest.json");
+    assert_eq!(manifest["outcome"], "error");
+    let artifacts: Vec<&str> = manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| artifact.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        artifacts,
+        [
+            "manifest.json",
+            "intent.txt",
+            "events.jsonl",
+            "diagnostics.json",
+            "input-profile.json",
+            "parser-config.json",
+            "candidates.json",
+            "plan.json"
+        ]
+    );
+
+    // The structured parse event follows plan validation and no
+    // materialization event appears after a refusal.
+    let events: Vec<Value> = fs::read_to_string(run.join("events.jsonl"))
+        .expect("read events")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid event JSON"))
+        .collect();
+    let event_names: Vec<&str> = events
+        .iter()
+        .map(|event| event["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        &event_names[event_names.len() - 3..],
+        ["plan_validated", "compared_columns_parsed", "run_finished"]
+    );
+    assert!(
+        !event_names.contains(&"materialization_completed"),
+        "refusal must abort before materialization"
+    );
+    let parsed = events
+        .iter()
+        .find(|event| event["event"] == "compared_columns_parsed")
+        .unwrap();
+    assert_eq!(
+        parsed["fields"]["fields"]["mixed"],
+        serde_json::json!(["column-1"])
+    );
+}
+
+#[test]
+fn duplicate_header_row_filter_refuses_with_column_ambiguous() {
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = workspace.path().join("duplicate.csv");
+    fs::write(&input, "ID,Job,job\n1,unemployed,x\n2,teacher,y\n").expect("write input");
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List rows where Job = unemployed",
+        ])
+        .output()
+        .expect("run baho");
+
+    assert!(!output.status.success(), "expected failure: {output:?}");
+
+    let run = workspace.path().join(".baho/runs/000001");
+    let diagnostics = read_artifact(&run, "diagnostics.json");
+    let codes = artifact_diagnostic_codes(&diagnostics);
+    assert!(
+        codes.contains(&"intent.column_ambiguous"),
+        "expected column_ambiguous diagnostic, got: {codes:?}"
+    );
+    assert!(
+        !codes.iter().any(|code| code.starts_with("parse.")),
+        "recognition refusals precede typed parsing"
+    );
+
+    let plan = read_artifact(&run, "plan.json");
+    assert_eq!(plan["schema_version"], 4);
+    assert!(
+        plan.get("plan").is_none(),
+        "refusal must not write a nested plan"
+    );
+    let recognition = &plan["recognition_evidence"];
+    assert_eq!(recognition["refusal_reason"], "intent.column_ambiguous");
+    let competing: Vec<&str> = recognition["competing_parses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|parse| parse["column_display_name"].as_str().unwrap())
+        .collect();
+    assert!(
+        competing.contains(&"Job"),
+        "competing parses must name the ambiguous header: {competing:?}"
+    );
+
+    assert!(!run.join("output/result.json").exists());
+    let events_raw = fs::read_to_string(run.join("events.jsonl")).expect("read events");
+    assert!(!events_raw.contains("compared_columns_parsed"));
+    assert!(!events_raw.contains("materialization_completed"));
+}
+
+#[test]
+fn missing_column_row_filter_refuses_with_column_not_found() {
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = write_job_income_csv(workspace.path());
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List rows where Salary > 1000",
+        ])
+        .output()
+        .expect("run baho");
+
+    assert!(!output.status.success(), "expected failure: {output:?}");
+
+    let run = workspace.path().join(".baho/runs/000001");
+    let diagnostics = read_artifact(&run, "diagnostics.json");
+    let codes = artifact_diagnostic_codes(&diagnostics);
+    assert!(
+        codes.contains(&"intent.column_not_found"),
+        "expected column_not_found diagnostic, got: {codes:?}"
+    );
+
+    let plan = read_artifact(&run, "plan.json");
+    let recognition = &plan["recognition_evidence"];
+    assert_eq!(recognition["refusal_reason"], "intent.column_not_found");
+    assert!(plan.get("plan").is_none());
+    assert!(!run.join("output/result.json").exists());
+
+    let events_raw = fs::read_to_string(run.join("events.jsonl")).expect("read events");
+    assert!(!events_raw.contains("compared_columns_parsed"));
+    assert!(!events_raw.contains("materialization_completed"));
+}
+
+#[test]
+fn grouped_literal_row_filter_refuses_with_literal_invalid() {
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = write_job_income_csv(workspace.path());
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List rows where Annual Income < 10,000",
+        ])
+        .output()
+        .expect("run baho");
+
+    assert!(!output.status.success(), "expected failure: {output:?}");
+
+    let run = workspace.path().join(".baho/runs/000001");
+    let diagnostics = read_artifact(&run, "diagnostics.json");
+    let codes = artifact_diagnostic_codes(&diagnostics);
+    assert!(
+        codes.contains(&"intent.literal_invalid"),
+        "expected literal_invalid diagnostic, got: {codes:?}"
+    );
+    assert!(
+        !codes.iter().any(|code| code.starts_with("parse.")),
+        "literal refusals precede typed parsing"
+    );
+
+    let plan = read_artifact(&run, "plan.json");
+    let recognition = &plan["recognition_evidence"];
+    assert_eq!(recognition["refusal_reason"], "intent.literal_invalid");
+    assert!(plan.get("plan").is_none());
+    assert!(!run.join("output/result.json").exists());
+
+    let events_raw = fs::read_to_string(run.join("events.jsonl")).expect("read events");
+    assert!(!events_raw.contains("compared_columns_parsed"));
+    assert!(!events_raw.contains("materialization_completed"));
 }

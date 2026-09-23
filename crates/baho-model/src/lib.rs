@@ -6,6 +6,7 @@
 
 pub mod candidate;
 pub mod column;
+pub mod decimal;
 pub mod diagnostic;
 pub mod document;
 pub mod grid;
@@ -14,6 +15,7 @@ pub mod revision;
 
 pub use candidate::*;
 pub use column::*;
+pub use decimal::*;
 pub use diagnostic::*;
 pub use document::*;
 pub use grid::*;

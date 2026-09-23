@@ -9,5 +9,5 @@ pub mod executor;
 pub mod validation;
 
 pub use error::ExecutionError;
-pub use executor::{ExecutionResult, GridInput, execute_plan};
+pub use executor::{ExecutionResult, GridInput, TruthValue, execute_plan};
 pub use validation::validate_execution_context;

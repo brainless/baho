@@ -1,26 +1,31 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use baho_exec::executor::{ExecutionResult, GridInput, execute_plan};
+use baho_exec::executor::{GridInput, execute_plan};
 use baho_ingest::profile::InputProfile;
 use baho_ingest::{DetectedFormat, ImportError, InspectOptions, detect_format};
 use baho_ingest_csv::header::build_header_with_config;
 use baho_ingest_csv::row_features::compute_row_features_with_config;
+use baho_ingest_csv::typed_values::{ParseVerdict, parse_compared_column};
 use baho_ingest_csv::{
     CsvImporter, DialectDetectionError, ParserConfig, SelectedRegionError,
     detect_candidates_with_config, read_selected_region,
 };
 use baho_model::candidate::TableCandidate;
+use baho_model::column::NumericParsePolicy;
 use baho_model::diagnostic::{Diagnostic, Severity};
 use baho_model::document::Value;
 use baho_model::materialized::MaterializedView;
 use baho_plan::evidence::RecognitionEvidence;
-use baho_plan::plan::Plan;
+use baho_plan::plan::{Expression, Literal, Plan, PlanStep};
 use baho_plan::validation::{validate_plan_references, validate_plan_structure};
 use serde::{Deserialize, Serialize};
 
 use crate::candidate_selection::select_candidate;
 use crate::error::CoreError;
-use crate::intent::{RecognizedIntent, compile_intent_to_plan, recognize_intent};
+use crate::intent::{
+    RecognizedIntent, RecognizedRequest, compile_request_to_plan, recognize_request,
+};
 
 /// The outcome of a pipeline run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -529,13 +534,17 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
         events: opened.events.clone(),
         outcome: CoreOutcome::Recorded,
     };
-    let intent = match recognize_intent(prompt, &opened.columns) {
-        Ok(intent) => intent,
+    let request = match recognize_request(prompt, &opened.columns) {
+        Ok(request) => request,
         Err(error) => {
             result.intent_evidence = recognition_evidence_of(&error);
             result.diagnostics.push(Diagnostic {
                 code: match &error {
                     crate::error::IntentError::Unsupported(_, _) => "intent.unsupported",
+                    crate::error::IntentError::PredicateUnsupported(_, _) => {
+                        "intent.predicate_unsupported"
+                    }
+                    crate::error::IntentError::LiteralInvalid { .. } => "intent.literal_invalid",
                     crate::error::IntentError::ColumnNotFound { .. } => "intent.column_not_found",
                     crate::error::IntentError::ColumnAmbiguous { .. } => "intent.column_ambiguous",
                     crate::error::IntentError::ParseAmbiguous { .. } => "intent.parse_ambiguous",
@@ -550,25 +559,35 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
             return result;
         }
     };
-    push_event(
-        &mut result.events,
-        "intent_recognized",
-        "intent",
-        serde_json::json!({
-            "action": intent.action, "operation": intent.operation, "column_id": intent.column_id,
-            "score": intent.evidence.matched_column.as_ref().map(|matched| matched.score),
+    let kind = match &request {
+        RecognizedRequest::Retrieval(intent) => {
+            result.intent = Some(intent.clone());
+            serde_json::json!({
+                "action": intent.action, "operation": intent.operation, "column_id": intent.column_id,
+                "score": intent.evidence.matched_column.as_ref().map(|matched| matched.score),
+            })
+        }
+        RecognizedRequest::RowFilter(intent) => serde_json::json!({
+            "action": intent.evidence.action.as_ref().map(|action| action.alias.clone()),
+            "operation": "row_filter",
+            "column_ids": intent
+                .evidence
+                .row_filter
+                .as_ref()
+                .map(|row_filter| row_filter.headers.iter().map(|header| header.column_id.clone()).collect::<Vec<_>>())
+                .unwrap_or_default(),
         }),
-    );
-    result.intent_evidence = Some(intent.evidence.clone());
-    result.intent = Some(intent.clone());
-    let plan = compile_intent_to_plan(
-        &intent,
+    };
+    push_event(&mut result.events, "intent_recognized", "intent", kind);
+    result.intent_evidence = Some(request_evidence(&request).clone());
+    let plan = compile_request_to_plan(
+        &request,
         &opened.source_revision.content_hash,
         &opened.selected_candidate.id,
     );
     if let Err(error) = validate_plan_structure(&plan) {
         result.diagnostics.push(Diagnostic {
-            code: "plan.invalid".to_string(),
+            code: error.diagnostic_code().to_string(),
             severity: Severity::Error,
             stage: "plan".to_string(),
             message: error.to_string(),
@@ -584,7 +603,7 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
         .collect::<Vec<_>>();
     if let Err(error) = validate_plan_references(&plan, &available_col_ids) {
         result.diagnostics.push(Diagnostic {
-            code: "plan.invalid".to_string(),
+            code: error.diagnostic_code().to_string(),
             severity: Severity::Error,
             stage: "plan".to_string(),
             message: error.to_string(),
@@ -600,6 +619,49 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
         serde_json::json!({ "schema_version": plan.schema_version, "step_count": plan.steps.len() }),
     );
     result.plan = Some(plan.clone());
+
+    // Strict typed parsing of every decimal-compared column happens before
+    // execution so the mixed-column refusal (locked decision 5) surfaces as
+    // observable parse evidence instead of an executor error.
+    let compared_column_ids = decimal_compared_column_ids(&plan);
+    let mut typed_columns: BTreeMap<String, baho_model::column::ParsedColumn> = BTreeMap::new();
+    if !compared_column_ids.is_empty() {
+        let records = selected_region_records(opened);
+        let mut parsed_columns = Vec::with_capacity(compared_column_ids.len());
+        for column_id in &compared_column_ids {
+            if let Some(column) = opened.columns.iter().find(|column| &column.id == column_id) {
+                parsed_columns.push(parse_compared_column(
+                    &records,
+                    opened.source_sheet_index,
+                    column,
+                    NumericParsePolicy::StrictDecimal,
+                    &opened.parser_config.normalization,
+                ));
+            }
+        }
+        for parsed in &parsed_columns {
+            result.diagnostics.extend(parsed.diagnostics());
+        }
+        let mixed_ids: Vec<String> = parsed_columns
+            .iter()
+            .filter(|parsed| matches!(parsed.verdict, ParseVerdict::Mixed { .. }))
+            .map(|parsed| parsed.column.column_id.clone())
+            .collect();
+        push_event(
+            &mut result.events,
+            "compared_columns_parsed",
+            "ingest-csv",
+            serde_json::json!({ "columns": compared_column_ids, "mixed": mixed_ids }),
+        );
+        if !mixed_ids.is_empty() {
+            result.outcome = CoreOutcome::Failed;
+            return result;
+        }
+        for parsed in parsed_columns {
+            typed_columns.insert(parsed.column.column_id.clone(), parsed.column);
+        }
+    }
+
     let grid = GridInput {
         table_id: opened.selected_candidate.id.clone(),
         source_revision: opened.source_revision.content_hash.clone(),
@@ -624,6 +686,7 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
             })
             .collect(),
         source_rows: opened.rows.iter().map(|row| row.source_row).collect(),
+        typed_columns,
     };
     let execution = match execute_plan(&plan, &grid) {
         Ok(execution) => execution,
@@ -653,451 +716,6 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
     result
 }
 
-#[allow(dead_code)]
-fn run_pipeline_legacy(path: &Path, prompt: &str) -> CoreResult {
-    let mut result = CoreResult {
-        input_profile: None,
-        parser_config: None,
-        candidates: Vec::new(),
-        selected_candidate: None,
-        intent: None,
-        plan: None,
-        intent_evidence: None,
-        output: None,
-        diagnostics: Vec::new(),
-        events: Vec::new(),
-        outcome: CoreOutcome::Recorded,
-    };
-
-    // Step 1: Dispatch, then import. This boundary prevents recognized
-    // non-CSV inputs from reaching CSV dialect detection.
-    if let Err(error) = dispatch_format(path) {
-        result.diagnostics.push(Diagnostic {
-            code: match &error {
-                CoreError::Ingest(ImportError::UnsupportedFormat { .. }) => {
-                    "core.unsupported_format"
-                }
-                _ => "core.format_detection_failed",
-            }
-            .to_string(),
-            severity: Severity::Error,
-            stage: "ingest".to_string(),
-            message: error.to_string(),
-            location: None,
-        });
-        result.outcome = CoreOutcome::Failed;
-        return result;
-    }
-
-    // Step 2: Import
-    let importer = CsvImporter;
-    let options = InspectOptions::default();
-    let parser_config = match ParserConfig::detect(path, options) {
-        Ok(config) => config,
-        Err(error) => {
-            result.diagnostics.push(Diagnostic {
-                code: match &error {
-                    DialectDetectionError::Ambiguous { .. } => "csv.dialect_ambiguous",
-                    DialectDetectionError::Io { .. } => "core.import_failed",
-                }
-                .to_string(),
-                severity: Severity::Error,
-                stage: "ingest-csv".to_string(),
-                message: error.to_string(),
-                location: None,
-            });
-            result.outcome = CoreOutcome::Failed;
-            return result;
-        }
-    };
-    result.parser_config = Some(parser_config.clone());
-    let imported = match importer.import_with_config(path, &parser_config) {
-        Ok(doc) => doc,
-        Err(e) => {
-            result.diagnostics.push(Diagnostic {
-                code: "core.import_failed".to_string(),
-                severity: Severity::Error,
-                stage: "core".to_string(),
-                message: e.to_string(),
-                location: None,
-            });
-            result.outcome = CoreOutcome::Failed;
-            return result;
-        }
-    };
-
-    result.input_profile = Some(imported.input_profile);
-    result.diagnostics.extend(imported.diagnostics);
-    let input_profile = result.input_profile.as_ref().unwrap();
-    push_event(
-        &mut result.events,
-        "input_profiled",
-        "ingest",
-        serde_json::json!({
-            "encoding": input_profile.encoding,
-            "record_count": input_profile.logical_record_count,
-        }),
-    );
-
-    let source_revision = imported.document.source.content_hash;
-    let sheet = match imported.document.sheets.into_iter().next() {
-        Some(s) => s,
-        None => {
-            result.diagnostics.push(Diagnostic {
-                code: "core.no_sheet".to_string(),
-                severity: Severity::Error,
-                stage: "core".to_string(),
-                message: "imported document has no sheets".to_string(),
-                location: None,
-            });
-            result.outcome = CoreOutcome::Failed;
-            return result;
-        }
-    };
-    let source_sheet_index = sheet.index;
-
-    // Step 2: Move the bounded analysis rows into CSV records. Moving the
-    // strings avoids retaining both a sampled Document and a duplicate record
-    // collection throughout the rest of the pipeline.
-    let logical_records: Vec<baho_ingest_csv::inspector::LogicalRecord> = sheet
-        .rows
-        .into_iter()
-        .map(|r| {
-            let fields = r
-                .cells
-                .into_iter()
-                .map(|cell| cell.raw_text)
-                .collect::<Vec<_>>();
-            let is_blank = fields
-                .iter()
-                .all(|field| parser_config.normalization.is_blank(field));
-            baho_ingest_csv::inspector::LogicalRecord {
-                index: r.index,
-                fields,
-                is_blank,
-            }
-        })
-        .collect();
-    let features = compute_row_features_with_config(&logical_records, &parser_config.normalization);
-
-    // Step 3: Detect candidates
-    let candidates = detect_candidates_with_config(
-        &logical_records,
-        &features,
-        &parser_config.candidate_detection,
-        &parser_config.candidate_scoring,
-        &parser_config.candidate_ordering,
-    );
-    result.candidates = candidates.clone();
-    push_event(
-        &mut result.events,
-        "table_candidates_detected",
-        "detect",
-        serde_json::json!({
-            "count": candidates.len(),
-        }),
-    );
-
-    // Step 4: Select candidate
-    let mut selected = match select_candidate(&candidates, &parser_config.candidate_detection) {
-        Ok(c) => c.clone(),
-        Err(CoreError::NoTableFound) => {
-            result.diagnostics.push(Diagnostic {
-                code: "table.not_found".to_string(),
-                severity: Severity::Error,
-                stage: "core".to_string(),
-                message: "no table candidate met the minimum score threshold".to_string(),
-                location: None,
-            });
-            result.outcome = CoreOutcome::Failed;
-            return result;
-        }
-        Err(CoreError::AmbiguousTable { candidate_count }) => {
-            result.diagnostics.push(Diagnostic {
-                code: "table.ambiguous".to_string(),
-                severity: Severity::Error,
-                stage: "core".to_string(),
-                message: format!("{} candidates with similar scores", candidate_count),
-                location: None,
-            });
-            result.outcome = CoreOutcome::Failed;
-            return result;
-        }
-        Err(e) => {
-            result.diagnostics.push(Diagnostic {
-                code: "core.candidate_selection_failed".to_string(),
-                severity: Severity::Error,
-                stage: "core".to_string(),
-                message: e.to_string(),
-                location: None,
-            });
-            result.outcome = CoreOutcome::Failed;
-            return result;
-        }
-    };
-
-    result.selected_candidate = Some(selected.clone());
-    push_event(
-        &mut result.events,
-        "table_candidate_selected",
-        "select",
-        serde_json::json!({
-            "candidate_id": selected.id,
-            "score": selected.score.total,
-        }),
-    );
-
-    // Step 5: Build header from selected candidate
-    let header_idx = selected.region.header_row.unwrap_or(0);
-    let header_record = &logical_records[header_idx];
-    let header_feature = &features[header_idx];
-    let (header_decision, header_diag) = build_header_with_config(
-        header_feature,
-        header_record,
-        source_sheet_index,
-        &parser_config.normalization,
-    );
-    result.diagnostics.extend(header_diag);
-    push_event(
-        &mut result.events,
-        "header_selected",
-        "header",
-        serde_json::json!({
-            "source_row": header_decision.source_row,
-            "column_count": header_decision.cells.len(),
-        }),
-    );
-
-    // Step 6: Classify body rows
-    let selected_region = match read_selected_region(
-        path,
-        header_feature.physical_width,
-        selected.region.body_start_row,
-        &parser_config,
-    ) {
-        Ok(region) => region,
-        Err(error) => {
-            let (code, stage, location) = match &error {
-                SelectedRegionError::FieldTooLarge { row, col, .. } => (
-                    "csv.field_too_large",
-                    "ingest-csv",
-                    Some(baho_model::diagnostic::DiagnosticLocation {
-                        row: Some(*row),
-                        col: Some(*col),
-                        cell: None,
-                    }),
-                ),
-                SelectedRegionError::MalformedRecord { row, .. } => (
-                    "csv.malformed_record",
-                    "ingest-csv",
-                    Some(baho_model::diagnostic::DiagnosticLocation {
-                        row: Some(*row),
-                        col: None,
-                        cell: None,
-                    }),
-                ),
-                SelectedRegionError::Io { .. } => ("core.materialize_region_failed", "core", None),
-            };
-            result.diagnostics.push(Diagnostic {
-                code: code.to_string(),
-                severity: Severity::Error,
-                stage: stage.to_string(),
-                message: error.to_string(),
-                location,
-            });
-            result.outcome = CoreOutcome::Failed;
-            return result;
-        }
-    };
-    selected.region.body_end_row = selected_region.body_end_row;
-    let data_row_indices: Vec<usize> = selected_region
-        .data_records
-        .iter()
-        .map(|record| record.index)
-        .collect();
-    let classifications = &selected_region.classifications;
-    push_event(
-        &mut result.events,
-        "body_rows_classified",
-        "classify",
-        serde_json::json!({
-            "data_rows": data_row_indices.len(),
-            "total_classified": selected_region.classification_count,
-            "classification_evidence_retained": classifications.len(),
-        }),
-    );
-
-    // Update candidates with real header and classifications
-    let selected_id = selected.id.clone();
-    for candidate in result.candidates.iter_mut() {
-        if candidate.id == selected_id {
-            candidate.header = header_decision.clone();
-            candidate.region.body_end_row = selected.region.body_end_row;
-            candidate.body_row_classifications = classifications.clone();
-            candidate.selected = true;
-        }
-    }
-    if let Some(ref mut sel) = result.selected_candidate {
-        sel.header = header_decision.clone();
-        sel.region.body_end_row = selected.region.body_end_row;
-        sel.body_row_classifications = classifications.clone();
-    }
-
-    // Build column definitions from header
-    let columns: Vec<baho_model::column::ColumnDefinition> = header_decision
-        .cells
-        .iter()
-        .map(|hc| baho_model::column::ColumnDefinition {
-            id: hc.column_id.clone(),
-            ordinal: hc.col,
-            source_header_raw: Some(hc.raw_text.clone()),
-            source_header_normalized: Some(hc.normalized_text.clone()),
-            display_name: if hc.normalized_text.is_empty() {
-                format!("Column {}", hc.col)
-            } else {
-                hc.normalized_text.clone()
-            },
-        })
-        .collect();
-
-    // Step 7: Recognize intent
-    let intent = match recognize_intent(prompt, &columns) {
-        Ok(i) => i,
-        Err(e) => {
-            result.intent_evidence = recognition_evidence_of(&e);
-            result.diagnostics.push(Diagnostic {
-                code: match &e {
-                    crate::error::IntentError::Unsupported(_, _) => "intent.unsupported",
-                    crate::error::IntentError::ColumnNotFound { .. } => "intent.column_not_found",
-                    crate::error::IntentError::ColumnAmbiguous { .. } => "intent.column_ambiguous",
-                    crate::error::IntentError::ParseAmbiguous { .. } => "intent.parse_ambiguous",
-                }
-                .to_string(),
-                severity: Severity::Error,
-                stage: "intent".to_string(),
-                message: e.to_string(),
-                location: None,
-            });
-            result.outcome = CoreOutcome::Failed;
-            return result;
-        }
-    };
-
-    push_event(
-        &mut result.events,
-        "intent_recognized",
-        "intent",
-        serde_json::json!({
-            "action": intent.action,
-            "operation": intent.operation,
-            "column_id": intent.column_id,
-            "score": intent.evidence.matched_column.as_ref().map(|m| m.score),
-        }),
-    );
-    result.intent = Some(intent.clone());
-    result.intent_evidence = Some(intent.evidence.clone());
-
-    // Step 8: Build plan
-    let plan = compile_intent_to_plan(&intent, &source_revision, &selected.id);
-
-    // Step 9: Validate plan
-    if let Err(e) = validate_plan_structure(&plan) {
-        result.diagnostics.push(Diagnostic {
-            code: "plan.invalid".to_string(),
-            severity: Severity::Error,
-            stage: "plan".to_string(),
-            message: e.to_string(),
-            location: None,
-        });
-        result.outcome = CoreOutcome::Failed;
-        return result;
-    }
-
-    let available_col_ids: Vec<String> = columns.iter().map(|c| c.id.clone()).collect();
-    if let Err(e) = validate_plan_references(&plan, &available_col_ids) {
-        result.diagnostics.push(Diagnostic {
-            code: "plan.invalid".to_string(),
-            severity: Severity::Error,
-            stage: "plan".to_string(),
-            message: e.to_string(),
-            location: None,
-        });
-        result.outcome = CoreOutcome::Failed;
-        return result;
-    }
-
-    push_event(
-        &mut result.events,
-        "plan_validated",
-        "plan",
-        serde_json::json!({
-            "schema_version": plan.schema_version,
-            "step_count": plan.steps.len(),
-        }),
-    );
-    result.plan = Some(plan.clone());
-
-    // Step 10: Build GridInput from the selected candidate's data rows
-    let data_rows = selected_region.data_records;
-    let grid_rows: Vec<Vec<Option<Value>>> = data_rows
-        .iter()
-        .map(|row| {
-            (0..columns.len())
-                .map(|col| {
-                    row.fields.get(col).map(|raw_text| {
-                        if parser_config.normalization.is_blank(raw_text) {
-                            Value::Blank
-                        } else {
-                            Value::Text(raw_text.clone())
-                        }
-                    })
-                })
-                .collect()
-        })
-        .collect();
-
-    let grid = GridInput {
-        table_id: selected.id.clone(),
-        source_revision,
-        source_sheet_index,
-        columns: columns.clone(),
-        rows: grid_rows,
-        source_rows: data_rows.iter().map(|row| row.index).collect(),
-    };
-
-    // Step 11: Execute plan
-    let exec_result: ExecutionResult = match execute_plan(&plan, &grid) {
-        Ok(r) => r,
-        Err(e) => {
-            result.diagnostics.push(Diagnostic {
-                code: "execution.failed".to_string(),
-                severity: Severity::Error,
-                stage: "exec".to_string(),
-                message: e.to_string(),
-                location: None,
-            });
-            result.outcome = CoreOutcome::Failed;
-            return result;
-        }
-    };
-
-    result.diagnostics.extend(exec_result.diagnostics);
-    push_event(
-        &mut result.events,
-        "materialization_completed",
-        "exec",
-        serde_json::json!({
-            "rows_processed": exec_result.rows_processed,
-            "rows_output": exec_result.rows_output,
-        }),
-    );
-
-    result.output = Some(exec_result.view);
-    result.outcome = CoreOutcome::Materialized;
-
-    result
-}
-
 fn push_event(events: &mut Vec<CoreEvent>, name: &str, stage: &str, fields: serde_json::Value) {
     events.push(CoreEvent {
         name: name.to_string(),
@@ -1109,16 +727,81 @@ fn push_event(events: &mut Vec<CoreEvent>, name: &str, stage: &str, fields: serd
 fn recognition_evidence_of(error: &crate::error::IntentError) -> Option<RecognitionEvidence> {
     match error {
         crate::error::IntentError::Unsupported(_, evidence) => evidence.clone(),
+        crate::error::IntentError::PredicateUnsupported(_, evidence) => evidence.clone(),
+        crate::error::IntentError::LiteralInvalid { evidence, .. } => evidence.clone(),
         crate::error::IntentError::ColumnNotFound { evidence, .. } => evidence.clone(),
         crate::error::IntentError::ColumnAmbiguous { evidence, .. } => evidence.clone(),
         crate::error::IntentError::ParseAmbiguous { evidence, .. } => evidence.clone(),
     }
 }
 
+fn request_evidence(request: &RecognizedRequest) -> &RecognitionEvidence {
+    match request {
+        RecognizedRequest::Retrieval(intent) => &intent.evidence,
+        RecognizedRequest::RowFilter(intent) => &intent.evidence,
+    }
+}
+
+/// Columns whose decimal comparisons require typed parse evidence, in
+/// deterministic column-ID order.
+fn decimal_compared_column_ids(plan: &Plan) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for step in &plan.steps {
+        if let PlanStep::Filter { predicate } = step {
+            collect_decimal_compared_columns(predicate, &mut ids);
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn collect_decimal_compared_columns(expression: &Expression, ids: &mut BTreeSet<String>) {
+    match expression {
+        Expression::Compare {
+            column,
+            literal: Literal::Decimal(_),
+            ..
+        } => {
+            ids.insert(column.clone());
+        }
+        Expression::Compare { .. } | Expression::IsNotBlank { .. } => {}
+        Expression::And { predicates } | Expression::Or { predicates } => {
+            for predicate in predicates {
+                collect_decimal_compared_columns(predicate, ids);
+            }
+        }
+        Expression::Not { predicate } => collect_decimal_compared_columns(predicate, ids),
+    }
+}
+
+/// Rebuild the selected region's logical records from the opened rows.
+/// `RawCell::Missing` occurs only as a ragged tail, so truncating the field
+/// list at the first missing cell reproduces the original record widths; the
+/// blank flag is unused by typed parsing.
+fn selected_region_records(opened: &OpenedTable) -> Vec<baho_ingest_csv::inspector::LogicalRecord> {
+    opened
+        .rows
+        .iter()
+        .map(|row| {
+            let mut fields = Vec::with_capacity(row.cells.len());
+            for cell in &row.cells {
+                match cell {
+                    RawCell::Present(text) => fields.push(text.clone()),
+                    RawCell::Missing => break,
+                }
+            }
+            baho_ingest_csv::inspector::LogicalRecord {
+                index: row.source_row,
+                fields,
+                is_blank: false,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use baho_plan::plan::PlanStep;
+    use baho_plan::plan::{PLAN_SCHEMA_VERSION_2, PlanStep};
     use std::io::Write;
 
     fn write_temp_csv(content: &str) -> tempfile::NamedTempFile {
@@ -2183,7 +1866,496 @@ ID,Value
                 Value::Text(s) => s.as_str(),
                 _ => panic!("expected text"),
             })
-            .collect();
+            .collect::<Vec<_>>();
         assert_eq!(values, vec!["A", "B"]);
+    }
+
+    // ==== Epic 006: orchestration wiring for explicit-column row filters ====
+
+    fn diagnostic_codes(result: &CoreResult) -> Vec<&str> {
+        result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect()
+    }
+
+    fn event_names(result: &CoreResult) -> Vec<&str> {
+        result
+            .events
+            .iter()
+            .map(|event| event.name.as_str())
+            .collect()
+    }
+
+    fn provenance_rows(result: &CoreResult) -> Vec<usize> {
+        result
+            .output
+            .as_ref()
+            .expect("expected a materialized output")
+            .provenance
+            .iter()
+            .map(|provenance| provenance.source_row)
+            .collect()
+    }
+
+    fn expect_failure_diagnostic<'a>(result: &'a CoreResult, code: &str) -> &'a Diagnostic {
+        result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == code)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected {code} diagnostic, got {:?}",
+                    diagnostic_codes(result)
+                )
+            })
+    }
+
+    /// The canonical epic table: header at row 0, body rows 1-6 with a
+    /// ragged last row so `Annual Income` has a missing cell.
+    fn job_income_csv() -> String {
+        "\
+ID,Job,Annual Income,Note
+1,unemployed,12000,full
+2,teacher,9999.99,part
+3,teacher,12000,long
+4,,,
+5,unemployed,,row5-note
+6,unemployed
+"
+        .to_string()
+    }
+
+    const CANONICAL_FILTER_PROMPT: &str =
+        "List rows where Job = unemployed or Annual Income < 10000";
+
+    fn row_filter_plan_schema_version(result: &CoreResult) -> u32 {
+        let row_filter = result
+            .intent_evidence
+            .as_ref()
+            .expect("row filter must surface recognition evidence")
+            .row_filter
+            .as_ref()
+            .expect("row filter evidence must be retained");
+        row_filter.plan_schema_version
+    }
+
+    #[test]
+    fn canonical_row_filter_materializes_plan_v2_retaining_all_columns() {
+        let file = write_temp_csv(&job_income_csv());
+        let opened = open_table(file.path()).expect("synthetic table should open");
+        let result = run_pipeline(file.path(), CANONICAL_FILTER_PROMPT);
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        assert!(
+            result.intent.is_none(),
+            "row filter has no retrieval intent"
+        );
+        let plan = result.plan.as_ref().expect("plan must be recorded");
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_2);
+        assert_eq!(plan.steps.len(), 1);
+        assert!(matches!(plan.steps[0], PlanStep::Filter { .. }));
+
+        // Only true rows are retained, in source order.
+        assert_eq!(provenance_rows(&result), [1, 2, 5, 6]);
+
+        // A predicate-only row request retains every source column in
+        // source order, including blank and missing raw evidence.
+        let output = result.output.as_ref().unwrap();
+        assert_eq!(
+            output
+                .columns
+                .iter()
+                .map(|column| (column.id.as_str(), column.ordinal))
+                .collect::<Vec<_>>(),
+            [
+                ("column-0", 0),
+                ("column-1", 1),
+                ("column-2", 2),
+                ("column-3", 3)
+            ]
+        );
+        assert_eq!(
+            output.rows[0]
+                .values
+                .iter()
+                .map(|value| match value {
+                    Some(Value::Text(text)) => text.clone(),
+                    Some(Value::Blank) => "<blank>".to_string(),
+                    None => "<missing>".to_string(),
+                    _ => panic!("unexpected value"),
+                })
+                .collect::<Vec<_>>(),
+            ["1", "unemployed", "12000", "full"]
+        );
+        assert_eq!(
+            output.rows[2].values[3],
+            Some(Value::Text("row5-note".to_string()))
+        );
+        assert_eq!(output.rows[2].values[2], Some(Value::Blank));
+        assert_eq!(output.rows[3].values[2], None);
+        assert_eq!(output.rows[3].values[3], None);
+
+        // Recognition evidence carries the row-filter decision.
+        let evidence = result.intent_evidence.as_ref().unwrap();
+        assert_eq!(evidence.refusal_reason, None);
+        assert_eq!(evidence.canonical_operation.as_deref(), Some("row_filter"));
+        let row_filter = evidence.row_filter.as_ref().unwrap();
+        assert_eq!(row_filter.plan_schema_version, PLAN_SCHEMA_VERSION_2);
+        assert_eq!(
+            row_filter
+                .headers
+                .iter()
+                .map(|header| header.display_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Job", "Annual Income"]
+        );
+
+        // Only the decimal-compared column is typed-parsed.
+        let parsed_event = result
+            .events
+            .iter()
+            .find(|event| event.name == "compared_columns_parsed")
+            .expect("compared columns must be parsed observably");
+        assert_eq!(
+            parsed_event.fields["columns"],
+            serde_json::json!(["column-2"])
+        );
+        assert_eq!(parsed_event.fields["mixed"], serde_json::json!([]));
+        assert_eq!(
+            event_names(&result),
+            [
+                "input_profiled",
+                "table_candidates_detected",
+                "table_candidate_selected",
+                "header_selected",
+                "body_rows_classified",
+                "intent_recognized",
+                "plan_validated",
+                "compared_columns_parsed",
+                "materialization_completed",
+            ]
+        );
+
+        // Borrowed execution of the same request matches the pipeline result.
+        let borrowed = execute_prompt(&opened, CANONICAL_FILTER_PROMPT);
+        assert_eq!(borrowed.outcome, result.outcome);
+        assert_eq!(
+            borrowed.plan.as_ref().map(|p| p.schema_version),
+            Some(PLAN_SCHEMA_VERSION_2)
+        );
+        assert_eq!(
+            borrowed.output.as_ref().map(|v| &v.provenance),
+            result.output.as_ref().map(|v| &v.provenance)
+        );
+        assert_eq!(
+            serde_json::to_value(&borrowed.diagnostics).unwrap(),
+            serde_json::to_value(&result.diagnostics).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&borrowed.events).unwrap(),
+            serde_json::to_value(&result.events).unwrap()
+        );
+    }
+
+    #[test]
+    fn compact_implicit_equality_filter_matches_canonical_semantics() {
+        let file = write_temp_csv(&job_income_csv());
+        let result = run_pipeline(file.path(), "List job unemployed or annual income < 10000");
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        assert_eq!(provenance_rows(&result), [1, 2, 5, 6]);
+        assert_eq!(
+            row_filter_plan_schema_version(&result),
+            PLAN_SCHEMA_VERSION_2
+        );
+        let row_filter = result
+            .intent_evidence
+            .as_ref()
+            .unwrap()
+            .row_filter
+            .as_ref()
+            .unwrap();
+        assert_eq!(row_filter.headers[0].tokens, vec!["job".to_string()]);
+        assert_eq!(row_filter.headers[0].span, (1, 2));
+        assert_eq!(row_filter.headers[1].span, (4, 6));
+    }
+
+    #[test]
+    fn longest_header_binding_decides_between_income_columns() {
+        let file = write_temp_csv("ID,Income,Annual Income\n1,5,20000\n2,15000,7\n");
+
+        let result = run_pipeline(file.path(), "List rows where Annual Income < 10000");
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        assert_eq!(provenance_rows(&result), [2]);
+        let row_filter = result
+            .intent_evidence
+            .as_ref()
+            .unwrap()
+            .row_filter
+            .as_ref()
+            .unwrap();
+        assert_eq!(row_filter.headers[0].display_name, "Annual Income");
+
+        let result = run_pipeline(file.path(), "List rows where Income < 10000");
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        assert_eq!(provenance_rows(&result), [1]);
+        let row_filter = result
+            .intent_evidence
+            .as_ref()
+            .unwrap()
+            .row_filter
+            .as_ref()
+            .unwrap();
+        assert_eq!(row_filter.headers[0].display_name, "Income");
+    }
+
+    #[test]
+    fn duplicate_normalized_headers_refuse_the_row_filter() {
+        let file = write_temp_csv("ID,Job,job\n1,unemployed,x\n2,teacher,y\n");
+        let result = run_pipeline(file.path(), "List rows where Job = unemployed");
+
+        assert_eq!(result.outcome, CoreOutcome::Failed);
+        assert!(result.output.is_none());
+        assert!(result.plan.is_none());
+        assert!(diagnostic_codes(&result).contains(&"intent.column_ambiguous"));
+        let evidence = result.intent_evidence.as_ref().unwrap();
+        assert_eq!(
+            evidence.refusal_reason.as_deref(),
+            Some("intent.column_ambiguous")
+        );
+        assert!(!event_names(&result).contains(&"compared_columns_parsed"));
+        assert!(
+            !diagnostic_codes(&result)
+                .iter()
+                .any(|code| code.starts_with("parse."))
+        );
+    }
+
+    #[test]
+    fn boolean_precedence_parentheses_and_negations_filter_rows() {
+        let file = write_temp_csv(
+            "ID,Status,City,Code\n1,active,Pune,1\n2,inactive,Pune,2\n3,active,Delhi,3\n4,inactive,Delhi,4\n",
+        );
+
+        let cases: &[(&str, &[usize])] = &[
+            (
+                "List rows where Status = active and City = Pune or Code = 3",
+                &[1, 3],
+            ),
+            ("List rows where not Status = active and City = Pune", &[2]),
+            ("List rows where Status = active but not City = Delhi", &[1]),
+            (
+                "List rows where ( Status = active or City = Pune ) and Code = 2",
+                &[2],
+            ),
+            ("List rows where (Status = active) and Code = 1", &[1]),
+        ];
+        for (prompt, expected) in cases {
+            let result = run_pipeline(file.path(), prompt);
+            assert_eq!(result.outcome, CoreOutcome::Materialized, "prompt {prompt}");
+            assert_eq!(
+                provenance_rows(&result),
+                *expected,
+                "prompt {prompt} must retain rows in source order"
+            );
+        }
+
+        // A purely text-compared predicate never requires typed column
+        // parsing; decimal literals such as `Code = 2` do.
+        let result = run_pipeline(
+            file.path(),
+            "List rows where Status = active and City = Pune",
+        );
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        assert!(!event_names(&result).contains(&"compared_columns_parsed"));
+        assert!(
+            !diagnostic_codes(&result)
+                .iter()
+                .any(|code| code.starts_with("parse."))
+        );
+    }
+
+    #[test]
+    fn blank_missing_and_boundary_malformed_cells_evaluate_unknown() {
+        // 9 valid values and 1 malformed value ("10,000") sit exactly at the
+        // 10% mixed-column limit, so the column is accepted; the blank,
+        // missing, and malformed cells evaluate to unknown and drop.
+        let file = write_temp_csv(
+            "ID,Annual Income\n1,500\n2,\n3\n4,\"10,000\"\n5,400\n6,300\n7,200\n8,100\n9,50\n10,25\n11,10\n12,5\n",
+        );
+        let result = run_pipeline(file.path(), "List rows where Annual Income < 1000");
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        assert_eq!(provenance_rows(&result), [1, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+        let malformed_diagnostics = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "parse.value_malformed")
+            .count();
+        assert_eq!(malformed_diagnostics, 1, "bounded per failure kind");
+        assert!(
+            !diagnostic_codes(&result).contains(&"parse.column_mixed"),
+            "the boundary share must not refuse"
+        );
+        assert!(event_names(&result).contains(&"compared_columns_parsed"));
+    }
+
+    #[test]
+    fn materially_mixed_column_refuses_before_execution() {
+        // 2 valid and 1 malformed value: a malformed share of 1/3 exceeds
+        // the 10% limit, so the compared column is refused before execution.
+        let file = write_temp_csv("ID,Annual Income\n1,500\n2,abc\n3,600\n");
+        let result = run_pipeline(file.path(), "List rows where Annual Income < 1000");
+
+        assert_eq!(result.outcome, CoreOutcome::Failed);
+        assert!(result.output.is_none());
+        assert!(
+            !diagnostic_codes(&result).contains(&"execution.failed"),
+            "the refusal must precede execution"
+        );
+        assert!(!event_names(&result).contains(&"materialization_completed"));
+        assert!(diagnostic_codes(&result).contains(&"parse.column_mixed"));
+        let mixed = expect_failure_diagnostic(&result, "parse.column_mixed");
+        assert_eq!(mixed.severity, Severity::Error);
+        assert_eq!(mixed.stage, "ingest-csv");
+        assert!(diagnostic_codes(&result).contains(&"parse.value_malformed"));
+
+        // The refused plan and evidence remain inspectable.
+        let plan = result.plan.as_ref().expect("refused plan is recorded");
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_2);
+        assert_eq!(
+            row_filter_plan_schema_version(&result),
+            PLAN_SCHEMA_VERSION_2
+        );
+
+        // The parse event follows plan validation, so artifact ordering
+        // stays stable.
+        assert_eq!(
+            &event_names(&result)[event_names(&result).len() - 1..],
+            ["compared_columns_parsed"]
+        );
+        let parsed_event = result
+            .events
+            .iter()
+            .find(|event| event.name == "compared_columns_parsed")
+            .unwrap();
+        assert_eq!(
+            parsed_event.fields["columns"],
+            serde_json::json!(["column-1"])
+        );
+        assert_eq!(
+            parsed_event.fields["mixed"],
+            serde_json::json!(["column-1"])
+        );
+    }
+
+    #[test]
+    fn grouped_numeric_literals_refuse_before_typed_parsing() {
+        let file = write_temp_csv("ID,Job,Annual Income\n1,unemployed,500\n2,teacher,600\n");
+        for prompt in [
+            "List rows where Annual Income < 10,000",
+            "List rows where Job = 10,000",
+        ] {
+            let result = run_pipeline(file.path(), prompt);
+
+            assert_eq!(result.outcome, CoreOutcome::Failed, "prompt {prompt}");
+            assert!(result.output.is_none());
+            assert!(result.plan.is_none());
+            assert!(diagnostic_codes(&result).contains(&"intent.literal_invalid"));
+            let evidence = result.intent_evidence.as_ref().unwrap();
+            assert_eq!(
+                evidence.refusal_reason.as_deref(),
+                Some("intent.literal_invalid")
+            );
+            assert!(
+                !event_names(&result).contains(&"compared_columns_parsed"),
+                "literal refusals must precede typed parsing, prompt {prompt}"
+            );
+            assert!(
+                !diagnostic_codes(&result)
+                    .iter()
+                    .any(|code| code.starts_with("parse.")),
+                "prompt {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn expression_depth_and_node_limits_refuse_without_execution() {
+        let file = write_temp_csv("ID,Job,Annual Income\n1,unemployed,500\n");
+
+        let mut depth_prompt = String::from("List rows where ");
+        for _ in 0..9 {
+            depth_prompt.push_str("not ( ");
+        }
+        depth_prompt.push_str("Job = 1");
+        for _ in 0..9 {
+            depth_prompt.push_str(" )");
+        }
+        let mut node_prompt = String::from("List rows where ");
+        let chain = (0..64).map(|_| "Job = 1").collect::<Vec<_>>().join(" and ");
+        node_prompt.push_str(&chain);
+
+        for prompt in [depth_prompt, node_prompt] {
+            let result = run_pipeline(file.path(), &prompt);
+
+            assert_eq!(result.outcome, CoreOutcome::Failed);
+            assert!(result.output.is_none());
+            assert!(result.plan.is_none());
+            assert!(
+                diagnostic_codes(&result).contains(&"intent.predicate_unsupported"),
+                "prompt {prompt}"
+            );
+            let evidence = result.intent_evidence.as_ref().unwrap();
+            assert_eq!(
+                evidence.refusal_reason.as_deref(),
+                Some("intent.predicate_unsupported")
+            );
+            assert!(!event_names(&result).contains(&"materialization_completed"));
+        }
+    }
+
+    #[test]
+    fn decimal_boundaries_and_negatives_filter_exactly() {
+        let file =
+            write_temp_csv("ID,Annual Income\n1,10000\n2,10000.0\n3,9999.99\n4,-2.5\n5,0.001\n");
+
+        let cases: &[(&str, &[usize])] = &[
+            ("List rows where Annual Income = 10000", &[1, 2]),
+            ("List rows where Annual Income <= 10000", &[1, 2, 3, 4, 5]),
+            ("List rows where Annual Income >= -2.5", &[1, 2, 3, 4, 5]),
+            ("List rows where Annual Income < 0.001", &[4]),
+            ("List rows where Annual Income <= -2.5", &[4]),
+        ];
+        for (prompt, expected) in cases {
+            let result = run_pipeline(file.path(), prompt);
+            assert_eq!(result.outcome, CoreOutcome::Materialized, "prompt {prompt}");
+            assert_eq!(provenance_rows(&result), *expected, "prompt {prompt}");
+            assert_eq!(
+                row_filter_plan_schema_version(&result),
+                PLAN_SCHEMA_VERSION_2
+            );
+        }
+    }
+
+    #[test]
+    fn retrieval_plans_stay_schema_version_1_after_request_swap() {
+        let file = write_temp_csv(&job_income_csv());
+        let result = run_pipeline(file.path(), "List note");
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        let plan = result.plan.as_ref().unwrap();
+        assert_eq!(plan.schema_version, 1);
+        assert_eq!(plan.steps.len(), 1);
+        assert!(matches!(plan.steps[0], PlanStep::Select { .. }));
+        let intent = result.intent.as_ref().expect("retrieval keeps its intent");
+        assert_eq!(intent.column_display_name, "Note");
+        let evidence = result.intent_evidence.as_ref().unwrap();
+        assert_eq!(evidence.canonical_operation.as_deref(), Some("select"));
+        assert!(evidence.row_filter.is_none());
+        assert!(!event_names(&result).contains(&"compared_columns_parsed"));
     }
 }

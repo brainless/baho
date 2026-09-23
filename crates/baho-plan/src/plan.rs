@@ -1,9 +1,19 @@
+use baho_model::ExactDecimal;
 use serde::{Deserialize, Serialize};
+
+/// Plan schema version 1: select, distinct, and `is_not_blank` filters only.
+pub const PLAN_SCHEMA_VERSION_1: u32 = 1;
+
+/// Plan schema version 2: adds typed literals and recursive predicates.
+///
+/// Version 1 plans keep their existing semantics and expression set; the
+/// extended expression kinds are never emitted under schema version 1.
+pub const PLAN_SCHEMA_VERSION_2: u32 = 2;
 
 /// A versioned, serializable operation plan bound to a specific source revision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
-    /// Schema version; must be 1.
+    /// Schema version: 1 or 2.
     pub schema_version: u32,
     /// The source this plan was built for.
     pub source: PlanSource,
@@ -44,16 +54,157 @@ pub enum DistinctKeep {
 }
 
 /// An expression used within plan steps.
+///
+/// The `is_not_blank` JSON shape is unchanged from plan schema version 1;
+/// `compare`, `and`, `or`, and `not` require plan schema version 2.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Expression {
     /// True when the cell value is not blank.
     IsNotBlank { column: String },
+    /// Compare one column against a typed literal.
+    Compare {
+        column: String,
+        operator: ComparisonOperator,
+        literal: Literal,
+    },
+    /// True when every predicate holds.
+    And { predicates: Vec<Expression> },
+    /// True when at least one predicate holds.
+    Or { predicates: Vec<Expression> },
+    /// Three-valued negation of one predicate.
+    Not { predicate: Box<Expression> },
+}
+
+impl Expression {
+    /// Operation tag of this expression, matching its serialized `"op"` value.
+    pub fn op(&self) -> &'static str {
+        match self {
+            Expression::IsNotBlank { .. } => "is_not_blank",
+            Expression::Compare { .. } => "compare",
+            Expression::And { .. } => "and",
+            Expression::Or { .. } => "or",
+            Expression::Not { .. } => "not",
+        }
+    }
+
+    /// The column referenced by a single-column leaf, if this expression is one.
+    pub fn column(&self) -> Option<&str> {
+        match self {
+            Expression::IsNotBlank { column } | Expression::Compare { column, .. } => Some(column),
+            Expression::And { .. } | Expression::Or { .. } | Expression::Not { .. } => None,
+        }
+    }
+
+    /// Every column referenced anywhere in this predicate, in deterministic
+    /// visitation order.
+    pub fn columns(&self) -> Vec<&str> {
+        let mut columns = Vec::new();
+        self.collect_columns(&mut columns);
+        columns
+    }
+
+    /// Number of nodes in this predicate tree; each expression counts once.
+    pub fn node_count(&self) -> usize {
+        1 + match self {
+            Expression::IsNotBlank { .. } | Expression::Compare { .. } => 0,
+            Expression::And { predicates } | Expression::Or { predicates } => {
+                predicates.iter().map(Expression::node_count).sum()
+            }
+            Expression::Not { predicate } => predicate.node_count(),
+        }
+    }
+
+    /// Depth of this predicate tree; a leaf is depth 1.
+    pub fn depth(&self) -> usize {
+        1 + match self {
+            Expression::IsNotBlank { .. } | Expression::Compare { .. } => 0,
+            Expression::And { predicates } | Expression::Or { predicates } => {
+                predicates.iter().map(Expression::depth).max().unwrap_or(0)
+            }
+            Expression::Not { predicate } => predicate.depth(),
+        }
+    }
+
+    fn collect_columns<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Expression::IsNotBlank { column } | Expression::Compare { column, .. } => {
+                out.push(column);
+            }
+            Expression::And { predicates } | Expression::Or { predicates } => {
+                for predicate in predicates {
+                    predicate.collect_columns(out);
+                }
+            }
+            Expression::Not { predicate } => predicate.collect_columns(out),
+        }
+    }
+}
+
+/// A typed literal operand of a comparison predicate.
+///
+/// The variant tag records the literal kind (`"text"` or `"decimal"`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Literal {
+    /// A text literal.
+    Text(String),
+    /// An exact decimal literal.
+    Decimal(ExactDecimal),
+}
+
+/// Comparison operators for atomic predicates.
+///
+/// Serialized as the surface grammar symbols.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ComparisonOperator {
+    #[serde(rename = "=")]
+    Equal,
+    #[serde(rename = "!=")]
+    NotEqual,
+    #[serde(rename = "<")]
+    Less,
+    #[serde(rename = "<=")]
+    LessOrEqual,
+    #[serde(rename = ">")]
+    Greater,
+    #[serde(rename = ">=")]
+    GreaterOrEqual,
+}
+
+impl ComparisonOperator {
+    /// Surface form used in the constrained grammar and plan JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComparisonOperator::Equal => "=",
+            ComparisonOperator::NotEqual => "!=",
+            ComparisonOperator::Less => "<",
+            ComparisonOperator::LessOrEqual => "<=",
+            ComparisonOperator::Greater => ">",
+            ComparisonOperator::GreaterOrEqual => ">=",
+        }
+    }
+
+    /// Whether this is an ordered comparison (`<`, `<=`, `>`, `>=`), which
+    /// requires a decimal literal.
+    pub fn is_ordered(self) -> bool {
+        matches!(
+            self,
+            ComparisonOperator::Less
+                | ComparisonOperator::LessOrEqual
+                | ComparisonOperator::Greater
+                | ComparisonOperator::GreaterOrEqual
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dec(text: &str) -> ExactDecimal {
+        ExactDecimal::parse(text).unwrap()
+    }
 
     fn sample_plan() -> Plan {
         Plan {
@@ -76,6 +227,33 @@ mod tests {
                     keep: DistinctKeep::First,
                 },
             ],
+        }
+    }
+
+    /// `List rows where Job = unemployed or Annual Income < 10000`
+    fn sample_v2_plan() -> Plan {
+        Plan {
+            schema_version: 2,
+            source: PlanSource {
+                revision: "abc123".to_string(),
+                table_id: "table-0".to_string(),
+            },
+            steps: vec![PlanStep::Filter {
+                predicate: Expression::Or {
+                    predicates: vec![
+                        Expression::Compare {
+                            column: "column-0".to_string(),
+                            operator: ComparisonOperator::Equal,
+                            literal: Literal::Text("unemployed".to_string()),
+                        },
+                        Expression::Compare {
+                            column: "column-1".to_string(),
+                            operator: ComparisonOperator::Less,
+                            literal: Literal::Decimal(dec("10000")),
+                        },
+                    ],
+                },
+            }],
         }
     }
 
@@ -126,5 +304,168 @@ mod tests {
         };
         assert_eq!(source.revision, "sha256:abcdef");
         assert_eq!(source.table_id, "table-0");
+    }
+
+    #[test]
+    fn is_not_blank_json_shape_unchanged() {
+        let expr = Expression::IsNotBlank {
+            column: "column-1".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&expr).unwrap(),
+            serde_json::json!({ "op": "is_not_blank", "column": "column-1" })
+        );
+    }
+
+    #[test]
+    fn v1_plan_json_round_trip_is_stable() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "source": { "revision": "abc123", "table_id": "table-0" },
+            "steps": [
+                {
+                    "op": "filter",
+                    "predicate": { "op": "is_not_blank", "column": "column-1" }
+                },
+                { "op": "select", "columns": ["column-1"] },
+                { "op": "distinct", "columns": ["column-1"], "keep": "first" }
+            ]
+        });
+        let plan: Plan = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&plan).unwrap(), json);
+    }
+
+    #[test]
+    fn v2_predicate_tree_serde_round_trip() {
+        let plan = sample_v2_plan();
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: Plan = serde_json::from_str(&json).unwrap();
+        assert_eq!(plan, back);
+    }
+
+    #[test]
+    fn v2_predicate_tree_json_structure() {
+        let json = serde_json::to_value(sample_v2_plan()).unwrap();
+        assert_eq!(json["schema_version"], 2);
+        let predicate = &json["steps"][0]["predicate"];
+        assert_eq!(predicate["op"], "or");
+        let operands = predicate["predicates"].as_array().unwrap();
+        assert_eq!(operands.len(), 2);
+        assert_eq!(operands[0]["op"], "compare");
+        assert_eq!(operands[0]["column"], "column-0");
+        assert_eq!(operands[0]["operator"], "=");
+        assert_eq!(
+            operands[0]["literal"],
+            serde_json::json!({ "text": "unemployed" })
+        );
+        assert_eq!(operands[1]["op"], "compare");
+        assert_eq!(operands[1]["column"], "column-1");
+        assert_eq!(operands[1]["operator"], "<");
+        assert_eq!(
+            operands[1]["literal"],
+            serde_json::json!({ "decimal": "10000" })
+        );
+    }
+
+    #[test]
+    fn nested_predicate_json_shape() {
+        let expr = Expression::Not {
+            predicate: Box::new(Expression::And {
+                predicates: vec![
+                    Expression::IsNotBlank {
+                        column: "column-0".to_string(),
+                    },
+                    Expression::Compare {
+                        column: "column-0".to_string(),
+                        operator: ComparisonOperator::NotEqual,
+                        literal: Literal::Text("x".to_string()),
+                    },
+                ],
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&expr).unwrap(),
+            serde_json::json!({
+                "op": "not",
+                "predicate": {
+                    "op": "and",
+                    "predicates": [
+                        { "op": "is_not_blank", "column": "column-0" },
+                        {
+                            "op": "compare",
+                            "column": "column-0",
+                            "operator": "!=",
+                            "literal": { "text": "x" }
+                        }
+                    ]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn comparison_operators_serialize_as_grammar_symbols() {
+        for (operator, symbol) in [
+            (ComparisonOperator::Equal, "="),
+            (ComparisonOperator::NotEqual, "!="),
+            (ComparisonOperator::Less, "<"),
+            (ComparisonOperator::LessOrEqual, "<="),
+            (ComparisonOperator::Greater, ">"),
+            (ComparisonOperator::GreaterOrEqual, ">="),
+        ] {
+            assert_eq!(
+                serde_json::to_value(operator).unwrap(),
+                serde_json::json!(symbol)
+            );
+            assert_eq!(operator.as_str(), symbol);
+            let back: ComparisonOperator = serde_json::from_str(&format!("\"{symbol}\"")).unwrap();
+            assert_eq!(back, operator);
+        }
+        assert!(!ComparisonOperator::Equal.is_ordered());
+        assert!(!ComparisonOperator::NotEqual.is_ordered());
+        assert!(ComparisonOperator::Less.is_ordered());
+        assert!(ComparisonOperator::LessOrEqual.is_ordered());
+        assert!(ComparisonOperator::Greater.is_ordered());
+        assert!(ComparisonOperator::GreaterOrEqual.is_ordered());
+    }
+
+    #[test]
+    fn decimal_literal_serializes_canonical_string() {
+        let literal = Literal::Decimal(dec("1.10"));
+        assert_eq!(
+            serde_json::to_value(&literal).unwrap(),
+            serde_json::json!({ "decimal": "1.1" })
+        );
+        let back: Literal = serde_json::from_str(r#"{"decimal":"-2.50"}"#).unwrap();
+        assert_eq!(back, Literal::Decimal(dec("-2.5")));
+    }
+
+    #[test]
+    fn predicate_shape_accessors() {
+        let expr = Expression::Not {
+            predicate: Box::new(Expression::And {
+                predicates: vec![
+                    Expression::IsNotBlank {
+                        column: "a".to_string(),
+                    },
+                    Expression::Compare {
+                        column: "b".to_string(),
+                        operator: ComparisonOperator::Less,
+                        literal: Literal::Decimal(dec("1")),
+                    },
+                ],
+            }),
+        };
+        assert_eq!(expr.op(), "not");
+        assert_eq!(expr.column(), None);
+        assert_eq!(expr.columns(), ["a", "b"]);
+        assert_eq!(expr.node_count(), 4);
+        assert_eq!(expr.depth(), 3);
+        let leaf = Expression::IsNotBlank {
+            column: "a".to_string(),
+        };
+        assert_eq!(leaf.column(), Some("a"));
+        assert_eq!(leaf.node_count(), 1);
+        assert_eq!(leaf.depth(), 1);
     }
 }

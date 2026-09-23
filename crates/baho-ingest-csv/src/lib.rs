@@ -12,6 +12,7 @@ pub mod header;
 pub mod importer;
 pub mod inspector;
 pub mod row_features;
+pub mod typed_values;
 
 pub use candidates::{CandidateConfig, detect_candidates, detect_candidates_with_config};
 pub use classifier::{classify_rows, classify_rows_with_config};
@@ -24,4 +25,9 @@ pub use inspector::{
 };
 pub use row_features::{
     ColumnShape, RowFeatures, compute_row_features, compute_row_features_with_config,
+};
+pub use typed_values::{
+    ColumnParseCounts, ComparedColumnParse, MAX_MALFORMED_SAMPLE_CELLS,
+    MIXED_COLUMN_MALFORMED_SHARE_PERCENT, MalformedValuesEvidence, MixedRefusalReason,
+    ParseVerdict, parse_compared_column,
 };

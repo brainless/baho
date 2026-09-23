@@ -34,6 +34,15 @@ pub enum IntentError {
     #[error("unsupported intent: {0}")]
     Unsupported(String, Option<RecognitionEvidence>),
 
+    #[error("unsupported predicate grammar: {0}")]
+    PredicateUnsupported(String, Option<RecognitionEvidence>),
+
+    #[error("invalid literal: {detail}")]
+    LiteralInvalid {
+        detail: String,
+        evidence: Option<RecognitionEvidence>,
+    },
+
     #[error("column not found for term '{prompt_term}'")]
     ColumnNotFound {
         prompt_term: String,

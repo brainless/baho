@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+baho-model = { path = "../baho-model" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2.0"
 
