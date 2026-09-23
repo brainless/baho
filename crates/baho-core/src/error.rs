@@ -60,4 +60,10 @@ pub enum IntentError {
         candidates: Vec<String>,
         evidence: Option<RecognitionEvidence>,
     },
+
+    #[error("excessive expression depth or size: {detail}")]
+    ExpressionLimitExceeded {
+        detail: String,
+        evidence: Option<RecognitionEvidence>,
+    },
 }

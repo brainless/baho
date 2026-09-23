@@ -2,14 +2,14 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
-use baho_model::column::{ColumnDefinition, ParsedColumn};
+use baho_model::column::{ColumnDefinition, InferredColumnType, ParsedColumn};
 use baho_model::diagnostic::{Diagnostic, Severity};
 use baho_model::document::{CellAddress, ParsedCell, SourcedCell, Value};
 use baho_model::materialized::{MaterializedRow, MaterializedView, RowProvenance};
 use baho_plan::plan::{ComparisonOperator, DistinctKeep, Expression, Literal, Plan, PlanStep};
 use baho_plan::validation::validate_plan_structure;
 
-use crate::error::ExecutionError;
+use crate::error::{ColumnMixedReason, ExecutionError};
 
 /// Grid data provided to the executor as input.
 pub struct GridInput {
@@ -19,10 +19,15 @@ pub struct GridInput {
     pub columns: Vec<ColumnDefinition>,
     pub rows: Vec<Vec<Option<Value>>>,
     pub source_rows: Vec<usize>,
-    /// Typed parse evidence for columns referenced by decimal comparisons,
-    /// keyed by column ID. Each entry aligns its cells with `source_rows`
-    /// through `SourcedCell::address.row`, so filtering steps that drop rows
-    /// never invalidate the evidence.
+    /// Typed parse evidence for columns referenced by comparisons, keyed by
+    /// column ID. A decimal comparison requires its column here. A text
+    /// comparison uses it only to reject numeric columns and to treat valid
+    /// decimals in a mixed column as `unknown`; a text-compared column with
+    /// no entry falls back to exact string comparison.
+    ///
+    /// Each entry aligns its cells with `source_rows` through
+    /// `SourcedCell::address.row`, so filtering steps that drop rows never
+    /// invalidate the evidence.
     pub typed_columns: BTreeMap<String, ParsedColumn>,
 }
 
@@ -106,7 +111,6 @@ pub fn execute_plan(plan: &Plan, grid: &GridInput) -> Result<ExecutionResult, Ex
 
     let typed = build_typed_columns(grid);
 
-    // Build initial column index lookup by id
     let mut col_index: HashMap<String, usize> = grid
         .columns
         .iter()
@@ -114,7 +118,6 @@ pub fn execute_plan(plan: &Plan, grid: &GridInput) -> Result<ExecutionResult, Ex
         .map(|(i, c)| (c.id.clone(), i))
         .collect();
 
-    // Validate all column references exist
     validate_column_refs(plan, &col_index)?;
     validate_typed_predicates(plan, &typed)?;
 
@@ -133,7 +136,6 @@ pub fn execute_plan(plan: &Plan, grid: &GridInput) -> Result<ExecutionResult, Ex
     // Track output columns (updated by select)
     let mut current_columns = grid.columns.clone();
 
-    // Execute steps sequentially
     for step in &plan.steps {
         match step {
             PlanStep::Filter { predicate } => {
@@ -206,7 +208,6 @@ pub fn execute_plan(plan: &Plan, grid: &GridInput) -> Result<ExecutionResult, Ex
 
     let rows_output = working.len();
 
-    // Build materialized rows and provenance
     let materialized_rows: Vec<MaterializedRow> = working
         .iter()
         .map(|(values, _, _)| MaterializedRow {
@@ -284,6 +285,7 @@ fn resolve_column_index(
 /// Typed parse evidence for one column plus its source-row lookup index.
 struct TypedColumnData<'a> {
     parsed: &'a ParsedColumn,
+    inferred: InferredColumnType,
     row_to_cell: HashMap<usize, usize>,
 }
 
@@ -303,6 +305,7 @@ fn build_typed_columns(grid: &GridInput) -> TypedColumns<'_> {
                 column_id.as_str(),
                 TypedColumnData {
                     parsed,
+                    inferred: parsed.inferred_type(),
                     row_to_cell,
                 },
             )
@@ -310,10 +313,12 @@ fn build_typed_columns(grid: &GridInput) -> TypedColumns<'_> {
         .collect()
 }
 
-/// Decimal comparisons require typed parse evidence: the column must carry at
-/// least one successfully parsed value or no comparison is interpretable.
-/// Malformed values below the parse stage's mixed-column refusal threshold are
-/// expected here and evaluate to `unknown` per row.
+/// Decimal comparisons enforce Epic 006 locked decision 5 at the crate
+/// boundary: a referenced column must be inferred [`InferredColumnType::Numeric`].
+/// Zero parseable nonblank values (Blank or Text) and a malformed share above
+/// [`baho_model::column::MIXED_COLUMN_MALFORMED_SHARE_PERCENT`] (Mixed) are
+/// refused before evaluation. Malformed values within the accepted threshold
+/// are expected here and evaluate to `unknown` per row.
 fn validate_typed_predicates(plan: &Plan, typed: &TypedColumns<'_>) -> Result<(), ExecutionError> {
     for step in &plan.steps {
         if let PlanStep::Filter { predicate } = step {
@@ -340,19 +345,38 @@ fn validate_expression_typed(
                     .ok_or_else(|| ExecutionError::MissingTypedParse {
                         column_id: column.clone(),
                     })?;
-            if !data
-                .parsed
-                .cells
-                .iter()
-                .any(|cell| matches!(cell.parsed, ParsedCell::Valid(_)))
-            {
-                return Err(ExecutionError::ColumnNotNumeric {
-                    column_id: column.clone(),
-                });
+            let reason = match data.inferred {
+                InferredColumnType::Numeric => return Ok(()),
+                InferredColumnType::Blank | InferredColumnType::Text => {
+                    ColumnMixedReason::NoParseableValues
+                }
+                InferredColumnType::Mixed => ColumnMixedReason::MalformedShareExceeded,
+            };
+            Err(ExecutionError::ColumnMixed {
+                column_id: column.clone(),
+                reason,
+            })
+        }
+        Expression::Compare {
+            column,
+            literal: Literal::Text(_),
+            ..
+        } => {
+            // A text literal against a numerically profiled column is a plan
+            // type mismatch (Epic 006 `plan.type_mismatch`). A column with no
+            // typed profile falls back to exact string comparison so direct
+            // executor callers keep Epic 002 behavior.
+            if let Some(data) = typed.get(column.as_str()) {
+                if data.inferred == InferredColumnType::Numeric {
+                    return Err(ExecutionError::TypeMismatch {
+                        column_id: column.clone(),
+                        expected: "text".to_string(),
+                        actual: "numeric".to_string(),
+                    });
+                }
             }
             Ok(())
         }
-        Expression::Compare { .. } => Ok(()),
         Expression::And { predicates } | Expression::Or { predicates } => {
             for predicate in predicates {
                 validate_expression_typed(predicate, typed)?;
@@ -450,6 +474,19 @@ fn evaluate_compare(
 ) -> Result<TruthValue, ExecutionError> {
     match literal {
         Literal::Text(expected) => {
+            // In a materially mixed column, cells that strict-parse as valid
+            // decimals are type-incompatible with a text literal and evaluate
+            // to `unknown`; malformed non-numeric cells still string-compare.
+            let mixed = evaluator
+                .typed
+                .get(column)
+                .is_some_and(|data| data.inferred == InferredColumnType::Mixed);
+            if mixed {
+                let cell = evaluator.typed_cell(column, source_row)?;
+                if !matches!(cell.parsed, ParsedCell::Malformed { .. }) {
+                    return Ok(TruthValue::Unknown);
+                }
+            }
             let value = evaluator.raw_value(values, column)?;
             Ok(match value {
                 None | Some(Value::Blank) => TruthValue::Unknown,
@@ -1028,7 +1065,8 @@ mod tests {
 
     /// Typed parse evidence for the income column (column-2, ordinal 2),
     /// mirroring ingest output: `None` records a missing cell from a ragged
-    /// row and raw text is classified by the strict decimal policy.
+    /// row, whitespace-only text records a blank cell, and other raw text is
+    /// classified by the strict decimal policy.
     fn typed_income_column(values: &[(usize, Option<&str>)]) -> (String, ParsedColumn) {
         let policy = baho_model::NumericParsePolicy::StrictDecimal;
         let cells = values
@@ -1042,6 +1080,7 @@ mod tests {
                 raw_text: text.map(|text| text.to_string()),
                 parsed: match text {
                     None => ParsedCell::Missing,
+                    Some(text) if text.trim().is_empty() => ParsedCell::Blank,
                     Some(text) => match policy.parse_decimal(text) {
                         Ok(value) => ParsedCell::Valid(value),
                         Err(reason) => ParsedCell::Malformed {
@@ -1199,10 +1238,9 @@ mod tests {
                 vec![text("n4"), text("j4"), text("-2.5")],
                 vec![text("n5"), text("j5"), text("0.001")],
                 vec![text("n6"), text("j6"), blank()],
-                vec![text("n7"), text("j7"), text("10,000")],
-                vec![text("n8"), text("j8"), none_val()],
+                vec![text("n7"), text("j7"), none_val()],
             ],
-            source_rows: vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
+            source_rows: vec![0, 1, 2, 3, 4, 5, 6, 7],
             typed_columns: typed_columns(vec![typed_income_column(&[
                 (0, Some("10000")),
                 (1, Some("10000.0")),
@@ -1211,8 +1249,7 @@ mod tests {
                 (4, Some("-2.5")),
                 (5, Some("0.001")),
                 (6, Some("   ")),
-                (7, Some("10,000")),
-                (8, None),
+                (7, None),
             ])]),
         };
 
@@ -1233,7 +1270,7 @@ mod tests {
                 *expected_rows,
                 "operator {operator:?} {literal_text}"
             );
-            assert_eq!(result.rows_processed, 9, "operator {operator:?}");
+            assert_eq!(result.rows_processed, 8, "operator {operator:?}");
         }
     }
 
@@ -1300,6 +1337,87 @@ mod tests {
         assert_eq!(result.rows_processed, 10);
         assert_eq!(result.rows_output, 9);
         assert_eq!(provenance_rows(&result), (0..9).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn text_literal_on_numeric_profiled_column_is_type_mismatch() {
+        let grid = GridInput {
+            table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
+            source_sheet_index: 0,
+            columns: job_income_columns(),
+            rows: vec![vec![text("A"), text("j"), text("500")]],
+            source_rows: vec![0],
+            typed_columns: typed_columns(vec![typed_income_column(&[(0, Some("500"))])]),
+        };
+
+        let err = execute_plan(&filter_plan(2, text_equals("column-2", "500")), &grid).unwrap_err();
+        assert!(matches!(
+            err,
+            ExecutionError::TypeMismatch { ref column_id, .. } if column_id == "column-2"
+        ));
+    }
+
+    #[test]
+    fn text_literal_on_text_profiled_column_still_string_compares() {
+        let grid = GridInput {
+            table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
+            source_sheet_index: 0,
+            columns: job_income_columns(),
+            rows: vec![
+                vec![text("A"), text("j"), text("unemployed")],
+                vec![text("B"), text("j"), text("teacher")],
+                vec![text("C"), text("j"), text("unemployed ")],
+            ],
+            source_rows: vec![0, 1, 2],
+            typed_columns: typed_columns(vec![typed_income_column(&[
+                (0, Some("unemployed")),
+                (1, Some("teacher")),
+                (2, Some("unemployed ")),
+            ])]),
+        };
+
+        let result = execute_plan(
+            &filter_plan(2, text_equals("column-2", "unemployed")),
+            &grid,
+        )
+        .unwrap();
+        assert_eq!(provenance_rows(&result), [0]);
+    }
+
+    #[test]
+    fn mixed_column_text_comparison_marks_numeric_cells_unknown() {
+        // 2 valid (500, 600) and 1 malformed (abc): a 1/3 malformed share
+        // exceeds the 10% limit, so the column is materially mixed and text
+        // comparison applies per cell.
+        let grid = GridInput {
+            table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
+            source_sheet_index: 0,
+            columns: job_income_columns(),
+            rows: vec![
+                vec![text("A"), text("j"), text("500")],
+                vec![text("B"), text("j"), text("abc")],
+                vec![text("C"), text("j"), text("600")],
+            ],
+            source_rows: vec![0, 1, 2],
+            typed_columns: typed_columns(vec![typed_income_column(&[
+                (0, Some("500")),
+                (1, Some("abc")),
+                (2, Some("600")),
+            ])]),
+        };
+
+        let text_match =
+            execute_plan(&filter_plan(2, text_equals("column-2", "abc")), &grid).unwrap();
+        assert_eq!(provenance_rows(&text_match), [1]);
+
+        // Numeric cells are type-incompatible with a text literal, so even an
+        // exact surface match must not retain the row.
+        let numeric_surface_match =
+            execute_plan(&filter_plan(2, text_equals("column-2", "500")), &grid).unwrap();
+        assert!(numeric_surface_match.view.provenance.is_empty());
     }
 
     #[test]
@@ -1496,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn numeric_column_without_parseable_values_refused() {
+    fn decimal_comparison_refuses_column_without_parseable_values() {
         let grid = GridInput {
             table_id: "table-0".to_string(),
             source_revision: "hash".to_string(),
@@ -1516,8 +1634,72 @@ mod tests {
         let err = execute_plan(&filter_plan(2, income_less_than("10000")), &grid).unwrap_err();
         assert!(matches!(
             err,
-            ExecutionError::ColumnNotNumeric { ref column_id } if column_id == "column-2"
+            ExecutionError::ColumnMixed {
+                ref column_id,
+                reason: ColumnMixedReason::NoParseableValues,
+            } if column_id == "column-2"
         ));
+        assert_eq!(err.diagnostic_code(), "parse.column_mixed");
+    }
+
+    #[test]
+    fn decimal_comparison_refuses_materially_mixed_column() {
+        // 2 valid and 1 malformed value: a malformed share of 1/3 exceeds the
+        // 10% limit, so a direct caller is refused before evaluation.
+        let grid = GridInput {
+            table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
+            source_sheet_index: 0,
+            columns: job_income_columns(),
+            rows: vec![
+                vec![text("A"), text("j"), text("500")],
+                vec![text("B"), text("j"), text("abc")],
+                vec![text("C"), text("j"), text("600")],
+            ],
+            source_rows: vec![0, 1, 2],
+            typed_columns: typed_columns(vec![typed_income_column(&[
+                (0, Some("500")),
+                (1, Some("abc")),
+                (2, Some("600")),
+            ])]),
+        };
+
+        let err = execute_plan(&filter_plan(2, income_less_than("1000")), &grid).unwrap_err();
+        assert!(matches!(
+            err,
+            ExecutionError::ColumnMixed {
+                ref column_id,
+                reason: ColumnMixedReason::MalformedShareExceeded,
+            } if column_id == "column-2"
+        ));
+        assert_eq!(err.diagnostic_code(), "parse.column_mixed");
+    }
+
+    #[test]
+    fn decimal_comparison_refuses_all_blank_column() {
+        // Zero nonblank values is a decision-5 refusal, not a Numeric column.
+        let grid = GridInput {
+            table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
+            source_sheet_index: 0,
+            columns: job_income_columns(),
+            rows: vec![
+                vec![text("A"), text("j"), blank()],
+                vec![text("B"), text("j"), none_val()],
+            ],
+            source_rows: vec![0, 1],
+            typed_columns: typed_columns(vec![typed_income_column(&[(0, Some("   ")), (1, None)])]),
+        };
+
+        let err = execute_plan(&filter_plan(2, income_less_than("10000")), &grid).unwrap_err();
+        assert!(matches!(
+            err,
+            ExecutionError::ColumnMixed {
+                ref column_id,
+                reason: ColumnMixedReason::NoParseableValues,
+            } if column_id == "column-2"
+        ));
+        assert_eq!(err.diagnostic_code(), "parse.column_mixed");
     }
 
     #[test]

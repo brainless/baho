@@ -603,8 +603,8 @@ fn row_filter_records_plan_v2_with_all_columns_and_provenance() {
         .unwrap();
     assert_eq!(
         parsed["fields"]["fields"]["columns"],
-        serde_json::json!(["column-2"]),
-        "only the decimal-compared column is typed-parsed"
+        serde_json::json!(["column-1", "column-2"]),
+        "every compared column is profiled"
     );
     assert_eq!(parsed["fields"]["fields"]["mixed"], serde_json::json!([]));
 
@@ -675,6 +675,17 @@ fn mixed_compared_column_refusal_writes_parse_diagnostics() {
         mixed["location"]["col"], 1,
         "mixed-column refusal locates the compared column"
     );
+    let malformed = diagnostics["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"].as_str() == Some("parse.value_malformed"))
+        .unwrap();
+    assert_eq!(malformed["location"]["cell"]["col"], 1);
+    assert_eq!(
+        malformed["location"]["cells"][0]["col"], 1,
+        "structured sample cells survive into diagnostics.json"
+    );
 
     // Recognition evidence and the refused plan stay inspectable in
     // plan.json, with the run stuck before execution.
@@ -739,6 +750,101 @@ fn mixed_compared_column_refusal_writes_parse_diagnostics() {
         parsed["fields"]["fields"]["mixed"],
         serde_json::json!(["column-1"])
     );
+}
+
+#[test]
+fn text_literal_against_numeric_column_writes_plan_type_mismatch() {
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = write_job_income_csv(workspace.path());
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List rows where Annual Income = \"500\"",
+        ])
+        .output()
+        .expect("run baho");
+
+    assert!(!output.status.success(), "expected failure: {output:?}");
+
+    let run = workspace.path().join(".baho/runs/000001");
+    let diagnostics = read_artifact(&run, "diagnostics.json");
+    let codes = artifact_diagnostic_codes(&diagnostics);
+    assert!(
+        codes.contains(&"plan.type_mismatch"),
+        "expected plan.type_mismatch, got: {codes:?}"
+    );
+    assert!(
+        !codes.contains(&"execution.failed"),
+        "a type mismatch is a plan diagnostic, not an execution failure"
+    );
+    let mismatch = diagnostics["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"].as_str() == Some("plan.type_mismatch"))
+        .unwrap();
+    assert_eq!(mismatch["severity"], "Error");
+
+    // The validated plan stays inspectable; nothing is materialized.
+    assert!(!run.join("output/result.json").exists());
+    let plan = read_artifact(&run, "plan.json");
+    assert_eq!(plan["schema_version"], 4);
+    assert_eq!(plan["plan"]["schema_version"], 2);
+
+    let events_raw = fs::read_to_string(run.join("events.jsonl")).expect("read events");
+    assert!(events_raw.contains("compared_columns_parsed"));
+    assert!(!events_raw.contains("materialization_completed"));
+}
+
+#[test]
+fn compact_grouped_literal_refuses_with_literal_invalid_in_artifacts() {
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = write_job_income_csv(workspace.path());
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List job = 10,000",
+        ])
+        .output()
+        .expect("run baho");
+
+    assert!(!output.status.success(), "expected failure: {output:?}");
+
+    let run = workspace.path().join(".baho/runs/000001");
+    let diagnostics = read_artifact(&run, "diagnostics.json");
+    let codes = artifact_diagnostic_codes(&diagnostics);
+    assert!(
+        codes.contains(&"intent.literal_invalid"),
+        "expected literal_invalid diagnostic, got: {codes:?}"
+    );
+    assert!(
+        !codes.contains(&"intent.column_not_found"),
+        "a predicate-shaped compact prompt must not fall back to retrieval: {codes:?}"
+    );
+
+    let plan = read_artifact(&run, "plan.json");
+    assert_eq!(plan["schema_version"], 4);
+    assert_eq!(
+        plan["recognition_evidence"]["refusal_reason"],
+        "intent.literal_invalid"
+    );
+    assert!(
+        plan.get("plan").is_none(),
+        "refusal must not write a nested plan"
+    );
+    assert!(!run.join("output/result.json").exists());
+
+    let events_raw = fs::read_to_string(run.join("events.jsonl")).expect("read events");
+    assert!(!events_raw.contains("compared_columns_parsed"));
+    assert!(!events_raw.contains("materialization_completed"));
 }
 
 #[test]

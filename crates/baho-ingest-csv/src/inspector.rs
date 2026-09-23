@@ -148,6 +148,7 @@ pub fn inspect_csv_with_config(
                             row: Some(total_count),
                             col: Some(col),
                             cell: None,
+                            cells: Vec::new(),
                         }),
                     });
                     total_count += 1;
@@ -197,6 +198,7 @@ pub fn inspect_csv_with_config(
                         row: Some(total_count),
                         col: None,
                         cell: None,
+                        cells: Vec::new(),
                     }),
                 });
                 total_count += 1;

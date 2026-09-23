@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::decimal::{DecimalParseError, ExactDecimal};
-use crate::document::SourcedCell;
+use crate::document::{ParsedCell, SourcedCell};
 
 /// Metadata for a single column in a materialized view.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -16,6 +16,31 @@ pub struct ColumnDefinition {
     pub source_header_normalized: Option<String>,
     /// Human-readable display name for presentation.
     pub display_name: String,
+}
+
+/// Locked Epic 006 decision 5: the malformed share of a compared column's
+/// nonblank cells may not exceed this percentage before the column counts as
+/// materially mixed.
+pub const MIXED_COLUMN_MALFORMED_SHARE_PERCENT: u64 = 10;
+
+/// Type inferred for a compared column from strict-decimal parse outcomes.
+///
+/// The inference is derived from [`ParsedColumn`] cells and is not persisted
+/// on its own; it lets validation distinguish compatible and incompatible
+/// comparisons without re-reading source formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferredColumnType {
+    /// At least one valid decimal and the malformed share is within the
+    /// locked limit; the column can back a decimal comparison.
+    Numeric,
+    /// No valid decimal, but at least one nonblank non-numeric cell.
+    Text,
+    /// At least one valid decimal but the malformed share exceeds the locked
+    /// limit; decimal comparison is refused and text comparison is per cell.
+    Mixed,
+    /// No nonblank cells at all.
+    Blank,
 }
 
 /// Policy that produced a column's parsed values.
@@ -45,6 +70,41 @@ pub struct ParsedColumn {
     pub policy: NumericParsePolicy,
     /// Source-order cells with raw text, coordinates, and parse outcomes.
     pub cells: Vec<SourcedCell>,
+}
+
+impl ParsedColumn {
+    /// Infer this column's type from its strict-decimal parse outcomes.
+    ///
+    /// Counts only nonblank cells. Zero nonblank cells is [`Blank`]; zero
+    /// valid decimals is [`Text`]; a malformed share above
+    /// [`MIXED_COLUMN_MALFORMED_SHARE_PERCENT`] is [`Mixed`]; otherwise
+    /// [`Numeric`].
+    ///
+    /// [`Blank`]: InferredColumnType::Blank
+    /// [`Text`]: InferredColumnType::Text
+    /// [`Mixed`]: InferredColumnType::Mixed
+    /// [`Numeric`]: InferredColumnType::Numeric
+    pub fn inferred_type(&self) -> InferredColumnType {
+        let mut valid = 0u128;
+        let mut malformed = 0u128;
+        for cell in &self.cells {
+            match cell.parsed {
+                ParsedCell::Valid(_) => valid += 1,
+                ParsedCell::Malformed { .. } => malformed += 1,
+                ParsedCell::Blank | ParsedCell::Missing => {}
+            }
+        }
+        let nonblank = valid + malformed;
+        if nonblank == 0 {
+            InferredColumnType::Blank
+        } else if valid == 0 {
+            InferredColumnType::Text
+        } else if malformed * 100 > nonblank * u128::from(MIXED_COLUMN_MALFORMED_SHARE_PERCENT) {
+            InferredColumnType::Mixed
+        } else {
+            InferredColumnType::Numeric
+        }
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +253,79 @@ mod tests {
             serde_json::json!({
                 "malformed": { "raw_text": "abc", "reason": "invalid_character" }
             })
+        );
+    }
+
+    fn inferred_column(cells: Vec<ParsedCell>) -> ParsedColumn {
+        ParsedColumn {
+            column_id: "column-1".to_string(),
+            policy: NumericParsePolicy::StrictDecimal,
+            cells: cells
+                .into_iter()
+                .enumerate()
+                .map(|(row, parsed)| SourcedCell {
+                    address: CellAddress {
+                        sheet_index: 0,
+                        row,
+                        col: 1,
+                    },
+                    raw_text: None,
+                    parsed,
+                })
+                .collect(),
+        }
+    }
+
+    fn valid(text: &str) -> ParsedCell {
+        ParsedCell::Valid(ExactDecimal::parse(text).unwrap())
+    }
+
+    fn malformed(text: &str) -> ParsedCell {
+        ParsedCell::Malformed {
+            raw_text: text.to_string(),
+            reason: DecimalParseError::InvalidCharacter,
+        }
+    }
+
+    #[test]
+    fn inferred_type_covers_numeric_text_mixed_and_blank() {
+        assert_eq!(
+            inferred_column(vec![valid("500"), ParsedCell::Blank, ParsedCell::Missing])
+                .inferred_type(),
+            InferredColumnType::Numeric
+        );
+        assert_eq!(
+            inferred_column(vec![malformed("abc"), ParsedCell::Blank]).inferred_type(),
+            InferredColumnType::Text
+        );
+        assert_eq!(
+            inferred_column(vec![valid("500"), malformed("abc"), valid("600")]).inferred_type(),
+            InferredColumnType::Mixed
+        );
+        assert_eq!(
+            inferred_column(vec![ParsedCell::Blank, ParsedCell::Missing]).inferred_type(),
+            InferredColumnType::Blank
+        );
+        assert_eq!(
+            inferred_column(vec![]).inferred_type(),
+            InferredColumnType::Blank
+        );
+    }
+
+    #[test]
+    fn inferred_type_applies_locked_malformed_share_boundary() {
+        let mut exact = vec![valid("500"); 9];
+        exact.push(malformed("10,000"));
+        assert_eq!(
+            inferred_column(exact).inferred_type(),
+            InferredColumnType::Numeric
+        );
+
+        let mut over = vec![valid("500"); 8];
+        over.push(malformed("10,000"));
+        assert_eq!(
+            inferred_column(over).inferred_type(),
+            InferredColumnType::Mixed
         );
     }
 }

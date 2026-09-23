@@ -20,8 +20,10 @@ use crate::inspector::LogicalRecord;
 pub const MAX_MALFORMED_SAMPLE_CELLS: usize = 3;
 
 /// Locked decision 5: a compared column is refused when the malformed share
-/// of nonblank cells exceeds this percentage.
-pub const MIXED_COLUMN_MALFORMED_SHARE_PERCENT: u64 = 10;
+/// of nonblank cells exceeds this percentage. The canonical definition lives
+/// in `baho-model` alongside the shared inferred-column-type rule.
+pub const MIXED_COLUMN_MALFORMED_SHARE_PERCENT: u64 =
+    baho_model::column::MIXED_COLUMN_MALFORMED_SHARE_PERCENT;
 
 /// Whether an accepted column still carries malformed cells or is refused
 /// outright per locked decision 5.
@@ -133,32 +135,24 @@ impl ComparedColumnParse {
                     row: None,
                     col: Some(self.column_ordinal),
                     cell: None,
+                    cells: Vec::new(),
                 }),
             });
         }
         for evidence in &self.malformed_evidence {
-            let sample_rows = evidence
-                .sample_cells
-                .iter()
-                .map(|cell| cell.row.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
             diagnostics.push(Diagnostic {
                 code: "parse.value_malformed".to_string(),
                 severity: Severity::Warning,
                 stage: PARSE_DIAGNOSTIC_STAGE.to_string(),
                 message: format!(
-                    "column '{}': {} malformed value(s) for strict decimal parsing (reason: {}); showing {} sample row(s): {}",
-                    evidence.column_id,
-                    evidence.total_count,
-                    evidence.reason,
-                    evidence.sample_cells.len(),
-                    sample_rows
+                    "column '{}': {} malformed value(s) for strict decimal parsing (reason: {})",
+                    evidence.column_id, evidence.total_count, evidence.reason
                 ),
                 location: Some(DiagnosticLocation {
                     row: None,
                     col: None,
                     cell: evidence.sample_cells.first().cloned(),
+                    cells: evidence.sample_cells.clone(),
                 }),
             });
         }
@@ -435,7 +429,12 @@ mod tests {
                     sheet_index: 0,
                     row: 15,
                     col: 1
-                })
+                }),
+                cells: vec![CellAddress {
+                    sheet_index: 0,
+                    row: 15,
+                    col: 1
+                }]
             })
         );
     }
@@ -501,7 +500,8 @@ mod tests {
             Some(DiagnosticLocation {
                 row: None,
                 col: Some(1),
-                cell: None
+                cell: None,
+                cells: Vec::new()
             })
         );
         assert_eq!(diagnostics[1].code, "parse.value_malformed");
@@ -690,6 +690,25 @@ mod tests {
             ]
         );
         assert_eq!(parsed.diagnostics().len(), 1);
+
+        let diagnostics = parsed.diagnostics();
+        let location = diagnostics[0]
+            .location
+            .as_ref()
+            .expect("malformed diagnostic carries a location");
+        assert_eq!(
+            location.cells, evidence.sample_cells,
+            "structured sample cells must match the bounded evidence in order"
+        );
+        assert!(
+            location.cells.len() <= MAX_MALFORMED_SAMPLE_CELLS,
+            "sample cell locations stay bounded"
+        );
+        assert_eq!(
+            location.cell,
+            evidence.sample_cells.first().cloned(),
+            "cell remains the first sample for backward compatibility"
+        );
     }
 
     #[test]

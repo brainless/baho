@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use baho_exec::error::ExecutionError;
 use baho_exec::executor::{GridInput, execute_plan};
 use baho_ingest::profile::InputProfile;
 use baho_ingest::{DetectedFormat, ImportError, InspectOptions, detect_format};
@@ -392,6 +393,7 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
                         row: Some(*row),
                         col: Some(*col),
                         cell: None,
+                        cells: Vec::new(),
                     }),
                 ),
                 SelectedRegionError::MalformedRecord { row, .. } => (
@@ -401,6 +403,7 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
                         row: Some(*row),
                         col: None,
                         cell: None,
+                        cells: Vec::new(),
                     }),
                 ),
                 SelectedRegionError::Io { .. } => ("core.materialize_region_failed", "core", None),
@@ -548,6 +551,9 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
                     crate::error::IntentError::ColumnNotFound { .. } => "intent.column_not_found",
                     crate::error::IntentError::ColumnAmbiguous { .. } => "intent.column_ambiguous",
                     crate::error::IntentError::ParseAmbiguous { .. } => "intent.parse_ambiguous",
+                    crate::error::IntentError::ExpressionLimitExceeded { .. } => {
+                        "plan.expression_limit_exceeded"
+                    }
                 }
                 .to_string(),
                 severity: Severity::Error,
@@ -620,15 +626,18 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
     );
     result.plan = Some(plan.clone());
 
-    // Strict typed parsing of every decimal-compared column happens before
-    // execution so the mixed-column refusal (locked decision 5) surfaces as
-    // observable parse evidence instead of an executor error.
-    let compared_column_ids = decimal_compared_column_ids(&plan);
+    // Strict typed parsing of every compared column happens before execution
+    // so the executor can distinguish numeric, text, mixed, and blank
+    // profiles. The mixed-column refusal (locked decision 5) and malformed
+    // diagnostics stay scoped to decimal-compared columns; non-numeric text
+    // is expected for text-only comparisons.
+    let all_compared_column_ids = compared_column_ids(&plan);
+    let decimal_column_ids = decimal_compared_column_ids(&plan);
     let mut typed_columns: BTreeMap<String, baho_model::column::ParsedColumn> = BTreeMap::new();
-    if !compared_column_ids.is_empty() {
+    if !all_compared_column_ids.is_empty() {
         let records = selected_region_records(opened);
-        let mut parsed_columns = Vec::with_capacity(compared_column_ids.len());
-        for column_id in &compared_column_ids {
+        let mut parsed_columns = Vec::with_capacity(all_compared_column_ids.len());
+        for column_id in &all_compared_column_ids {
             if let Some(column) = opened.columns.iter().find(|column| &column.id == column_id) {
                 parsed_columns.push(parse_compared_column(
                     &records,
@@ -640,10 +649,13 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
             }
         }
         for parsed in &parsed_columns {
-            result.diagnostics.extend(parsed.diagnostics());
+            if decimal_column_ids.contains(&parsed.column.column_id) {
+                result.diagnostics.extend(parsed.diagnostics());
+            }
         }
         let mixed_ids: Vec<String> = parsed_columns
             .iter()
+            .filter(|parsed| decimal_column_ids.contains(&parsed.column.column_id))
             .filter(|parsed| matches!(parsed.verdict, ParseVerdict::Mixed { .. }))
             .map(|parsed| parsed.column.column_id.clone())
             .collect();
@@ -651,7 +663,7 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
             &mut result.events,
             "compared_columns_parsed",
             "ingest-csv",
-            serde_json::json!({ "columns": compared_column_ids, "mixed": mixed_ids }),
+            serde_json::json!({ "columns": all_compared_column_ids, "mixed": mixed_ids }),
         );
         if !mixed_ids.is_empty() {
             result.outcome = CoreOutcome::Failed;
@@ -691,10 +703,11 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
     let execution = match execute_plan(&plan, &grid) {
         Ok(execution) => execution,
         Err(error) => {
+            let (code, stage) = execution_error_diagnostic(&error);
             result.diagnostics.push(Diagnostic {
-                code: "execution.failed".to_string(),
+                code: code.to_string(),
                 severity: Severity::Error,
-                stage: "exec".to_string(),
+                stage: stage.to_string(),
                 message: error.to_string(),
                 location: None,
             });
@@ -716,6 +729,19 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
     result
 }
 
+/// Stable diagnostic code and stage for an execution failure. A column and
+/// literal type mismatch is reported as the Epic 006 `plan.type_mismatch`; a
+/// decision-5 mixed-column refusal is `parse.column_mixed`; every other
+/// execution failure stays `execution.failed`.
+fn execution_error_diagnostic(error: &ExecutionError) -> (&'static str, &'static str) {
+    let stage = match error {
+        ExecutionError::TypeMismatch { .. } => "plan",
+        ExecutionError::ColumnMixed { .. } => "ingest-csv",
+        _ => "exec",
+    };
+    (error.diagnostic_code(), stage)
+}
+
 fn push_event(events: &mut Vec<CoreEvent>, name: &str, stage: &str, fields: serde_json::Value) {
     events.push(CoreEvent {
         name: name.to_string(),
@@ -732,6 +758,7 @@ fn recognition_evidence_of(error: &crate::error::IntentError) -> Option<Recognit
         crate::error::IntentError::ColumnNotFound { evidence, .. } => evidence.clone(),
         crate::error::IntentError::ColumnAmbiguous { evidence, .. } => evidence.clone(),
         crate::error::IntentError::ParseAmbiguous { evidence, .. } => evidence.clone(),
+        crate::error::IntentError::ExpressionLimitExceeded { evidence, .. } => evidence.clone(),
     }
 }
 
@@ -739,6 +766,33 @@ fn request_evidence(request: &RecognizedRequest) -> &RecognitionEvidence {
     match request {
         RecognizedRequest::Retrieval(intent) => &intent.evidence,
         RecognizedRequest::RowFilter(intent) => &intent.evidence,
+    }
+}
+
+/// Every column referenced by a comparison predicate, text or decimal, in
+/// deterministic column-ID order.
+fn compared_column_ids(plan: &Plan) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for step in &plan.steps {
+        if let PlanStep::Filter { predicate } = step {
+            collect_compared_columns(predicate, &mut ids);
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn collect_compared_columns(expression: &Expression, ids: &mut BTreeSet<String>) {
+    match expression {
+        Expression::Compare { column, .. } => {
+            ids.insert(column.clone());
+        }
+        Expression::IsNotBlank { .. } => {}
+        Expression::And { predicates } | Expression::Or { predicates } => {
+            for predicate in predicates {
+                collect_compared_columns(predicate, ids);
+            }
+        }
+        Expression::Not { predicate } => collect_compared_columns(predicate, ids),
     }
 }
 
@@ -1762,6 +1816,91 @@ Unique Income,Income
     }
 
     #[test]
+    fn compact_row_filter_and_retrieval_ambiguity_produces_failure() {
+        // With columns `Unique` and `Income`, `list unique income` is both a
+        // compact row filter (`Unique = "income"`) and an Epic 002 distinct
+        // retrieval over `Income`. Two complete parses must refuse rather
+        // than silently resolve.
+        let csv = "\
+Unique,Income
+a,10
+b,20
+c,30
+";
+        let file = write_temp_csv(csv);
+        let result = run_pipeline(file.path(), "list unique income");
+
+        assert_eq!(result.outcome, CoreOutcome::Failed);
+        assert!(result.output.is_none());
+
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "intent.parse_ambiguous")
+            .expect("expected parse_ambiguous diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+
+        let evidence = result
+            .intent_evidence
+            .as_ref()
+            .expect("parse_ambiguous must surface refusal evidence");
+        assert_eq!(
+            evidence.refusal_reason.as_deref(),
+            Some("intent.parse_ambiguous")
+        );
+        assert!(evidence.row_filter.is_none());
+        let competing: Vec<(&str, Option<&str>)> = evidence
+            .competing_parses
+            .iter()
+            .map(|parse| {
+                (
+                    parse.column_display_name.as_str(),
+                    parse.modifier.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            competing,
+            vec![("Unique", None), ("Income", Some("unique"))]
+        );
+    }
+
+    #[test]
+    fn compact_predicate_refusals_surface_their_codes() {
+        // Compact prompts without `rows`/`where` are predicate-shaped when
+        // they fail to parse; the refusal must not be reinterpreted as an
+        // Epic 002 retrieval column_not_found.
+        let cases = [
+            ("List job = 10,000", "intent.literal_invalid"),
+            ("List job = 1 or", "intent.predicate_unsupported"),
+            ("List nonsense = 1", "intent.column_not_found"),
+        ];
+        for (prompt, expected_code) in cases {
+            let file = write_temp_csv(&job_income_csv());
+            let result = run_pipeline(file.path(), prompt);
+
+            assert_eq!(result.outcome, CoreOutcome::Failed, "prompt {prompt}");
+            assert!(result.output.is_none(), "prompt {prompt}");
+            assert!(result.plan.is_none(), "prompt {prompt}");
+            expect_failure_diagnostic(&result, expected_code);
+            let evidence = result
+                .intent_evidence
+                .as_ref()
+                .unwrap_or_else(|| panic!("prompt {prompt} must surface refusal evidence"));
+            assert_eq!(
+                evidence.refusal_reason.as_deref(),
+                Some(expected_code),
+                "prompt {prompt}"
+            );
+            assert!(evidence.row_filter.is_none(), "prompt {prompt}");
+            assert!(
+                !event_names(&result).contains(&"materialization_completed"),
+                "prompt {prompt}"
+            );
+        }
+    }
+
+    #[test]
     fn intent_evidence_surfaced_on_success() {
         let csv = "\
 ID,Name
@@ -2012,7 +2151,8 @@ ID,Job,Annual Income,Note
             ["Job", "Annual Income"]
         );
 
-        // Only the decimal-compared column is typed-parsed.
+        // Every compared column is profiled; the text-compared Job column
+        // produces no refusal or malformed diagnostics.
         let parsed_event = result
             .events
             .iter()
@@ -2020,7 +2160,7 @@ ID,Job,Annual Income,Note
             .expect("compared columns must be parsed observably");
         assert_eq!(
             parsed_event.fields["columns"],
-            serde_json::json!(["column-2"])
+            serde_json::json!(["column-1", "column-2"])
         );
         assert_eq!(parsed_event.fields["mixed"], serde_json::json!([]));
         assert_eq!(
@@ -2162,14 +2302,24 @@ ID,Job,Annual Income,Note
             );
         }
 
-        // A purely text-compared predicate never requires typed column
-        // parsing; decimal literals such as `Code = 2` do.
+        // A purely text-compared predicate profiles every compared column but
+        // emits no parse refusal or malformed diagnostics; decimal literals
+        // such as `Code = 2` additionally parse strictly.
         let result = run_pipeline(
             file.path(),
             "List rows where Status = active and City = Pune",
         );
         assert_eq!(result.outcome, CoreOutcome::Materialized);
-        assert!(!event_names(&result).contains(&"compared_columns_parsed"));
+        let parsed_event = result
+            .events
+            .iter()
+            .find(|event| event.name == "compared_columns_parsed")
+            .expect("text-compared columns are profiled observably");
+        assert_eq!(
+            parsed_event.fields["columns"],
+            serde_json::json!(["column-1", "column-2"])
+        );
+        assert_eq!(parsed_event.fields["mixed"], serde_json::json!([]));
         assert!(
             !diagnostic_codes(&result)
                 .iter()
@@ -2288,11 +2438,11 @@ ID,Job,Annual Income,Note
         let file = write_temp_csv("ID,Job,Annual Income\n1,unemployed,500\n");
 
         let mut depth_prompt = String::from("List rows where ");
-        for _ in 0..9 {
+        for _ in 0..16 {
             depth_prompt.push_str("not ( ");
         }
         depth_prompt.push_str("Job = 1");
-        for _ in 0..9 {
+        for _ in 0..16 {
             depth_prompt.push_str(" )");
         }
         let mut node_prompt = String::from("List rows where ");
@@ -2306,13 +2456,17 @@ ID,Job,Annual Income,Note
             assert!(result.output.is_none());
             assert!(result.plan.is_none());
             assert!(
-                diagnostic_codes(&result).contains(&"intent.predicate_unsupported"),
+                diagnostic_codes(&result).contains(&"plan.expression_limit_exceeded"),
+                "prompt {prompt}"
+            );
+            assert!(
+                !diagnostic_codes(&result).contains(&"intent.predicate_unsupported"),
                 "prompt {prompt}"
             );
             let evidence = result.intent_evidence.as_ref().unwrap();
             assert_eq!(
                 evidence.refusal_reason.as_deref(),
-                Some("intent.predicate_unsupported")
+                Some("plan.expression_limit_exceeded")
             );
             assert!(!event_names(&result).contains(&"materialization_completed"));
         }
@@ -2339,6 +2493,74 @@ ID,Job,Annual Income,Note
                 PLAN_SCHEMA_VERSION_2
             );
         }
+    }
+
+    #[test]
+    fn text_literal_against_numeric_column_refuses_with_type_mismatch() {
+        let file = write_temp_csv(&job_income_csv());
+        let result = run_pipeline(file.path(), "List rows where Annual Income = \"500\"");
+
+        assert_eq!(result.outcome, CoreOutcome::Failed);
+        assert!(result.output.is_none());
+        let diagnostic = expect_failure_diagnostic(&result, "plan.type_mismatch");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(
+            !diagnostic_codes(&result).contains(&"execution.failed"),
+            "a type mismatch must surface as plan.type_mismatch"
+        );
+        assert!(!event_names(&result).contains(&"materialization_completed"));
+
+        // The plan validated structurally and was recorded before the typed
+        // execution check refused it.
+        let plan = result.plan.as_ref().expect("validated plan is recorded");
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_2);
+        let parsed_event = result
+            .events
+            .iter()
+            .find(|event| event.name == "compared_columns_parsed")
+            .expect("the numeric column is profiled");
+        assert_eq!(
+            parsed_event.fields["columns"],
+            serde_json::json!(["column-2"])
+        );
+    }
+
+    #[test]
+    fn text_literal_against_text_column_still_materializes() {
+        let file = write_temp_csv(&job_income_csv());
+        let result = run_pipeline(file.path(), "List rows where Job = unemployed");
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        assert_eq!(provenance_rows(&result), [1, 5, 6]);
+        assert!(
+            !diagnostic_codes(&result)
+                .iter()
+                .any(|code| code.starts_with("parse.")),
+            "non-numeric text is expected for a text comparison"
+        );
+    }
+
+    #[test]
+    fn mixed_text_compared_column_is_profiled_without_refusal() {
+        // 2 valid and 1 malformed nonblank value: materially mixed, but a
+        // text comparison must not refuse the plan nor emit parse diagnostics.
+        let file = write_temp_csv("ID,Note\n1,500\n2,abc\n3,600\n");
+        let result = run_pipeline(file.path(), "List rows where Note = abc");
+
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        assert_eq!(provenance_rows(&result), [2]);
+        assert!(
+            !diagnostic_codes(&result)
+                .iter()
+                .any(|code| code.starts_with("parse.")),
+            "text-only comparisons emit no parse diagnostics"
+        );
+        let parsed_event = result
+            .events
+            .iter()
+            .find(|event| event.name == "compared_columns_parsed")
+            .unwrap();
+        assert_eq!(parsed_event.fields["mixed"], serde_json::json!([]));
     }
 
     #[test]

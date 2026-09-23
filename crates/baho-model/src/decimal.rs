@@ -7,12 +7,26 @@ use std::str::FromStr;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Largest scale [`ExactDecimal`] will represent.
+///
+/// Scale drives the length of every canonical string, `Display`, and serde
+/// output, so it must stay bounded: `scale = u32::MAX` would make
+/// [`ExactDecimal::to_canonical_string`] attempt a multi-gigabyte allocation.
+/// `4096` is far beyond any measurement or financial precision baho needs while
+/// keeping the worst-case canonical string under a few kilobytes.
+pub const MAX_SCALE: u32 = 4096;
+
 /// An exact decimal value: `mantissa × 10^-scale`.
 ///
 /// The representation is normalized on construction: trailing fractional zeros
 /// are stripped (`1.10` becomes `11 × 10^-1`) and every zero, including `-0`,
 /// becomes `0 × 10^0`. Equality and ordering are exact, so `1.10 == 1.1` and
 /// `10 == 10.0`.
+///
+/// The scale is always at most [`MAX_SCALE`], which bounds the size of the
+/// canonical string form. Input parsing enforces this with
+/// [`DecimalParseError::OutOfRange`]; the programmer-facing constructors treat
+/// a larger scale as a programming error.
 #[derive(Debug, Clone, Copy)]
 pub struct ExactDecimal {
     mantissa: i128,
@@ -22,7 +36,18 @@ pub struct ExactDecimal {
 impl ExactDecimal {
     /// Build a value from an integer mantissa and a decimal scale, normalizing
     /// the representation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `scale` exceeds [`MAX_SCALE`]. This is a programmer error: all
+    /// input-controlled values must go through [`ExactDecimal::parse`], which
+    /// refuses an oversized scale with [`DecimalParseError::OutOfRange`] instead
+    /// of panicking.
     pub fn new(mantissa: i128, scale: u32) -> Self {
+        assert!(
+            scale <= MAX_SCALE,
+            "ExactDecimal::new scale {scale} exceeds MAX_SCALE ({MAX_SCALE}); use ExactDecimal::parse for input-controlled values"
+        );
         let mut mantissa = mantissa;
         let mut scale = scale;
         if mantissa == 0 {
@@ -75,9 +100,14 @@ impl ExactDecimal {
             return Err(DecimalParseError::InvalidCharacter);
         }
         // Trailing fractional zeros never change the value; strip them before
-        // building the mantissa so long zero runs cannot push a representable
-        // value out of range.
+        // checking the scale and building the mantissa so long zero runs cannot
+        // push a representable value out of range.
         let fraction = fraction.trim_end_matches('0');
+        // The scale bounds the canonical-string length; refuse input-controlled
+        // values that exceed it rather than letting `new` panic.
+        if fraction.len() > MAX_SCALE as usize {
+            return Err(DecimalParseError::OutOfRange);
+        }
         let mut digits = String::with_capacity(integer.len() + fraction.len());
         digits.push_str(integer);
         digits.push_str(fraction);
@@ -421,6 +451,43 @@ mod tests {
             ExactDecimal::parse("9999999999999999999999999999999999999999"),
             Err(DecimalParseError::OutOfRange)
         );
+    }
+
+    #[test]
+    fn parse_rejects_fraction_beyond_max_scale() {
+        let mut text = String::from("0.");
+        text.push_str(&"0".repeat(MAX_SCALE as usize));
+        text.push('1');
+        assert_eq!(
+            ExactDecimal::parse(&text),
+            Err(DecimalParseError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn parse_accepts_fraction_at_max_scale_and_round_trips() {
+        let mut text = String::from("0.");
+        text.push_str(&"0".repeat(MAX_SCALE as usize - 1));
+        text.push('1');
+        let value = ExactDecimal::parse(&text).expect("fraction at MAX_SCALE must parse");
+        assert_eq!(value.scale(), MAX_SCALE);
+        assert_eq!(value.to_canonical_string(), text);
+        assert_eq!(
+            ExactDecimal::parse(&value.to_canonical_string()).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds MAX_SCALE")]
+    fn new_beyond_max_scale_is_programmer_error() {
+        let _ = ExactDecimal::new(1, MAX_SCALE + 1);
+    }
+
+    #[test]
+    fn canonical_string_length_is_bounded_at_max_scale() {
+        let value = ExactDecimal::new(1, MAX_SCALE);
+        assert!(value.to_canonical_string().len() <= MAX_SCALE as usize + 8);
     }
 
     #[test]

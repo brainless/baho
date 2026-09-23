@@ -50,6 +50,7 @@ pub fn build_header_with_config(
                     row: Some(record.index),
                     col: Some(col),
                     cell: None,
+                    cells: Vec::new(),
                 }),
             });
         }

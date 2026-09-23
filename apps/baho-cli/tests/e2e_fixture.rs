@@ -566,7 +566,8 @@ fn row_filter_materializes_all_columns_from_fixture() {
         .unwrap();
     assert_eq!(
         parsed["fields"]["fields"]["columns"],
-        serde_json::json!(["column-6"])
+        serde_json::json!(["column-3", "column-6"]),
+        "every compared column is profiled"
     );
     assert_eq!(parsed["fields"]["fields"]["mixed"], serde_json::json!([]));
 
@@ -627,11 +628,11 @@ fn condensed_row_filter_matches_canonical_from_fixture() {
 }
 
 #[test]
-fn overlapping_row_filter_headers_refuse_as_parse_ambiguous() {
+fn overlapping_row_filter_headers_bind_longest_end_to_end() {
     // "Annual" and "Annual Income" share their first token with different
-    // phrase lengths, so `Annual Income` survives more than one complete
-    // parse and recognition refuses with a deterministic ambiguity
-    // diagnostic instead of choosing a column.
+    // phrase lengths. The longest complete header wins, so `Annual Income
+    // < 5` binds `Annual Income` and materializes instead of refusing with
+    // a parse-ambiguity diagnostic.
     let workspace = tempdir().expect("create temporary workspace");
     let input = workspace.path().join("sample.csv");
     fs::write(&input, "ID,Annual,Annual Income\n1,5,2\n2,6,3\n").expect("write input");
@@ -647,54 +648,79 @@ fn overlapping_row_filter_headers_refuse_as_parse_ambiguous() {
         .output()
         .expect("run baho");
 
-    assert!(!output.status.success(), "expected failure: {output:?}");
+    assert!(output.status.success(), "{output:?}");
 
     let run = workspace.path().join(".baho/runs/000001");
+    let plan = read_json(&run.join("plan.json"));
+    assert_eq!(plan["schema_version"], 4);
+    assert_eq!(plan["plan"]["schema_version"], 2);
+    let steps = plan["plan"]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["op"], "filter");
+
+    let evidence = &plan["recognition_evidence"];
+    assert_eq!(evidence["schema_version"], 2);
+    assert!(evidence["refusal_reason"].is_null());
+    assert_eq!(evidence["canonical_operation"], "row_filter");
+    let row_filter = &evidence["row_filter"];
+    let headers = row_filter["headers"].as_array().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0]["display_name"], "Annual Income");
+    assert_eq!(headers[0]["column_id"], "column-2");
+    assert_eq!(
+        headers[0]["tokens"],
+        serde_json::json!(["annual", "income"])
+    );
+    assert_eq!(headers[0]["span"], serde_json::json!([3, 5]));
+    let predicate = &row_filter["predicate"];
+    assert_eq!(predicate["op"], "compare");
+    assert_eq!(predicate["column"], "column-2");
+    assert_eq!(predicate["operator"], "<");
+    assert_eq!(predicate["literal"], serde_json::json!({"decimal": "5"}));
+
+    let result = read_json(&run.join("output/result.json"));
+    assert_eq!(result["schema_version"], 2);
+    let columns = result["result"]["columns"].as_array().unwrap();
+    let names: Vec<&str> = columns
+        .iter()
+        .map(|column| column["display_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["ID", "Annual", "Annual Income"]);
+    let rows = result["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let provenance = result["result"]["provenance"].as_array().unwrap();
+    let source_rows: Vec<u64> = provenance
+        .iter()
+        .map(|row| row["source_row"].as_u64().unwrap())
+        .collect();
+    assert_eq!(source_rows, [1, 2]);
+
     let diagnostics = read_json(&run.join("diagnostics.json"));
     let codes = diagnostic_codes(&diagnostics);
     assert!(
-        codes.contains(&"intent.parse_ambiguous"),
-        "expected parse_ambiguous diagnostic, got: {codes:?}"
-    );
-
-    let plan = read_json(&run.join("plan.json"));
-    assert_eq!(plan["schema_version"], 4);
-    assert!(
-        plan.get("plan").is_none(),
-        "refusal must not write a nested plan"
-    );
-    let evidence = &plan["recognition_evidence"];
-    assert_eq!(evidence["schema_version"], 2);
-    assert_eq!(evidence["refusal_reason"], "intent.parse_ambiguous");
-    let competing: Vec<&str> = evidence["competing_parses"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|parse| parse["column_display_name"].as_str().unwrap())
-        .collect();
-    assert_eq!(competing, ["Annual Income", "Annual"]);
-    assert!(
-        !run.join("output/result.json").exists(),
-        "refusal must not materialize output"
+        codes
+            .iter()
+            .all(|code| !code.starts_with("intent.") && !code.starts_with("parse.")),
+        "unexpected intent/parse diagnostics: {codes:?}"
     );
 }
 
 #[test]
-fn expression_depth_limit_refuses_as_predicate_unsupported() {
-    // The recognizer enforces the predicate depth limit before any plan is
-    // compiled, so the CLI can only observe intent.predicate_unsupported;
-    // plan.expression_limit_exceeded is a plan-level code for plans that
-    // were not produced by recognition.
+fn expression_depth_limit_refuses_as_expression_limit_exceeded() {
+    // The recognizer enforces the predicate depth limit with the same measure
+    // as plan validation (parentheses are free; `not` adds one level), so an
+    // over-limit prompt surfaces the stable plan.expression_limit_exceeded
+    // code through the run artifacts.
     let workspace = tempdir().expect("create temporary workspace");
     let input = workspace.path().join("sample.csv");
     fs::write(&input, "ID,Job\n1,unemployed\n2,teacher\n").expect("write input");
 
     let mut prompt = String::from("List rows where ");
-    for _ in 0..9 {
+    for _ in 0..16 {
         prompt.push_str("not ( ");
     }
     prompt.push_str("Job = 1");
-    for _ in 0..9 {
+    for _ in 0..16 {
         prompt.push_str(" )");
     }
 
@@ -715,15 +741,22 @@ fn expression_depth_limit_refuses_as_predicate_unsupported() {
     let diagnostics = read_json(&run.join("diagnostics.json"));
     let codes = diagnostic_codes(&diagnostics);
     assert!(
-        codes.contains(&"intent.predicate_unsupported"),
-        "expected predicate_unsupported diagnostic, got: {codes:?}"
+        codes.contains(&"plan.expression_limit_exceeded"),
+        "expected expression_limit_exceeded diagnostic, got: {codes:?}"
+    );
+    assert!(
+        !codes.contains(&"intent.predicate_unsupported"),
+        "over-limit prompts must not report predicate_unsupported, got: {codes:?}"
     );
     let plan = read_json(&run.join("plan.json"));
     assert!(plan.get("plan").is_none());
+    assert_eq!(
+        plan["recognition_evidence"]["refusal_reason"],
+        "plan.expression_limit_exceeded"
+    );
     assert!(
-        diagnostic_codes(&read_json(&run.join("diagnostics.json")))
-            .iter()
-            .all(|code| !code.starts_with("parse."))
+        codes.iter().all(|code| !code.starts_with("parse.")),
+        "unexpected parse diagnostics: {codes:?}"
     );
     assert!(!run.join("output/result.json").exists());
 }

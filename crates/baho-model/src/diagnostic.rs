@@ -28,6 +28,11 @@ pub struct DiagnosticLocation {
     pub row: Option<usize>,
     pub col: Option<usize>,
     pub cell: Option<CellAddress>,
+    /// Bounded, deterministic sample of source cells a diagnostic applies to.
+    /// Optional and additive: absent in older artifacts and omitted when
+    /// empty, so existing diagnostics keep their serialized shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cells: Vec<CellAddress>,
 }
 
 #[cfg(test)]
@@ -56,6 +61,7 @@ mod tests {
                     row: 4,
                     col: 0,
                 }),
+                cells: Vec::new(),
             }),
         };
         assert_eq!(diag.code, "csv.malformed_record");
@@ -81,10 +87,12 @@ mod tests {
             row: Some(10),
             col: None,
             cell: None,
+            cells: Vec::new(),
         };
         assert_eq!(loc.row, Some(10));
         assert!(loc.col.is_none());
         assert!(loc.cell.is_none());
+        assert!(loc.cells.is_empty());
     }
 
     #[test]
@@ -98,10 +106,75 @@ mod tests {
                 row: Some(7),
                 col: None,
                 cell: None,
+                cells: Vec::new(),
             }),
         };
         let json = serde_json::to_string(&diag).unwrap();
         let back: Diagnostic = serde_json::from_str(&json).unwrap();
         assert_eq!(diag, back);
+    }
+
+    #[test]
+    fn legacy_location_without_cells_deserializes_with_empty_cells() {
+        let location: DiagnosticLocation = serde_json::from_str(
+            r#"{"row":4,"col":null,"cell":{"sheet_index":0,"row":4,"col":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(location.row, Some(4));
+        assert!(location.col.is_none());
+        assert_eq!(
+            location.cell,
+            Some(CellAddress {
+                sheet_index: 0,
+                row: 4,
+                col: 0,
+            })
+        );
+        assert!(location.cells.is_empty());
+    }
+
+    #[test]
+    fn serialization_omits_empty_cells_and_keeps_legacy_shape() {
+        let location = DiagnosticLocation {
+            row: Some(4),
+            col: None,
+            cell: None,
+            cells: Vec::new(),
+        };
+        let value = serde_json::to_value(&location).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "row": 4, "col": null, "cell": null })
+        );
+    }
+
+    #[test]
+    fn cells_round_trip_preserving_order() {
+        let location = DiagnosticLocation {
+            row: None,
+            col: None,
+            cell: Some(CellAddress {
+                sheet_index: 0,
+                row: 4,
+                col: 1,
+            }),
+            cells: vec![
+                CellAddress {
+                    sheet_index: 0,
+                    row: 4,
+                    col: 1,
+                },
+                CellAddress {
+                    sheet_index: 0,
+                    row: 5,
+                    col: 1,
+                },
+            ],
+        };
+        let value = serde_json::to_value(&location).unwrap();
+        assert_eq!(value["cells"][0]["row"], 4);
+        assert_eq!(value["cells"][1]["row"], 5);
+        let back: DiagnosticLocation = serde_json::from_value(value).unwrap();
+        assert_eq!(location, back);
     }
 }

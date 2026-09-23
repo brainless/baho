@@ -17,6 +17,13 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+/// `diagnostics.json` envelope schema version.
+///
+/// Adding the optional, defaulted `DiagnosticLocation.cells` sample list is
+/// backward compatible: pre-existing diagnostics serialize exactly as before
+/// and older artifacts deserialize with an empty list, so the version is
+/// intentionally kept at 1. Compatibility is covered in `baho-model`'s
+/// serde tests.
 const RUN_SCHEMA_VERSION: u32 = 1;
 const RUN_ID_WIDTH: usize = 6;
 /// `plan.json` envelope schema version.
