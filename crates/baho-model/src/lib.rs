@@ -11,7 +11,9 @@ pub mod diagnostic;
 pub mod document;
 pub mod grid;
 pub mod materialized;
+pub mod numeric_shape;
 pub mod revision;
+pub mod text_match;
 
 pub use candidate::*;
 pub use column::*;
@@ -20,4 +22,6 @@ pub use diagnostic::*;
 pub use document::*;
 pub use grid::*;
 pub use materialized::*;
+pub use numeric_shape::*;
 pub use revision::*;
+pub use text_match::*;

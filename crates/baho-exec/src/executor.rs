@@ -6,6 +6,7 @@ use baho_model::column::{ColumnDefinition, InferredColumnType, ParsedColumn};
 use baho_model::diagnostic::{Diagnostic, Severity};
 use baho_model::document::{CellAddress, ParsedCell, SourcedCell, Value};
 use baho_model::materialized::{MaterializedRow, MaterializedView, RowProvenance};
+use baho_model::text_match::TextMatchPolicy;
 use baho_plan::plan::{ComparisonOperator, DistinctKeep, Expression, Literal, Plan, PlanStep};
 use baho_plan::validation::validate_plan_structure;
 
@@ -23,7 +24,8 @@ pub struct GridInput {
     /// column ID. A decimal comparison requires its column here. A text
     /// comparison uses it only to reject numeric columns and to treat valid
     /// decimals in a mixed column as `unknown`; a text-compared column with
-    /// no entry falls back to exact string comparison.
+    /// no entry falls back to string comparison under the plan's
+    /// [`TextMatchPolicy`].
     ///
     /// Each entry aligns its cells with `source_rows` through
     /// `SourcedCell::address.row`, so filtering steps that drop rows never
@@ -110,6 +112,7 @@ pub fn execute_plan(plan: &Plan, grid: &GridInput) -> Result<ExecutionResult, Ex
     }
 
     let typed = build_typed_columns(grid);
+    let text_match = plan.text_match_policy();
 
     let mut col_index: HashMap<String, usize> = grid
         .columns
@@ -142,6 +145,7 @@ pub fn execute_plan(plan: &Plan, grid: &GridInput) -> Result<ExecutionResult, Ex
                 let evaluator = PredicateEvaluator {
                     col_index: &col_index,
                     typed: &typed,
+                    text_match,
                 };
                 let before = working.len();
                 let mut retained = Vec::with_capacity(before);
@@ -364,8 +368,9 @@ fn validate_expression_typed(
         } => {
             // A text literal against a numerically profiled column is a plan
             // type mismatch (Epic 006 `plan.type_mismatch`). A column with no
-            // typed profile falls back to exact string comparison so direct
-            // executor callers keep Epic 002 behavior.
+            // typed profile falls back to string comparison under the plan's
+            // text-match policy so direct executor callers keep Epic 002
+            // behavior.
             if let Some(data) = typed.get(column.as_str()) {
                 if data.inferred == InferredColumnType::Numeric {
                     return Err(ExecutionError::TypeMismatch {
@@ -377,6 +382,13 @@ fn validate_expression_typed(
             }
             Ok(())
         }
+        Expression::Compare {
+            column,
+            literal: Literal::Deferred(raw),
+            ..
+        } => Err(ExecutionError::UnresolvedLiteral {
+            detail: format!("column '{column}' still carries deferred numeric literal '{raw}'"),
+        }),
         Expression::And { predicates } | Expression::Or { predicates } => {
             for predicate in predicates {
                 validate_expression_typed(predicate, typed)?;
@@ -390,6 +402,7 @@ fn validate_expression_typed(
 struct PredicateEvaluator<'a> {
     col_index: &'a HashMap<String, usize>,
     typed: &'a TypedColumns<'a>,
+    text_match: TextMatchPolicy,
 }
 
 impl PredicateEvaluator<'_> {
@@ -491,7 +504,9 @@ fn evaluate_compare(
             Ok(match value {
                 None | Some(Value::Blank) => TruthValue::Unknown,
                 Some(Value::Text(text)) => {
-                    let equal = text == expected;
+                    // Epic 008 locked decision 1: fold both sides under the
+                    // plan's text-match policy; raw spellings never change.
+                    let equal = evaluator.text_match.text_eq(text, expected);
                     match operator {
                         ComparisonOperator::Equal => TruthValue::from_bool(equal),
                         ComparisonOperator::NotEqual => TruthValue::from_bool(!equal),
@@ -518,6 +533,9 @@ fn evaluate_compare(
                 }
             })
         }
+        Literal::Deferred(raw) => Err(ExecutionError::UnresolvedLiteral {
+            detail: format!("column '{column}' still carries deferred numeric literal '{raw}'"),
+        }),
     }
 }
 
@@ -1421,10 +1439,99 @@ mod tests {
     }
 
     #[test]
-    fn text_comparison_is_exact_and_incompatible_cells_are_unknown() {
+    fn mixed_column_text_comparison_folds_case_under_v3() {
+        // 2 valid (500, 600) and 1 malformed (Abc): a 1/3 malformed share is
+        // materially mixed. Under v3 the malformed cell's string comparison
+        // folds case; valid numeric cells stay type-incompatible and unknown,
+        // and raw spellings reach the output unchanged.
+        let grid = GridInput {
+            table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
+            source_sheet_index: 0,
+            columns: job_income_columns(),
+            rows: vec![
+                vec![text("A"), text("j"), text("500")],
+                vec![text("B"), text("j"), text("Abc")],
+                vec![text("C"), text("j"), text("600")],
+            ],
+            source_rows: vec![0, 1, 2],
+            typed_columns: typed_columns(vec![typed_income_column(&[
+                (0, Some("500")),
+                (1, Some("Abc")),
+                (2, Some("600")),
+            ])]),
+        };
+
+        let folded = execute_plan(&filter_plan(3, text_equals("column-2", "abc")), &grid).unwrap();
+        assert_eq!(provenance_rows(&folded), [1]);
+        assert_eq!(folded.view.rows[0].values[2], text("Abc"));
+
+        let exact = execute_plan(&filter_plan(2, text_equals("column-2", "abc")), &grid).unwrap();
+        assert!(exact.view.provenance.is_empty());
+
+        let numeric_surface_match =
+            execute_plan(&filter_plan(3, text_equals("column-2", "500")), &grid).unwrap();
+        assert!(numeric_surface_match.view.provenance.is_empty());
+    }
+
+    #[test]
+    fn text_comparison_folds_case_but_not_whitespace_under_v3() {
         // Rows: 0 exact match, 1 trailing whitespace, 2 different case,
         // 3 blank, 4 numeric cell against text literal, 5 missing cell,
-        // 6 different text.
+        // 6 different text. Under plan schema version 3 the case variant
+        // matches and is equal for `!=`; trailing whitespace is never
+        // trimmed (Epic 008 locked decision 11).
+        let grid = GridInput {
+            table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
+            source_sheet_index: 0,
+            columns: grid_columns(),
+            rows: vec![
+                vec![text("n0"), text("unemployed")],
+                vec![text("n1"), text("unemployed ")],
+                vec![text("n2"), text("Unemployed")],
+                vec![text("n3"), blank()],
+                vec![text("n4"), Some(Value::Number(1.0))],
+                vec![text("n5"), none_val()],
+                vec![text("n6"), text("employed")],
+            ],
+            source_rows: vec![0, 1, 2, 3, 4, 5, 6],
+            typed_columns: BTreeMap::new(),
+        };
+
+        let equal = execute_plan(
+            &filter_plan(3, text_equals("column-1", "unemployed")),
+            &grid,
+        )
+        .unwrap();
+        assert_eq!(provenance_rows(&equal), [0, 2]);
+        // Materialized values retain the original raw spelling; folding is
+        // comparison-only.
+        assert_eq!(equal.view.rows[1].values[1], text("Unemployed"));
+
+        let not_equal = execute_plan(
+            &filter_plan(
+                3,
+                compare_expr(
+                    "column-1",
+                    ComparisonOperator::NotEqual,
+                    Literal::Text("unemployed".to_string()),
+                ),
+            ),
+            &grid,
+        )
+        .unwrap();
+        // The case variant folds to equal so `!=` drops it; the trailing
+        // whitespace row stays unequal and is retained. Blank, missing, and
+        // numeric cells stay unknown and are retained by neither operator.
+        assert_eq!(provenance_rows(&not_equal), [1, 6]);
+    }
+
+    #[test]
+    fn text_comparison_stays_exact_under_v2() {
+        // Same grid as the v3 folding test: plan schema version 2 retains
+        // exact case-sensitive equality, so the case-variant row matches for
+        // `!=` and never for `=`.
         let grid = GridInput {
             table_id: "table-0".to_string(),
             source_revision: "hash".to_string(),
@@ -1463,6 +1570,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(provenance_rows(&not_equal), [1, 2, 6]);
+    }
+
+    #[test]
+    fn text_comparison_folds_non_ascii_case_but_not_full_case_folding_under_v3() {
+        let grid = GridInput {
+            table_id: "table-0".to_string(),
+            source_revision: "hash".to_string(),
+            source_sheet_index: 0,
+            columns: grid_columns(),
+            rows: vec![
+                vec![text("n0"), text("Été")],
+                vec![text("n1"), text("ÉTÉ")],
+                vec![text("n2"), text("ß")],
+                vec![text("n3"), text("SS")],
+                vec![text("n4"), text("ss")],
+            ],
+            source_rows: vec![0, 1, 2, 3, 4],
+            typed_columns: BTreeMap::new(),
+        };
+
+        // Unicode full lowercase folds the accented pair.
+        let accented =
+            execute_plan(&filter_plan(3, text_equals("column-1", "ÉTÉ")), &grid).unwrap();
+        assert_eq!(provenance_rows(&accented), [0, 1]);
+
+        // `ß` lowercases to itself (lowercase conversion, not case folding),
+        // so it never matches `SS`/`ss` (Epic 008 locked decision 1).
+        let sharp_s = execute_plan(&filter_plan(3, text_equals("column-1", "ß")), &grid).unwrap();
+        assert_eq!(provenance_rows(&sharp_s), [2]);
+
+        let ascii_pair =
+            execute_plan(&filter_plan(3, text_equals("column-1", "ss")), &grid).unwrap();
+        assert_eq!(provenance_rows(&ascii_pair), [3, 4]);
     }
 
     #[test]

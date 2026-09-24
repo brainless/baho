@@ -9,10 +9,11 @@ use baho_ingest_csv::header::build_header_with_config;
 use baho_ingest_csv::row_features::compute_row_features_with_config;
 use baho_ingest_csv::typed_values::{
     MIXED_COLUMN_MALFORMED_SHARE_PERCENT, ParseVerdict, parse_compared_column,
+    parse_compared_column_selecting_policy,
 };
 use baho_ingest_csv::{
     CsvImporter, DialectDetectionError, ParserConfig, SelectedRegionError,
-    detect_candidates_with_config, read_selected_region,
+    detect_candidates_with_config, read_selected_region, select_numeric_policy,
 };
 use baho_model::candidate::TableCandidate;
 use baho_model::column::NumericParsePolicy;
@@ -27,7 +28,8 @@ use serde::{Deserialize, Serialize};
 use crate::candidate_selection::select_candidate;
 use crate::error::CoreError;
 use crate::intent::{
-    RecognizedIntent, RecognizedRequest, compile_request_to_plan, recognize_request,
+    DeferredLiteralError, RecognizedIntent, RecognizedRequest, compile_request_to_plan,
+    recognize_request, resolve_deferred_literals,
 };
 
 /// The outcome of a pipeline run.
@@ -539,7 +541,7 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
         events: opened.events.clone(),
         outcome: CoreOutcome::Recorded,
     };
-    let request = match recognize_request(prompt, &opened.columns) {
+    let mut request = match recognize_request(prompt, &opened.columns) {
         Ok(request) => request,
         Err(error) => {
             result.intent_evidence = recognition_evidence_of(&error);
@@ -588,6 +590,14 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
     };
     push_event(&mut result.events, "intent_recognized", "intent", kind);
     result.intent_evidence = Some(request_evidence(&request).clone());
+    // Epic 008 locked decisions 7–8: resolve deferred numeric literals under
+    // each bound column's selected policy before plan compilation. Policy
+    // ambiguity refuses with `parse.format_ambiguous` before literal
+    // resolution; a non-numeric column or an unparseable literal refuses with
+    // `intent.literal_invalid`.
+    if !resolve_row_filter_deferred_literals(&mut result, &mut request, opened) {
+        return result;
+    }
     let plan = compile_request_to_plan(
         &request,
         &opened.source_revision.content_hash,
@@ -641,13 +651,27 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
         let mut parsed_columns = Vec::with_capacity(all_compared_column_ids.len());
         for column_id in &all_compared_column_ids {
             if let Some(column) = opened.columns.iter().find(|column| &column.id == column_id) {
-                parsed_columns.push(parse_compared_column(
-                    &records,
-                    opened.source_sheet_index,
-                    column,
-                    NumericParsePolicy::StrictDecimal,
-                    &opened.parser_config.normalization,
-                ));
+                // Decimal-compared columns select their numeric policy from
+                // column evidence (Epic 008 locked decisions 5–6). Text-
+                // compared columns keep the strict baseline: their values are
+                // compared as text and must not be refused as format-ambiguous.
+                let parsed = if decimal_column_ids.contains(column_id) {
+                    parse_compared_column_selecting_policy(
+                        &records,
+                        opened.source_sheet_index,
+                        column,
+                        &opened.parser_config.normalization,
+                    )
+                } else {
+                    parse_compared_column(
+                        &records,
+                        opened.source_sheet_index,
+                        column,
+                        NumericParsePolicy::StrictDecimal,
+                        &opened.parser_config.normalization,
+                    )
+                };
+                parsed_columns.push(parsed);
             }
         }
         for parsed in &parsed_columns {
@@ -658,13 +682,18 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
         let mixed_ids: Vec<String> = parsed_columns
             .iter()
             .filter(|parsed| decimal_column_ids.contains(&parsed.column.column_id))
-            .filter(|parsed| matches!(parsed.verdict, ParseVerdict::Mixed { .. }))
+            .filter(|parsed| {
+                matches!(
+                    parsed.verdict,
+                    ParseVerdict::Mixed { .. } | ParseVerdict::FormatAmbiguous { .. }
+                )
+            })
             .map(|parsed| parsed.column.column_id.clone())
             .collect();
         let column_evidence: Vec<_> = parsed_columns
             .iter()
             .map(|parsed| {
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "column_id": parsed.column.column_id,
                     "column_ordinal": parsed.column_ordinal,
                     "policy": parsed.column.policy,
@@ -672,17 +701,23 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
                     "decimal_comparison_required": decimal_column_ids.contains(&parsed.column.column_id),
                     "verdict": parsed.verdict,
                     "counts": parsed.counts(),
-                })
+                });
+                if let Some(selection) = &parsed.policy_selection {
+                    entry["policy_selection"] = serde_json::json!(selection);
+                }
+                entry
             })
             .collect();
-        // Version 1 of this event had only `columns` and `mixed`; historical
-        // event lines remain readable without reinterpretation.
+        // Version 1 of this event had only `columns` and `mixed`; version 2
+        // added `column_evidence`; version 3 (Epic 008) adds
+        // `policy_selection`. Historical event lines remain readable without
+        // reinterpretation.
         push_event(
             &mut result.events,
             "compared_columns_parsed",
             "ingest-csv",
             serde_json::json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "columns": all_compared_column_ids,
                 "mixed": mixed_ids,
                 "mixed_limit_percent": MIXED_COLUMN_MALFORMED_SHARE_PERCENT,
@@ -793,6 +828,92 @@ fn request_evidence(request: &RecognizedRequest) -> &RecognitionEvidence {
     }
 }
 
+/// Resolve deferred numeric literals on a recognized row filter (Epic 008
+/// locked decisions 7–8). Returns `false` when `result` has been failed and
+/// the caller must return it.
+fn resolve_row_filter_deferred_literals(
+    result: &mut CoreResult,
+    request: &mut RecognizedRequest,
+    opened: &OpenedTable,
+) -> bool {
+    let RecognizedRequest::RowFilter(intent) = request else {
+        return true;
+    };
+    let records = selected_region_records(opened);
+    let mut policy_cache: BTreeMap<String, NumericParsePolicy> = BTreeMap::new();
+    let resolution = resolve_deferred_literals(intent, |column_id| {
+        if let Some(policy) = policy_cache.get(column_id) {
+            return Ok(*policy);
+        }
+        let texts: Vec<String> = records
+            .iter()
+            .filter_map(|record| {
+                opened
+                    .columns
+                    .iter()
+                    .find(|column| &column.id == column_id)
+                    .and_then(|column| record.fields.get(column.ordinal))
+            })
+            .filter(|text| !opened.parser_config.normalization.is_blank(text))
+            .cloned()
+            .collect();
+        let selection =
+            select_numeric_policy(texts.iter().map(String::as_str)).map_err(|refused| {
+                let _ = refused;
+                DeferredLiteralError::FormatAmbiguous {
+                    column_id: column_id.to_string(),
+                }
+            })?;
+        let policy = selection.policy;
+        let has_valid = texts.iter().any(|text| policy.parse_decimal(text).is_ok());
+        if !has_valid {
+            return Err(DeferredLiteralError::LiteralInvalid {
+                detail: format!(
+                    "numeric literal against non-numeric column '{column_id}' has no parsing policy"
+                ),
+            });
+        }
+        policy_cache.insert(column_id.to_string(), policy);
+        Ok(policy)
+    });
+    match resolution {
+        Ok(()) => {
+            result.intent_evidence = Some(intent.evidence.clone());
+            true
+        }
+        Err(DeferredLiteralError::FormatAmbiguous { column_id }) => {
+            if let Some(evidence) = result.intent_evidence.as_mut() {
+                evidence.refusal_reason = Some("parse.format_ambiguous".to_string());
+            }
+            result.diagnostics.push(Diagnostic {
+                code: "parse.format_ambiguous".to_string(),
+                severity: Severity::Error,
+                stage: "ingest-csv".to_string(),
+                message: format!(
+                    "column '{column_id}': no unique numeric interpretation, so deferred numeric literals cannot be resolved"
+                ),
+                location: None,
+            });
+            result.outcome = CoreOutcome::Failed;
+            false
+        }
+        Err(DeferredLiteralError::LiteralInvalid { detail }) => {
+            if let Some(evidence) = result.intent_evidence.as_mut() {
+                evidence.refusal_reason = Some("intent.literal_invalid".to_string());
+            }
+            result.diagnostics.push(Diagnostic {
+                code: "intent.literal_invalid".to_string(),
+                severity: Severity::Error,
+                stage: "intent".to_string(),
+                message: format!("invalid literal: {detail}"),
+                location: None,
+            });
+            result.outcome = CoreOutcome::Failed;
+            false
+        }
+    }
+}
+
 /// Every column referenced by a comparison predicate, text or decimal, in
 /// deterministic column-ID order.
 fn compared_column_ids(plan: &Plan) -> Vec<String> {
@@ -879,7 +1000,7 @@ fn selected_region_records(opened: &OpenedTable) -> Vec<baho_ingest_csv::inspect
 #[cfg(test)]
 mod tests {
     use super::*;
-    use baho_plan::plan::{PLAN_SCHEMA_VERSION_2, PlanStep};
+    use baho_plan::plan::{PLAN_SCHEMA_VERSION_3, PlanStep};
     use std::io::Write;
 
     fn write_temp_csv(content: &str) -> tempfile::NamedTempFile {
@@ -1893,13 +2014,15 @@ c,30
     fn compact_predicate_refusals_surface_their_codes() {
         // Compact prompts without `rows`/`where` are predicate-shaped when
         // they fail to parse; the refusal must not be reinterpreted as an
-        // Epic 002 retrieval column_not_found.
+        // Epic 002 retrieval column_not_found. The grouped literal defers
+        // during recognition (Epic 008) and refuses at policy resolution, so
+        // its evidence retains the completed row-filter parse.
         let cases = [
-            ("List job = 10,000", "intent.literal_invalid"),
-            ("List job = 1 or", "intent.predicate_unsupported"),
-            ("List nonsense = 1", "intent.column_not_found"),
+            ("List job = 10,000", "intent.literal_invalid", true),
+            ("List job = 1 or", "intent.predicate_unsupported", false),
+            ("List nonsense = 1", "intent.column_not_found", false),
         ];
-        for (prompt, expected_code) in cases {
+        for (prompt, expected_code, recognition_completed) in cases {
             let file = write_temp_csv(&job_income_csv());
             let result = run_pipeline(file.path(), prompt);
 
@@ -1916,7 +2039,11 @@ c,30
                 Some(expected_code),
                 "prompt {prompt}"
             );
-            assert!(evidence.row_filter.is_none(), "prompt {prompt}");
+            if recognition_completed {
+                assert!(evidence.row_filter.is_some(), "prompt {prompt}");
+            } else {
+                assert!(evidence.row_filter.is_none(), "prompt {prompt}");
+            }
             assert!(
                 !event_names(&result).contains(&"materialization_completed"),
                 "prompt {prompt}"
@@ -2105,7 +2232,7 @@ ID,Job,Annual Income,Note
     }
 
     #[test]
-    fn canonical_row_filter_materializes_plan_v2_retaining_all_columns() {
+    fn canonical_row_filter_materializes_plan_v3_retaining_all_columns() {
         let file = write_temp_csv(&job_income_csv());
         let opened = open_table(file.path()).expect("synthetic table should open");
         let result = run_pipeline(file.path(), CANONICAL_FILTER_PROMPT);
@@ -2116,7 +2243,7 @@ ID,Job,Annual Income,Note
             "row filter has no retrieval intent"
         );
         let plan = result.plan.as_ref().expect("plan must be recorded");
-        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_2);
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_3);
         assert_eq!(plan.steps.len(), 1);
         assert!(matches!(plan.steps[0], PlanStep::Filter { .. }));
 
@@ -2165,7 +2292,7 @@ ID,Job,Annual Income,Note
         assert_eq!(evidence.refusal_reason, None);
         assert_eq!(evidence.canonical_operation.as_deref(), Some("row_filter"));
         let row_filter = evidence.row_filter.as_ref().unwrap();
-        assert_eq!(row_filter.plan_schema_version, PLAN_SCHEMA_VERSION_2);
+        assert_eq!(row_filter.plan_schema_version, PLAN_SCHEMA_VERSION_3);
         assert_eq!(
             row_filter
                 .headers
@@ -2207,7 +2334,7 @@ ID,Job,Annual Income,Note
         assert_eq!(borrowed.outcome, result.outcome);
         assert_eq!(
             borrowed.plan.as_ref().map(|p| p.schema_version),
-            Some(PLAN_SCHEMA_VERSION_2)
+            Some(PLAN_SCHEMA_VERSION_3)
         );
         assert_eq!(
             borrowed.output.as_ref().map(|v| &v.provenance),
@@ -2232,7 +2359,7 @@ ID,Job,Annual Income,Note
         assert_eq!(provenance_rows(&result), [1, 2, 5, 6]);
         assert_eq!(
             row_filter_plan_schema_version(&result),
-            PLAN_SCHEMA_VERSION_2
+            PLAN_SCHEMA_VERSION_3
         );
         let row_filter = result
             .intent_evidence
@@ -2353,11 +2480,14 @@ ID,Job,Annual Income,Note
 
     #[test]
     fn blank_missing_and_boundary_malformed_cells_evaluate_unknown() {
-        // 9 valid values and 1 malformed value ("10,000") sit exactly at the
+        // 9 valid values and 1 malformed value ("oops") sit exactly at the
         // 10% mixed-column limit, so the column is accepted; the blank,
-        // missing, and malformed cells evaluate to unknown and drop.
+        // missing, and malformed cells evaluate to unknown and drop. Epic 008
+        // policy selection keeps this column strict: no separator evidence, so
+        // "oops" stays malformed (grouped values such as "10,000" now select a
+        // grouping policy and parse; that path is covered in ingest-csv).
         let file = write_temp_csv(
-            "ID,Annual Income\n1,500\n2,\n3\n4,\"10,000\"\n5,400\n6,300\n7,200\n8,100\n9,50\n10,25\n11,10\n12,5\n",
+            "ID,Annual Income\n1,500\n2,\n3\n4,oops\n5,400\n6,300\n7,200\n8,100\n9,50\n10,25\n11,10\n12,5\n",
         );
         let result = run_pipeline(file.path(), "List rows where Annual Income < 1000");
 
@@ -2399,10 +2529,10 @@ ID,Job,Annual Income,Note
 
         // The refused plan and evidence remain inspectable.
         let plan = result.plan.as_ref().expect("refused plan is recorded");
-        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_2);
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_3);
         assert_eq!(
             row_filter_plan_schema_version(&result),
-            PLAN_SCHEMA_VERSION_2
+            PLAN_SCHEMA_VERSION_3
         );
 
         // The parse event follows plan validation, so artifact ordering
@@ -2455,6 +2585,38 @@ ID,Job,Annual Income,Note
                 "prompt {prompt}"
             );
         }
+    }
+
+    #[test]
+    fn grouped_numeric_literals_resolve_under_a_grouping_column_policy() {
+        // Epic 008 locked decision 7: `10,000` inherits the bound column's
+        // selected policy. Undecided three-digit groups select the locked
+        // grouping preference, so the threshold is 10000 and the raw cell text
+        // is preserved in the output.
+        let file =
+            write_temp_csv("ID,Annual Income\n1,50000\n2,\"10,000\"\n3,75000\n4,\"2,500\"\n");
+        let result = run_pipeline(file.path(), "List rows where Annual Income < 15,000");
+
+        assert_eq!(
+            result.outcome,
+            CoreOutcome::Materialized,
+            "{:?}",
+            result.diagnostics
+        );
+        assert_eq!(provenance_rows(&result), [2, 4]);
+        assert!(!diagnostic_codes(&result).contains(&"intent.literal_invalid"));
+        assert!(!diagnostic_codes(&result).contains(&"parse.format_ambiguous"));
+    }
+
+    #[test]
+    fn format_ambiguous_columns_refuse_with_parse_format_ambiguous() {
+        let file = write_temp_csv("ID,Amount\n1,\"1,234\"\n2,\"1.234\"\n3,500\n");
+        let result = run_pipeline(file.path(), "List rows where Amount < 10,000");
+
+        assert_eq!(result.outcome, CoreOutcome::Failed);
+        assert!(result.output.is_none());
+        assert!(diagnostic_codes(&result).contains(&"parse.format_ambiguous"));
+        assert!(!event_names(&result).contains(&"compared_columns_parsed"));
     }
 
     #[test]
@@ -2514,7 +2676,7 @@ ID,Job,Annual Income,Note
             assert_eq!(provenance_rows(&result), *expected, "prompt {prompt}");
             assert_eq!(
                 row_filter_plan_schema_version(&result),
-                PLAN_SCHEMA_VERSION_2
+                PLAN_SCHEMA_VERSION_3
             );
         }
     }
@@ -2537,7 +2699,7 @@ ID,Job,Annual Income,Note
         // The plan validated structurally and was recorded before the typed
         // execution check refused it.
         let plan = result.plan.as_ref().expect("validated plan is recorded");
-        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_2);
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_3);
         let parsed_event = result
             .events
             .iter()

@@ -14,8 +14,9 @@ pub use baho_ingest_csv::{CandidateConfig, ParserConfig};
 pub use candidate_selection::select_candidate;
 pub use error::{CoreError, IntentError};
 pub use intent::{
-    CanonicalAction, CanonicalOperation, RecognizedIntent, RecognizedRequest, RowFilterIntent,
-    compile_intent_to_plan, compile_request_to_plan, recognize_intent, recognize_request,
+    CanonicalAction, CanonicalOperation, DeferredLiteralError, RecognizedIntent, RecognizedRequest,
+    RowFilterIntent, compile_intent_to_plan, compile_request_to_plan, recognize_intent,
+    recognize_request, resolve_deferred_literals,
 };
 pub use orchestration::{
     CoreEvent, CoreOutcome, CoreResult, OpenTableFailure, OpenedRow, OpenedTable, RawCell,

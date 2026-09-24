@@ -1,14 +1,18 @@
-use baho_model::NumericParsePolicy;
+use baho_model::{NumericParsePolicy, TextMatchPolicy};
 use serde::{Deserialize, Serialize};
 
-use crate::plan::{ComparisonOperator, Expression, Literal, PLAN_SCHEMA_VERSION_2};
+use crate::plan::{ComparisonOperator, Expression, Literal, PLAN_SCHEMA_VERSION_3};
 
 /// Current recognition-evidence envelope schema version.
 ///
 /// Version 1 is the historical unversioned Epic 002 retrieval-only shape;
 /// older artifacts are never rewritten or reinterpreted. Version 2 adds the
 /// explicit `schema_version` field and the row-filter evidence of Epic 006.
-pub const RECOGNITION_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+/// Version 3 (Epic 008 locked decision 14) covers the text-match policy,
+/// deferred numeric literals, and the extended `NumericParsePolicy` value
+/// space. Version 2 artifacts without `text_match` deserialize with
+/// [`TextMatchPolicy::Exact`], their historical semantics.
+pub const RECOGNITION_EVIDENCE_SCHEMA_VERSION: u32 = 3;
 
 /// Evidence recorded during deterministic intent recognition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,11 +67,21 @@ pub struct RowFilterEvidence {
     pub predicate: Option<Expression>,
     /// Plan schema version emitted for this recognition.
     pub plan_schema_version: u32,
+    /// Text-match policy for text `=`/`!=` implied by `plan_schema_version`
+    /// (Epic 008 locked decisions 1–3). Missing in version 2 artifacts, which
+    /// deserialize as [`TextMatchPolicy::Exact`].
+    #[serde(default)]
+    pub text_match: TextMatchPolicy,
 }
 
 impl RowFilterEvidence {
     /// The plan schema version the row-filter path emits.
-    pub const PLAN_SCHEMA_VERSION: u32 = PLAN_SCHEMA_VERSION_2;
+    pub const PLAN_SCHEMA_VERSION: u32 = PLAN_SCHEMA_VERSION_3;
+
+    /// The text-match policy the row-filter path records. Matches
+    /// [`crate::plan::Plan::text_match_policy()`] for
+    /// [`Self::PLAN_SCHEMA_VERSION`].
+    pub const TEXT_MATCH: TextMatchPolicy = TextMatchPolicy::UnicodeLowercase;
 }
 
 /// Evidence of a header phrase bound to one column during row-filter
@@ -372,6 +386,7 @@ mod tests {
                     ],
                 }),
                 plan_schema_version: RowFilterEvidence::PLAN_SCHEMA_VERSION,
+                text_match: RowFilterEvidence::TEXT_MATCH,
             }),
         }
     }
@@ -460,9 +475,67 @@ mod tests {
     }
 
     #[test]
+    fn row_filter_evidence_records_text_match_policy() {
+        let evidence = sample_row_filter_evidence();
+        let row_filter = evidence.row_filter.as_ref().unwrap();
+        assert_eq!(row_filter.text_match, TextMatchPolicy::UnicodeLowercase);
+        assert_eq!(
+            RowFilterEvidence::TEXT_MATCH,
+            TextMatchPolicy::UnicodeLowercase
+        );
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert!(json.contains(r#""text_match":"unicode_lowercase""#));
+        let back: RecognitionEvidence = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.row_filter.unwrap().text_match,
+            TextMatchPolicy::UnicodeLowercase
+        );
+    }
+
+    #[test]
+    fn version_2_row_filter_evidence_deserializes_with_exact_text_match() {
+        // Compatibility coverage for locked decision 14: a version 2 artifact
+        // predates `text_match` and must keep its historical exact-match
+        // semantics. It is never rewritten.
+        let json = serde_json::json!({
+            "schema_version": 2,
+            "prompt_tokens": [{ "index": 0, "text": "list" }],
+            "action": null,
+            "modifier": null,
+            "column_phrase": null,
+            "matched_column": null,
+            "match_class": null,
+            "canonical_operation": "row_filter",
+            "refusal_reason": null,
+            "competing_parses": [],
+            "row_filter": {
+                "action": null,
+                "headers": [],
+                "operators": [],
+                "connectors": [],
+                "literals": [
+                    { "raw_text": "10000", "literal": {"decimal": "10000"}, "parser_policy": "strict_decimal", "span": [5, 6] }
+                ],
+                "parentheses": [],
+                "predicate": null,
+                "plan_schema_version": 2
+            }
+        });
+        let back: RecognitionEvidence = serde_json::from_value(json).unwrap();
+        assert_eq!(back.schema_version, 2);
+        let row_filter = back.row_filter.unwrap();
+        assert_eq!(row_filter.text_match, TextMatchPolicy::Exact);
+        assert_eq!(row_filter.plan_schema_version, 2);
+        assert_eq!(
+            row_filter.literals[0].literal,
+            Literal::Decimal(dec("10000"))
+        );
+    }
+
+    #[test]
     fn retrieval_evidence_json_keeps_existing_fields() {
         let json = serde_json::to_value(sample_evidence()).unwrap();
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         assert!(json["row_filter"].is_null());
         assert_eq!(json["canonical_operation"], "distinct");
         assert_eq!(json["action"]["alias"], "extract");
@@ -473,9 +546,10 @@ mod tests {
     #[test]
     fn row_filter_evidence_json_structure() {
         let json = serde_json::to_value(sample_row_filter_evidence()).unwrap();
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         let row_filter = &json["row_filter"];
-        assert_eq!(row_filter["plan_schema_version"], 2);
+        assert_eq!(row_filter["plan_schema_version"], 3);
+        assert_eq!(row_filter["text_match"], "unicode_lowercase");
         assert_eq!(row_filter["action"]["alias"], "list");
 
         let headers = row_filter["headers"].as_array().unwrap();

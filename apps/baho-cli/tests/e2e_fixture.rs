@@ -118,7 +118,7 @@ fn extract_unique_floor_plans_from_fixture() {
 
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    assert_eq!(plan["schema_version"], 4);
+    assert_eq!(plan["schema_version"], 5);
     let steps = plan["plan"]["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 3);
     assert_eq!(steps[0]["op"], "filter");
@@ -187,7 +187,7 @@ fn unsupported_intent_returns_failure() {
     // Refusal persists bounded recognition evidence in plan.json with no plan.
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    assert_eq!(plan["schema_version"], 4);
+    assert_eq!(plan["schema_version"], 5);
     assert!(
         plan.get("plan").is_none(),
         "refusal must not write a nested plan, got {:?}",
@@ -410,10 +410,10 @@ fn row_filter_materializes_all_columns_from_fixture() {
 
     let run = workspace.path().join(".baho/runs/000001");
 
-    // Envelope 4 carries a schema version 2 row-filter plan.
+    // Envelope 4 carries a schema version 3 row-filter plan.
     let plan = read_json(&run.join("plan.json"));
-    assert_eq!(plan["schema_version"], 4);
-    assert_eq!(plan["plan"]["schema_version"], 2);
+    assert_eq!(plan["schema_version"], 5);
+    assert_eq!(plan["plan"]["schema_version"], 3);
     let steps = plan["plan"]["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0]["op"], "filter");
@@ -421,11 +421,11 @@ fn row_filter_materializes_all_columns_from_fixture() {
     // Recognition evidence has its own schema version 2 and the row-filter
     // decision with the plan schema version it emitted.
     let evidence = &plan["recognition_evidence"];
-    assert_eq!(evidence["schema_version"], 2);
+    assert_eq!(evidence["schema_version"], 3);
     assert!(evidence["refusal_reason"].is_null());
     assert_eq!(evidence["canonical_operation"], "row_filter");
     let row_filter = &evidence["row_filter"];
-    assert_eq!(row_filter["plan_schema_version"], 2);
+    assert_eq!(row_filter["plan_schema_version"], 3);
     let headers = row_filter["headers"].as_array().unwrap();
     let header_names: Vec<&str> = headers
         .iter()
@@ -604,13 +604,13 @@ fn condensed_row_filter_matches_canonical_from_fixture() {
 
     let run = workspace.path().join(".baho/runs/000001");
     let plan = read_json(&run.join("plan.json"));
-    assert_eq!(plan["schema_version"], 4);
-    assert_eq!(plan["plan"]["schema_version"], 2);
+    assert_eq!(plan["schema_version"], 5);
+    assert_eq!(plan["plan"]["schema_version"], 3);
     let evidence = &plan["recognition_evidence"];
-    assert_eq!(evidence["schema_version"], 2);
+    assert_eq!(evidence["schema_version"], 3);
     assert_eq!(evidence["canonical_operation"], "row_filter");
     let row_filter = &evidence["row_filter"];
-    assert_eq!(row_filter["plan_schema_version"], 2);
+    assert_eq!(row_filter["plan_schema_version"], 3);
     // The condensed form binds the implicit-equality header directly.
     let headers = row_filter["headers"].as_array().unwrap();
     assert_eq!(headers[0]["tokens"], serde_json::json!(["status"]));
@@ -652,14 +652,14 @@ fn overlapping_row_filter_headers_bind_longest_end_to_end() {
 
     let run = workspace.path().join(".baho/runs/000001");
     let plan = read_json(&run.join("plan.json"));
-    assert_eq!(plan["schema_version"], 4);
-    assert_eq!(plan["plan"]["schema_version"], 2);
+    assert_eq!(plan["schema_version"], 5);
+    assert_eq!(plan["plan"]["schema_version"], 3);
     let steps = plan["plan"]["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0]["op"], "filter");
 
     let evidence = &plan["recognition_evidence"];
-    assert_eq!(evidence["schema_version"], 2);
+    assert_eq!(evidence["schema_version"], 3);
     assert!(evidence["refusal_reason"].is_null());
     assert_eq!(evidence["canonical_operation"], "row_filter");
     let row_filter = &evidence["row_filter"];
@@ -759,4 +759,129 @@ fn expression_depth_limit_refuses_as_expression_limit_exceeded() {
         "unexpected parse diagnostics: {codes:?}"
     );
     assert!(!run.join("output/result.json").exists());
+}
+
+// ==== Epic 008: filter value normalization ====
+
+#[test]
+fn grouped_integer_column_filter_under_locked_grouping_preference() {
+    // Epic 008 locked decisions 5–7: undecided three-digit groups select the
+    // locked grouping preference, so `10,000` is 10000 and the prompt literal
+    // `15,000` inherits that policy. Raw cell text is preserved.
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = workspace.path().join("income.csv");
+    fs::write(
+        &input,
+        "ID,Annual Income\n1,50000\n2,\"10,000\"\n3,75000\n4,\"2,500\"\n",
+    )
+    .expect("write input");
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List rows where Annual Income < 15,000",
+        ])
+        .output()
+        .expect("run baho");
+
+    assert!(output.status.success(), "{output:?}");
+    let run = workspace.path().join(".baho/runs/000001");
+    let result = read_json(&run.join("output/result.json"));
+    let rows = result["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let provenance = result["result"]["provenance"].as_array().unwrap();
+    let source_rows: Vec<u64> = provenance
+        .iter()
+        .map(|row| row["source_row"].as_u64().unwrap())
+        .collect();
+    assert_eq!(source_rows, [2, 4]);
+    let row2_values = rows[0]["values"].as_array().unwrap();
+    let row4_values = rows[1]["values"].as_array().unwrap();
+    assert_eq!(
+        row2_values[1],
+        serde_json::json!({"Text": "10,000"}),
+        "raw cell text is preserved"
+    );
+    assert_eq!(row4_values[1], serde_json::json!({"Text": "2,500"}));
+    let diagnostics = read_json(&run.join("diagnostics.json"));
+    let codes = diagnostic_codes(&diagnostics);
+    assert!(
+        codes.iter().all(|code| !code.starts_with("intent.")),
+        "unexpected intent diagnostics: {codes:?}"
+    );
+}
+
+#[test]
+fn case_insensitive_text_equality_matches_letter_case_variants() {
+    // Epic 008 locked decision 1: text `=` folds both sides with Unicode full
+    // lowercase under plan schema version 3; the raw spelling is preserved in
+    // the output.
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = workspace.path().join("status.csv");
+    fs::write(&input, "ID,Status\n1,Inactive\n2,ACTIVE\n3,paused\n").expect("write input");
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List rows where Status = inactive",
+        ])
+        .output()
+        .expect("run baho");
+
+    assert!(output.status.success(), "{output:?}");
+    let run = workspace.path().join(".baho/runs/000001");
+    let result = read_json(&run.join("output/result.json"));
+    let rows = result["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    let values = rows[0]["values"].as_array().unwrap();
+    assert_eq!(
+        values[1],
+        serde_json::json!({"Text": "Inactive"}),
+        "raw spelling is preserved"
+    );
+    let plan = read_json(&run.join("plan.json"));
+    assert_eq!(plan["plan"]["schema_version"], 3);
+    assert_eq!(
+        plan["recognition_evidence"]["row_filter"]["text_match"],
+        "unicode_lowercase"
+    );
+}
+
+#[test]
+fn format_ambiguous_columns_refuse_with_parse_format_ambiguous() {
+    // Epic 008 locked decisions 6 and 9: `1,234` and `1.234` keep both
+    // readings plausible, so the column refuses before typed parsing and
+    // before deferred literal resolution.
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = workspace.path().join("amount.csv");
+    fs::write(&input, "ID,Amount\n1,\"1,234\"\n2,\"1.234\"\n3,500\n").expect("write input");
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List rows where Amount < 10,000",
+        ])
+        .output()
+        .expect("run baho");
+
+    assert!(!output.status.success(), "expected failure: {output:?}");
+    let run = workspace.path().join(".baho/runs/000001");
+    let diagnostics = read_json(&run.join("diagnostics.json"));
+    let codes = diagnostic_codes(&diagnostics);
+    assert!(
+        codes.contains(&"parse.format_ambiguous"),
+        "expected format_ambiguous diagnostic, got: {codes:?}"
+    );
+    assert!(!run.join("output/result.json").exists());
+    let events_raw = fs::read_to_string(run.join("events.jsonl")).expect("read events");
+    assert!(!events_raw.contains("compared_columns_parsed"));
 }

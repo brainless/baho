@@ -29,9 +29,11 @@ const RUN_ID_WIDTH: usize = 6;
 /// `plan.json` envelope schema version.
 ///
 /// Version 4 covers the recognition-evidence envelope with its own
-/// `schema_version` and row-filter evidence (Epic 006). Historical envelopes
-/// are never rewritten or reinterpreted.
-const PLAN_ARTIFACT_SCHEMA_VERSION: u32 = 4;
+/// `schema_version` and row-filter evidence (Epic 006). Version 5 (Epic 008
+/// locked decision 14) covers recognition-evidence version 3 with text-match
+/// policy, deferred numeric literals, and the extended `NumericParsePolicy`
+/// value space. Historical envelopes are never rewritten or reinterpreted.
+const PLAN_ARTIFACT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Error)]
 pub enum RunRecordError {

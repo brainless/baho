@@ -199,6 +199,9 @@ pub enum DecimalParseError {
     InvalidCharacter,
     /// In the grammar but not representable as an i128 mantissa plus u32 scale.
     OutOfRange,
+    /// Grouping marks violate the policy structure: wrong group size,
+    /// misplaced mark, or a grouping mark outside the integer part.
+    InvalidGrouping,
 }
 
 impl fmt::Display for DecimalParseError {
@@ -217,12 +220,112 @@ impl fmt::Display for DecimalParseError {
             DecimalParseError::OutOfRange => {
                 "decimal literal does not fit the exact decimal representation"
             }
+            DecimalParseError::InvalidGrouping => "decimal literal has invalid grouping structure",
         };
         f.write_str(message)
     }
 }
 
 impl std::error::Error for DecimalParseError {}
+
+/// Parse a signed decimal with an explicit decimal mark and grouping mark.
+///
+/// Epic 008 locked decision 12: grouping structure is validated here and the
+/// normalized digit string is parsed with [`ExactDecimal::parse`], so values
+/// stay exact decimals. Grouping marks must form 3-digit groups after a 1–3
+/// digit leading group. The fractional part may not contain grouping marks.
+/// Whitespace and any other characters are refused.
+pub fn parse_grouped_decimal(
+    text: &str,
+    decimal_mark: char,
+    group_mark: char,
+) -> Result<ExactDecimal, DecimalParseError> {
+    if text.is_empty() {
+        return Err(DecimalParseError::Empty);
+    }
+    let (negative, rest) = match text.as_bytes()[0] {
+        b'+' => (false, &text[1..]),
+        b'-' => (true, &text[1..]),
+        _ => (false, text),
+    };
+    if rest.is_empty() {
+        return Err(DecimalParseError::SignWithoutDigits);
+    }
+    if !rest
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || ch == decimal_mark || ch == group_mark)
+    {
+        return Err(DecimalParseError::InvalidCharacter);
+    }
+    if rest.chars().filter(|ch| *ch == decimal_mark).count() > 1 {
+        return Err(DecimalParseError::MultipleDecimalPoints);
+    }
+    let (integer, fraction) = match rest.split_once(decimal_mark) {
+        Some((integer, fraction)) => (integer, Some(fraction)),
+        None => (rest, None),
+    };
+    if integer.is_empty() {
+        return Err(DecimalParseError::MissingIntegerDigits);
+    }
+    let fraction = match fraction {
+        Some("") => return Err(DecimalParseError::MissingFractionDigits),
+        Some(fraction) => {
+            if fraction.contains(group_mark) {
+                return Err(DecimalParseError::InvalidGrouping);
+            }
+            if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(DecimalParseError::InvalidCharacter);
+            }
+            fraction
+        }
+        None => "",
+    };
+    let integer_digits = strip_grouping_marks(integer, group_mark)?;
+    let mut normalized = String::with_capacity(integer_digits.len() + fraction.len() + 2);
+    if negative {
+        normalized.push('-');
+    }
+    normalized.push_str(&integer_digits);
+    if !fraction.is_empty() {
+        normalized.push('.');
+        normalized.push_str(fraction);
+    }
+    ExactDecimal::parse(&normalized)
+}
+
+/// Validate grouping marks in an integer part and return the bare digits.
+///
+/// The leading group must be 1–3 digits; every later group must be exactly 3
+/// digits; a trailing or doubled grouping mark is refused.
+fn strip_grouping_marks(integer: &str, group_mark: char) -> Result<String, DecimalParseError> {
+    let mut digits = String::with_capacity(integer.len());
+    let mut group_size = 0usize;
+    let mut seen_group_mark = false;
+    for ch in integer.chars() {
+        if ch == group_mark {
+            let ok = if seen_group_mark {
+                group_size == 3
+            } else {
+                (1..=3).contains(&group_size)
+            };
+            if !ok {
+                return Err(DecimalParseError::InvalidGrouping);
+            }
+            seen_group_mark = true;
+            group_size = 0;
+        } else {
+            digits.push(ch);
+            group_size += 1;
+        }
+    }
+    if seen_group_mark && group_size != 3 {
+        return Err(DecimalParseError::InvalidGrouping);
+    }
+    if digits.is_empty() {
+        return Err(DecimalParseError::MissingIntegerDigits);
+    }
+    Ok(digits)
+}
 
 impl PartialEq for ExactDecimal {
     fn eq(&self, other: &Self) -> bool {
@@ -499,5 +602,43 @@ mod tests {
         assert!(ExactDecimal::new(1, 40) < ExactDecimal::new(1, 38));
         assert!(ExactDecimal::new(1, 0) > ExactDecimal::new(1, 40));
         assert!(ExactDecimal::new(-1, 0) < ExactDecimal::new(-1, 40));
+    }
+
+    #[test]
+    fn invalid_grouping_has_a_distinct_error_and_message() {
+        assert_eq!(
+            parse_grouped_decimal("1,23", '.', ','),
+            Err(DecimalParseError::InvalidGrouping)
+        );
+        let message = DecimalParseError::InvalidGrouping.to_string();
+        assert!(message.contains("grouping"), "{message}");
+    }
+
+    #[test]
+    fn parse_grouped_decimal_preserves_sign_empty_and_scale_rules() {
+        assert_eq!(
+            parse_grouped_decimal("", '.', ','),
+            Err(DecimalParseError::Empty)
+        );
+        assert_eq!(
+            parse_grouped_decimal("-", '.', ','),
+            Err(DecimalParseError::SignWithoutDigits)
+        );
+        assert_eq!(
+            parse_grouped_decimal(" 1", '.', ','),
+            Err(DecimalParseError::InvalidCharacter)
+        );
+        assert_eq!(
+            parse_grouped_decimal("5.", '.', ','),
+            Err(DecimalParseError::MissingFractionDigits)
+        );
+        assert_eq!(
+            parse_grouped_decimal(".5", '.', ','),
+            Err(DecimalParseError::MissingIntegerDigits)
+        );
+        assert_eq!(
+            parse_grouped_decimal("+1,234.50", '.', ',').unwrap(),
+            dec("1234.5")
+        );
     }
 }

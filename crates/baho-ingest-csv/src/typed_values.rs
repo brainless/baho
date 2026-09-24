@@ -4,7 +4,9 @@
 //! columns referenced by typed comparison predicates: blank, missing,
 //! malformed, and exact-decimal outcomes, the mixed-column refusal
 //! threshold, and bounded `parse.value_malformed` / `parse.column_mixed`
-//! diagnostics. It does not own prompt recognition or Boolean evaluation.
+//! diagnostics. It also runs Epic 008 column policy selection and refuses
+//! `parse.format_ambiguous` when the column has no unique numeric
+//! interpretation. It does not own prompt recognition or Boolean evaluation.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +17,9 @@ use baho_model::document::{CellAddress, ParsedCell, SourcedCell};
 
 use crate::config::NormalizationConfig;
 use crate::inspector::LogicalRecord;
+use crate::policy_selection::{
+    PolicyAmbiguityReason, PolicySelectionEvidence, select_numeric_policy,
+};
 
 /// Locked decision 6: at most 3 sample cell locations per failure kind.
 pub const MAX_MALFORMED_SAMPLE_CELLS: usize = 3;
@@ -26,7 +31,7 @@ pub const MIXED_COLUMN_MALFORMED_SHARE_PERCENT: u64 =
     baho_model::column::MIXED_COLUMN_MALFORMED_SHARE_PERCENT;
 
 /// Whether an accepted column still carries malformed cells or is refused
-/// outright per locked decision 5.
+/// outright per locked decision 5 or Epic 008 locked decision 6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ParseVerdict {
@@ -34,6 +39,10 @@ pub enum ParseVerdict {
     Accepted,
     /// The column is refused for typed comparison with `parse.column_mixed`.
     Mixed { reason: MixedRefusalReason },
+    /// The column is refused for typed comparison with `parse.format_ambiguous`
+    /// because policy selection found no unique numeric interpretation
+    /// (Epic 008 locked decisions 6 and 9).
+    FormatAmbiguous { reason: PolicyAmbiguityReason },
 }
 
 /// Why a compared column was refused under locked decision 5.
@@ -88,6 +97,10 @@ pub struct ComparedColumnParse {
     pub column_ordinal: usize,
     pub verdict: ParseVerdict,
     pub malformed_evidence: Vec<MalformedValuesEvidence>,
+    /// Policy-selection evidence when selection ran (Epic 008). `None` on the
+    /// explicit-policy path used for text-compared columns and focused tests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_selection: Option<PolicySelectionEvidence>,
 }
 
 impl ComparedColumnParse {
@@ -96,12 +109,37 @@ impl ComparedColumnParse {
         parse_counts(self.column.cells.len(), &self.column.cells)
     }
 
-    /// Deterministic diagnostics: `parse.column_mixed` when refused, then
-    /// one `parse.value_malformed` per failure kind. Malformed sample raw
-    /// text stays in [`Self::column`]; the diagnostics carry counts and
-    /// locations only.
+    /// Deterministic diagnostics. `parse.format_ambiguous` refuses before
+    /// typed parsing evidence (locked decision 9). Otherwise
+    /// `parse.column_mixed` when refused, then one `parse.value_malformed` per
+    /// failure kind. Malformed sample raw text stays in [`Self::column`]; the
+    /// diagnostics carry counts and locations only.
     pub fn diagnostics(&self) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
+        if let ParseVerdict::FormatAmbiguous { reason } = self.verdict {
+            let scope = format!("column '{}'", self.column.column_id);
+            let message = match reason {
+                PolicyAmbiguityReason::ConflictingRoles => format!(
+                    "{scope}: separator evidence conflicts, so the numeric format is ambiguous"
+                ),
+                PolicyAmbiguityReason::BothSeparatorsUndecided => format!(
+                    "{scope}: both '.' and ',' occur with undecided roles, so the numeric format is ambiguous"
+                ),
+            };
+            diagnostics.push(Diagnostic {
+                code: "parse.format_ambiguous".to_string(),
+                severity: Severity::Error,
+                stage: PARSE_DIAGNOSTIC_STAGE.to_string(),
+                message,
+                location: Some(DiagnosticLocation {
+                    row: None,
+                    col: Some(self.column_ordinal),
+                    cell: None,
+                    cells: Vec::new(),
+                }),
+            });
+            return diagnostics;
+        }
         if let ParseVerdict::Mixed { reason } = self.verdict {
             let counts = self.counts();
             let scope = format!("column '{}'", self.column.column_id);
@@ -162,13 +200,76 @@ impl ComparedColumnParse {
 
 const PARSE_DIAGNOSTIC_STAGE: &str = "ingest-csv";
 
-/// Parse one compared column over the selected region's body records.
+/// Parse one compared column over the selected region's body records under an
+/// explicit policy.
 ///
 /// Every record yields exactly one [`SourcedCell`]: `Missing` when the
 /// physical record ends before this column, `Blank` when the present text is
-/// blank under `blank_rule`, and otherwise strict decimal parse outcome under
-/// `policy`. The mixed-column verdict follows locked decision 5.
+/// blank under `blank_rule`, and otherwise decimal parse outcome under
+/// `policy`. The mixed-column verdict follows locked decision 5. This entry
+/// point does not run policy selection; decimal-compared columns should use
+/// [`parse_compared_column_selecting_policy`].
 pub fn parse_compared_column(
+    records: &[LogicalRecord],
+    sheet_index: usize,
+    column: &ColumnDefinition,
+    policy: NumericParsePolicy,
+    blank_rule: &NormalizationConfig,
+) -> ComparedColumnParse {
+    let mut parsed = parse_compared_column_inner(records, sheet_index, column, policy, blank_rule);
+    parsed.policy_selection = None;
+    parsed
+}
+
+/// Parse one compared column after selecting its numeric policy from the
+/// nonblank cell texts (Epic 008 locked decisions 5–6 and 9).
+///
+/// Ambiguous format refuses with [`ParseVerdict::FormatAmbiguous`] and
+/// `parse.format_ambiguous` before typed parsing evidence. On refusal the
+/// cells are still parsed under [`NumericParsePolicy::StrictDecimal`] so raw
+/// text and coordinates remain available as evidence.
+pub fn parse_compared_column_selecting_policy(
+    records: &[LogicalRecord],
+    sheet_index: usize,
+    column: &ColumnDefinition,
+    blank_rule: &NormalizationConfig,
+) -> ComparedColumnParse {
+    let texts: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record.fields.get(column.ordinal))
+        .map(String::as_str)
+        .filter(|text| !blank_rule.is_blank(text))
+        .collect();
+    match select_numeric_policy(texts) {
+        Ok(selection) => {
+            let mut parsed = parse_compared_column_inner(
+                records,
+                sheet_index,
+                column,
+                selection.policy,
+                blank_rule,
+            );
+            parsed.policy_selection = Some(selection.evidence);
+            parsed
+        }
+        Err(refused) => {
+            let mut parsed = parse_compared_column_inner(
+                records,
+                sheet_index,
+                column,
+                NumericParsePolicy::StrictDecimal,
+                blank_rule,
+            );
+            parsed.verdict = ParseVerdict::FormatAmbiguous {
+                reason: refused.reason,
+            };
+            parsed.policy_selection = Some(refused.evidence);
+            parsed
+        }
+    }
+}
+
+fn parse_compared_column_inner(
     records: &[LogicalRecord],
     sheet_index: usize,
     column: &ColumnDefinition,
@@ -224,6 +325,7 @@ pub fn parse_compared_column(
         column_ordinal: column.ordinal,
         verdict,
         malformed_evidence,
+        policy_selection: None,
     }
 }
 
@@ -834,5 +936,121 @@ mod tests {
 
         let back: ComparedColumnParse = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, back);
+    }
+
+    fn select_income(records: &[LogicalRecord]) -> ComparedColumnParse {
+        parse_compared_column_selecting_policy(
+            records,
+            0,
+            &income_column(1),
+            &NormalizationConfig::default(),
+        )
+    }
+
+    #[test]
+    fn selection_prefers_grouping_for_undecided_three_digit_groups() {
+        let records = vec![
+            record(0, &["a", "50000"]),
+            record(1, &["b", "10,000"]),
+            record(2, &["c", "75000"]),
+        ];
+
+        let parsed = select_income(&records);
+
+        assert_eq!(parsed.verdict, ParseVerdict::Accepted);
+        assert_eq!(
+            parsed.column.policy,
+            NumericParsePolicy::DotDecimalCommaGrouping
+        );
+        assert_eq!(parsed.counts().valid, 3);
+        assert_eq!(parsed.counts().malformed, 0);
+        let selection = parsed
+            .policy_selection
+            .as_ref()
+            .expect("selection evidence recorded");
+        assert_eq!(selection.locked_preference, Some(','));
+        assert!(parsed.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn selection_uses_decided_evidence_over_undecided_values() {
+        let records = vec![record(0, &["a", "1,23"]), record(1, &["b", "1,234"])];
+
+        let parsed = select_income(&records);
+
+        assert_eq!(parsed.verdict, ParseVerdict::Accepted);
+        assert_eq!(
+            parsed.column.policy,
+            NumericParsePolicy::CommaDecimalDotGrouping
+        );
+        assert_eq!(parsed.counts().valid, 2);
+    }
+
+    #[test]
+    fn both_undecided_separators_refuse_as_format_ambiguous() {
+        let records = vec![record(0, &["a", "1,234"]), record(1, &["b", "1.234"])];
+
+        let parsed = select_income(&records);
+
+        assert_eq!(
+            parsed.verdict,
+            ParseVerdict::FormatAmbiguous {
+                reason: PolicyAmbiguityReason::BothSeparatorsUndecided
+            }
+        );
+        let diagnostics = parsed.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "parse.format_ambiguous");
+        assert_eq!(diagnostics[0].severity, Severity::Error);
+        assert_eq!(diagnostics[0].stage, "ingest-csv");
+        assert_eq!(
+            diagnostics[0].location,
+            Some(DiagnosticLocation {
+                row: None,
+                col: Some(1),
+                cell: None,
+                cells: Vec::new()
+            })
+        );
+    }
+
+    #[test]
+    fn conflicting_roles_refuse_as_format_ambiguous_before_mixed_evidence() {
+        let records = vec![
+            record(0, &["a", "1,23"]),
+            record(1, &["b", "1,234,567"]),
+            record(2, &["c", "oops"]),
+        ];
+
+        let parsed = select_income(&records);
+
+        assert_eq!(
+            parsed.verdict,
+            ParseVerdict::FormatAmbiguous {
+                reason: PolicyAmbiguityReason::ConflictingRoles
+            }
+        );
+        let diagnostics = parsed.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "parse.format_ambiguous");
+    }
+
+    #[test]
+    fn selection_records_policy_and_keeps_raw_text() {
+        let records = vec![record(0, &["a", "1,234.56"]), record(1, &["b", "12.34"])];
+
+        let parsed = select_income(&records);
+
+        assert_eq!(
+            parsed.column.policy,
+            NumericParsePolicy::DotDecimalCommaGrouping
+        );
+        assert_eq!(parsed.column.cells[0].raw_text.as_deref(), Some("1,234.56"));
+        assert_eq!(
+            parsed.column.cells[0].parsed,
+            ParsedCell::Valid(ExactDecimal::parse("1234.56").unwrap())
+        );
+        let json = serde_json::to_value(&parsed.policy_selection).unwrap();
+        assert_eq!(json[0]["locked_preference"], serde_json::Value::Null);
     }
 }

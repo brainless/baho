@@ -72,6 +72,9 @@ pub enum ExecutionError {
         reason: ColumnMixedReason,
     },
 
+    #[error("unresolved deferred literal: {detail}")]
+    UnresolvedLiteral { detail: String },
+
     #[error("invalid plan: {0}")]
     InvalidPlan(#[from] PlanValidationError),
 }

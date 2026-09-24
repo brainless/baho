@@ -1,4 +1,4 @@
-use baho_model::ExactDecimal;
+use baho_model::{ExactDecimal, TextMatchPolicy};
 use serde::{Deserialize, Serialize};
 
 /// Plan schema version 1: select, distinct, and `is_not_blank` filters only.
@@ -10,15 +10,42 @@ pub const PLAN_SCHEMA_VERSION_1: u32 = 1;
 /// extended expression kinds are never emitted under schema version 1.
 pub const PLAN_SCHEMA_VERSION_2: u32 = 2;
 
+/// Plan schema version 3: text `=`/`!=` become case-insensitive.
+///
+/// Version 3 defines text `=`/`!=` as case-insensitive: Unicode full
+/// lowercase conversion (`str::to_lowercase`) is applied to both the source
+/// text and the literal before exact comparison (Epic 008 locked decision 1,
+/// [`TextMatchPolicy::UnicodeLowercase`]). Versions 1 and 2 retain exact
+/// case-sensitive equality. The expression set is unchanged from version 2
+/// (`is_not_blank`, `compare`, `and`, `or`, `not`); ordered text comparison
+/// remains rejected by structural validation.
+pub const PLAN_SCHEMA_VERSION_3: u32 = 3;
+
 /// A versioned, serializable operation plan bound to a specific source revision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
-    /// Schema version: 1 or 2.
+    /// Schema version: 1, 2, or 3.
     pub schema_version: u32,
     /// The source this plan was built for.
     pub source: PlanSource,
     /// Ordered operation steps.
     pub steps: Vec<PlanStep>,
+}
+
+impl Plan {
+    /// The text-match policy for text `=`/`!=` under this plan's schema
+    /// version (Epic 008 locked decision 2).
+    ///
+    /// Version 3 folds both sides with Unicode full lowercase conversion;
+    /// versions 1 and 2 retain exact case-sensitive equality. Unknown
+    /// versions, which structural validation rejects, fall back to
+    /// [`TextMatchPolicy::Exact`].
+    pub fn text_match_policy(&self) -> TextMatchPolicy {
+        match self.schema_version {
+            PLAN_SCHEMA_VERSION_3 => TextMatchPolicy::UnicodeLowercase,
+            _ => TextMatchPolicy::Exact,
+        }
+    }
 }
 
 /// Binds a plan to a specific table within a source revision.
@@ -56,7 +83,7 @@ pub enum DistinctKeep {
 /// An expression used within plan steps.
 ///
 /// The `is_not_blank` JSON shape is unchanged from plan schema version 1;
-/// `compare`, `and`, `or`, and `not` require plan schema version 2.
+/// `compare`, `and`, `or`, and `not` require plan schema version 2 or later.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Expression {
@@ -143,7 +170,11 @@ impl Expression {
 
 /// A typed literal operand of a comparison predicate.
 ///
-/// The variant tag records the literal kind (`"text"` or `"decimal"`).
+/// The variant tag records the literal kind (`"text"`, `"decimal"`, or
+/// `"deferred"`). [`Literal::Deferred`] is an Epic 008 recognition-time
+/// placeholder for a format-shaped numeric token that must be resolved under
+/// the bound column's selected policy before compilation; structural
+/// validation rejects it in any persisted or executable plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Literal {
@@ -151,6 +182,9 @@ pub enum Literal {
     Text(String),
     /// An exact decimal literal.
     Decimal(ExactDecimal),
+    /// Raw numeric text awaiting policy-aware resolution (Epic 008 locked
+    /// decision 7).
+    Deferred(String),
 }
 
 /// Comparison operators for atomic predicates.
@@ -365,6 +399,32 @@ mod tests {
             operands[1]["literal"],
             serde_json::json!({ "decimal": "10000" })
         );
+    }
+
+    #[test]
+    fn text_match_policy_derives_from_schema_version() {
+        let mut plan = sample_v2_plan();
+        assert_eq!(plan.text_match_policy(), TextMatchPolicy::Exact);
+        plan.schema_version = PLAN_SCHEMA_VERSION_1;
+        assert_eq!(plan.text_match_policy(), TextMatchPolicy::Exact);
+        plan.schema_version = PLAN_SCHEMA_VERSION_2;
+        assert_eq!(plan.text_match_policy(), TextMatchPolicy::Exact);
+        plan.schema_version = PLAN_SCHEMA_VERSION_3;
+        assert_eq!(plan.text_match_policy(), TextMatchPolicy::UnicodeLowercase);
+        // Unknown versions fall back to exact; structural validation
+        // rejects them before execution can consult the policy.
+        plan.schema_version = 4;
+        assert_eq!(plan.text_match_policy(), TextMatchPolicy::Exact);
+    }
+
+    #[test]
+    fn v3_plan_json_round_trip_is_stable() {
+        let mut plan = sample_v2_plan();
+        plan.schema_version = PLAN_SCHEMA_VERSION_3;
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: Plan = serde_json::from_str(&json).unwrap();
+        assert_eq!(plan, back);
+        assert_eq!(serde_json::to_value(&back).unwrap()["schema_version"], 3);
     }
 
     #[test]

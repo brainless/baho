@@ -172,7 +172,7 @@ fn run_records_the_request_and_input_identity() {
 
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    assert_eq!(plan["schema_version"], 4);
+    assert_eq!(plan["schema_version"], 5);
     assert_eq!(plan["plan"]["schema_version"], 1);
     assert_eq!(
         plan["recognition_evidence"]["canonical_operation"],
@@ -321,16 +321,16 @@ fn select_only_run_writes_correct_plan() {
 
     let run = workspace.path().join(".baho/runs/000001");
 
-    // Plan artifact has schema_version 4
+    // Plan artifact has schema_version 5
     let plan: Value = serde_json::from_slice(&fs::read(run.join("plan.json")).expect("read plan"))
         .expect("valid plan JSON");
-    assert_eq!(plan["schema_version"], 4);
+    assert_eq!(plan["schema_version"], 5);
 
     // A retrieval request (`List <column>`) still emits a plan schema
     // version 1 plan inside the envelope, with no row-filter evidence.
     assert_eq!(plan["plan"]["schema_version"], 1);
     let recognition = &plan["recognition_evidence"];
-    assert_eq!(recognition["schema_version"], 2);
+    assert_eq!(recognition["schema_version"], 3);
     assert!(recognition["row_filter"].is_null());
 
     // Plan has exactly 1 step (select only)
@@ -395,7 +395,7 @@ fn write_job_income_csv(workspace: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[test]
-fn row_filter_records_plan_v2_with_all_columns_and_provenance() {
+fn row_filter_records_plan_v3_with_all_columns_and_provenance() {
     let workspace = tempdir().expect("create temporary workspace");
     let input = write_job_income_csv(workspace.path());
 
@@ -422,10 +422,10 @@ fn row_filter_records_plan_v2_with_all_columns_and_provenance() {
     assert_eq!(manifest["outcome"], "materialized");
 
     // The plan.json envelope is schema version 4 and carries a schema
-    // version 2 row-filter plan with a single Filter step.
+    // version 3 row-filter plan with a single Filter step.
     let plan = read_artifact(&run, "plan.json");
-    assert_eq!(plan["schema_version"], 4);
-    assert_eq!(plan["plan"]["schema_version"], 2);
+    assert_eq!(plan["schema_version"], 5);
+    assert_eq!(plan["plan"]["schema_version"], 3);
     let steps = plan["plan"]["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0]["op"], "filter");
@@ -433,11 +433,11 @@ fn row_filter_records_plan_v2_with_all_columns_and_provenance() {
     // Recognition evidence is schema version 2 and records the row-filter
     // recognition decision, including the plan schema version it emitted.
     let recognition = &plan["recognition_evidence"];
-    assert_eq!(recognition["schema_version"], 2);
+    assert_eq!(recognition["schema_version"], 3);
     assert!(recognition["refusal_reason"].is_null());
     assert_eq!(recognition["canonical_operation"], "row_filter");
     let row_filter = &recognition["row_filter"];
-    assert_eq!(row_filter["plan_schema_version"], 2);
+    assert_eq!(row_filter["plan_schema_version"], 3);
     assert_eq!(row_filter["action"]["alias"], "list");
     let headers = row_filter["headers"].as_array().unwrap();
     let header_names: Vec<&str> = headers
@@ -607,7 +607,7 @@ fn row_filter_records_plan_v2_with_all_columns_and_provenance() {
         "every compared column is profiled"
     );
     assert_eq!(parsed["fields"]["fields"]["mixed"], serde_json::json!([]));
-    assert_eq!(parsed["fields"]["fields"]["schema_version"], 2);
+    assert_eq!(parsed["fields"]["fields"]["schema_version"], 3);
     assert_eq!(
         parsed["fields"]["fields"]["column_evidence"],
         serde_json::json!([
@@ -627,7 +627,14 @@ fn row_filter_records_plan_v2_with_all_columns_and_provenance() {
                 "inferred_type": "numeric",
                 "decimal_comparison_required": true,
                 "verdict": { "status": "accepted" },
-                "counts": { "rows": 5, "missing": 1, "blank": 1, "valid": 3, "malformed": 0 }
+                "counts": { "rows": 5, "missing": 1, "blank": 1, "valid": 3, "malformed": 0 },
+                "policy_selection": {
+                    "neutral": 2,
+                    "decided": 1,
+                    "undecided": 0,
+                    "role_assignments": [[".", "decimal_mark"]],
+                    "locked_preference": null
+                }
             }
         ])
     );
@@ -714,13 +721,13 @@ fn mixed_compared_column_refusal_writes_parse_diagnostics() {
     // Recognition evidence and the refused plan stay inspectable in
     // plan.json, with the run stuck before execution.
     let plan = read_artifact(&run, "plan.json");
-    assert_eq!(plan["schema_version"], 4);
-    assert_eq!(plan["plan"]["schema_version"], 2);
+    assert_eq!(plan["schema_version"], 5);
+    assert_eq!(plan["plan"]["schema_version"], 3);
     assert_eq!(plan["plan"]["steps"][0]["op"], "filter");
     let recognition = &plan["recognition_evidence"];
-    assert_eq!(recognition["schema_version"], 2);
+    assert_eq!(recognition["schema_version"], 3);
     assert!(recognition["refusal_reason"].is_null());
-    assert_eq!(recognition["row_filter"]["plan_schema_version"], 2);
+    assert_eq!(recognition["row_filter"]["plan_schema_version"], 3);
 
     // No output is materialized; the refusal is visible in the manifest and
     // the output artifact is absent from the artifact index.
@@ -774,7 +781,7 @@ fn mixed_compared_column_refusal_writes_parse_diagnostics() {
         parsed["fields"]["fields"]["mixed"],
         serde_json::json!(["column-1"])
     );
-    assert_eq!(parsed["fields"]["fields"]["schema_version"], 2);
+    assert_eq!(parsed["fields"]["fields"]["schema_version"], 3);
     assert_eq!(
         parsed["fields"]["fields"]["column_evidence"],
         serde_json::json!([{
@@ -784,7 +791,14 @@ fn mixed_compared_column_refusal_writes_parse_diagnostics() {
             "inferred_type": "mixed",
             "decimal_comparison_required": true,
             "verdict": { "status": "mixed", "reason": "malformed_share_exceeded" },
-            "counts": { "rows": 3, "missing": 0, "blank": 0, "valid": 2, "malformed": 1 }
+            "counts": { "rows": 3, "missing": 0, "blank": 0, "valid": 2, "malformed": 1 },
+            "policy_selection": {
+                "neutral": 3,
+                "decided": 0,
+                "undecided": 0,
+                "role_assignments": [],
+                "locked_preference": null
+            }
         }])
     );
 }
@@ -829,12 +843,125 @@ fn text_literal_against_numeric_column_writes_plan_type_mismatch() {
     // The validated plan stays inspectable; nothing is materialized.
     assert!(!run.join("output/result.json").exists());
     let plan = read_artifact(&run, "plan.json");
-    assert_eq!(plan["schema_version"], 4);
-    assert_eq!(plan["plan"]["schema_version"], 2);
+    assert_eq!(plan["schema_version"], 5);
+    assert_eq!(plan["plan"]["schema_version"], 3);
 
     let events_raw = fs::read_to_string(run.join("events.jsonl")).expect("read events");
     assert!(events_raw.contains("compared_columns_parsed"));
     assert!(!events_raw.contains("materialization_completed"));
+}
+
+#[test]
+fn grouped_numeric_policy_is_recorded_in_run_artifacts() {
+    // Epic 008 locked decisions 4–7 and 14: the selected policy, its
+    // evidence, and the resolved literal policy land in the run artifacts.
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = workspace.path().join("income.csv");
+    fs::write(&input, "ID,Annual Income\n1,50000\n2,\"10,000\"\n3,75000\n").expect("write input");
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List rows where Annual Income < 15,000",
+        ])
+        .output()
+        .expect("run baho");
+    assert!(output.status.success(), "{output:?}");
+
+    let run = workspace.path().join(".baho/runs/000001");
+    let plan = read_artifact(&run, "plan.json");
+    assert_eq!(plan["schema_version"], 5);
+    assert_eq!(plan["plan"]["schema_version"], 3);
+    let recognition = &plan["recognition_evidence"];
+    assert_eq!(recognition["schema_version"], 3);
+    let literals = recognition["row_filter"]["literals"].as_array().unwrap();
+    assert_eq!(literals[0]["raw_text"], "15,000");
+    assert_eq!(literals[0]["parser_policy"], "dot_decimal_comma_grouping");
+
+    let events_raw = fs::read_to_string(run.join("events.jsonl")).expect("read events");
+    let events: Vec<Value> = events_raw
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid event JSON"))
+        .collect();
+    let parsed = events
+        .iter()
+        .find(|event| event["event"] == "compared_columns_parsed")
+        .unwrap();
+    let evidence = &parsed["fields"]["fields"]["column_evidence"][0];
+    assert_eq!(evidence["policy"], "dot_decimal_comma_grouping");
+    assert_eq!(evidence["policy_selection"]["locked_preference"], ",");
+    assert_eq!(evidence["policy_selection"]["undecided"], 1);
+}
+
+#[test]
+fn case_insensitive_text_filter_records_text_match_policy_and_raw_provenance() {
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = workspace.path().join("status.csv");
+    fs::write(&input, "ID,Status\n1,Inactive\n2,ACTIVE\n").expect("write input");
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List rows where Status = inactive",
+        ])
+        .output()
+        .expect("run baho");
+    assert!(output.status.success(), "{output:?}");
+
+    let run = workspace.path().join(".baho/runs/000001");
+    let plan = read_artifact(&run, "plan.json");
+    assert_eq!(
+        plan["recognition_evidence"]["row_filter"]["text_match"],
+        "unicode_lowercase"
+    );
+    let result = read_artifact(&run, "output/result.json");
+    let rows = result["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    let values = rows[0]["values"].as_array().unwrap();
+    assert_eq!(values[1]["Text"], "Inactive");
+    let provenance = &result["result"]["provenance"][0];
+    assert_eq!(provenance["source_row"], 1);
+    assert_eq!(
+        provenance["source_addresses"],
+        serde_json::json!([
+            { "sheet_index": 0, "row": 1, "col": 0 },
+            { "sheet_index": 0, "row": 1, "col": 1 }
+        ])
+    );
+}
+
+#[test]
+fn format_ambiguous_column_writes_parse_format_ambiguous_artifact() {
+    let workspace = tempdir().expect("create temporary workspace");
+    let input = workspace.path().join("amount.csv");
+    fs::write(&input, "ID,Amount\n1,\"1,234\"\n2,\"1.234\"\n").expect("write input");
+
+    let output = baho()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            input.to_str().expect("UTF-8 path"),
+            "--prompt",
+            "List rows where Amount < 100",
+        ])
+        .output()
+        .expect("run baho");
+    assert!(!output.status.success(), "expected failure: {output:?}");
+
+    let run = workspace.path().join(".baho/runs/000001");
+    let diagnostics = read_artifact(&run, "diagnostics.json");
+    let codes = artifact_diagnostic_codes(&diagnostics);
+    assert!(
+        codes.contains(&"parse.format_ambiguous"),
+        "expected format_ambiguous diagnostic, got: {codes:?}"
+    );
+    assert!(!run.join("output/result.json").exists());
 }
 
 #[test]
@@ -868,7 +995,7 @@ fn compact_grouped_literal_refuses_with_literal_invalid_in_artifacts() {
     );
 
     let plan = read_artifact(&run, "plan.json");
-    assert_eq!(plan["schema_version"], 4);
+    assert_eq!(plan["schema_version"], 5);
     assert_eq!(
         plan["recognition_evidence"]["refusal_reason"],
         "intent.literal_invalid"
@@ -916,7 +1043,7 @@ fn duplicate_header_row_filter_refuses_with_column_ambiguous() {
     );
 
     let plan = read_artifact(&run, "plan.json");
-    assert_eq!(plan["schema_version"], 4);
+    assert_eq!(plan["schema_version"], 5);
     assert!(
         plan.get("plan").is_none(),
         "refusal must not write a nested plan"

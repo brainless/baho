@@ -11,6 +11,7 @@ pub mod dialect;
 pub mod header;
 pub mod importer;
 pub mod inspector;
+pub mod policy_selection;
 pub mod row_features;
 pub mod typed_values;
 
@@ -23,11 +24,15 @@ pub use importer::{CsvImporter, SelectedRegion, SelectedRegionError, read_select
 pub use inspector::{
     InspectionResult, LogicalRecord, MalformedRecord, inspect_csv, inspect_csv_with_config,
 };
+pub use policy_selection::{
+    PolicyAmbiguityReason, PolicySelection, PolicySelectionEvidence, PolicySelectionOutcome,
+    PolicySelectionRefused, select_numeric_policy,
+};
 pub use row_features::{
     ColumnShape, RowFeatures, compute_row_features, compute_row_features_with_config,
 };
 pub use typed_values::{
     ColumnParseCounts, ComparedColumnParse, MAX_MALFORMED_SAMPLE_CELLS,
     MIXED_COLUMN_MALFORMED_SHARE_PERCENT, MalformedValuesEvidence, MixedRefusalReason,
-    ParseVerdict, parse_compared_column,
+    ParseVerdict, parse_compared_column, parse_compared_column_selecting_policy,
 };

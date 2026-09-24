@@ -7,7 +7,7 @@ use baho_plan::evidence::{
     RowFilterEvidence,
 };
 use baho_plan::plan::{
-    ComparisonOperator, DistinctKeep, Expression, Literal, PLAN_SCHEMA_VERSION_2, Plan, PlanSource,
+    ComparisonOperator, DistinctKeep, Expression, Literal, PLAN_SCHEMA_VERSION_3, Plan, PlanSource,
     PlanStep,
 };
 use baho_plan::validation::{MAX_PREDICATE_DEPTH, MAX_PREDICATE_NODES};
@@ -658,8 +658,10 @@ pub fn recognize_request(
 /// Compile a recognized request into a plan.
 ///
 /// Retrieval requests compile to version 1 plans exactly as before; row
-/// filters compile to a version 2 plan with a single filter step that
-/// retains every source column in source order.
+/// filters compile to a version 3 plan with a single filter step that
+/// retains every source column in source order. Deferred numeric literals
+/// must already be resolved (Epic 008 locked decision 7); structural
+/// validation rejects any that remain.
 pub fn compile_request_to_plan(
     request: &RecognizedRequest,
     source_revision: &str,
@@ -670,7 +672,7 @@ pub fn compile_request_to_plan(
             compile_intent_to_plan(intent, source_revision, table_id)
         }
         RecognizedRequest::RowFilter(intent) => Plan {
-            schema_version: PLAN_SCHEMA_VERSION_2,
+            schema_version: PLAN_SCHEMA_VERSION_3,
             source: PlanSource {
                 revision: source_revision.to_string(),
                 table_id: table_id.to_string(),
@@ -679,6 +681,127 @@ pub fn compile_request_to_plan(
                 predicate: intent.predicate.clone(),
             }],
         },
+    }
+}
+
+/// Why deferred numeric literal resolution failed (Epic 008 locked decision 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferredLiteralError {
+    /// The bound column has no unique numeric interpretation
+    /// (`parse.format_ambiguous`).
+    FormatAmbiguous { column_id: String },
+    /// The literal cannot be interpreted under the resolved context
+    /// (`intent.literal_invalid`).
+    LiteralInvalid { detail: String },
+}
+
+/// Resolve deferred numeric literals on a row filter (Epic 008 locked
+/// decisions 7–8).
+///
+/// `policy_for_column` returns the selected policy for a compared column, or
+/// [`DeferredLiteralError::FormatAmbiguous`] when policy selection refuses and
+/// [`DeferredLiteralError::LiteralInvalid`] when the column cannot back a
+/// numeric comparison. The predicate and its recognition evidence are updated
+/// in place; resolved literals record the parser policy used.
+pub fn resolve_deferred_literals<F>(
+    intent: &mut RowFilterIntent,
+    mut policy_for_column: F,
+) -> Result<(), DeferredLiteralError>
+where
+    F: FnMut(&str) -> Result<NumericParsePolicy, DeferredLiteralError>,
+{
+    let mut deferred: Vec<(String, String)> = Vec::new();
+    collect_deferred_literals(&intent.predicate, &mut deferred);
+    if deferred.is_empty() {
+        return Ok(());
+    }
+    let mut policies: Vec<(String, NumericParsePolicy)> = Vec::new();
+    for (column_id, _) in &deferred {
+        if policies.iter().any(|(known, _)| known == column_id) {
+            continue;
+        }
+        let policy = policy_for_column(column_id)?;
+        policies.push((column_id.clone(), policy));
+    }
+    for (column_id, raw) in &deferred {
+        let policy = policies
+            .iter()
+            .find(|(known, _)| known == column_id)
+            .map(|(_, policy)| *policy)
+            .expect("policy selected for every deferred column");
+        let value = policy.parse_decimal(raw).map_err(|error| {
+            DeferredLiteralError::LiteralInvalid {
+                detail: format!(
+                    "numeric literal '{raw}' is invalid under column '{column_id}' policy {policy:?}: {error}"
+                ),
+            }
+        })?;
+        replace_deferred_literal(&mut intent.predicate, column_id, raw, value);
+    }
+    if let Some(row_filter) = intent.evidence.row_filter.as_mut() {
+        for entry in &mut row_filter.literals {
+            if let Literal::Deferred(raw) = &entry.literal {
+                let policy = policies
+                    .iter()
+                    .find(|(known, _)| {
+                        deferred
+                            .iter()
+                            .any(|(column, deferred_raw)| deferred_raw == raw && column == known)
+                    })
+                    .map(|(_, policy)| *policy);
+                if let Some(policy) = policy {
+                    if let Ok(value) = policy.parse_decimal(raw) {
+                        entry.literal = Literal::Decimal(value);
+                        entry.parser_policy = Some(policy);
+                    }
+                }
+            }
+        }
+        row_filter.predicate = Some(intent.predicate.clone());
+    }
+    Ok(())
+}
+
+fn collect_deferred_literals(expression: &Expression, out: &mut Vec<(String, String)>) {
+    match expression {
+        Expression::Compare {
+            column,
+            literal: Literal::Deferred(raw),
+            ..
+        } => out.push((column.clone(), raw.clone())),
+        Expression::Compare { .. } | Expression::IsNotBlank { .. } => {}
+        Expression::And { predicates } | Expression::Or { predicates } => {
+            for predicate in predicates {
+                collect_deferred_literals(predicate, out);
+            }
+        }
+        Expression::Not { predicate } => collect_deferred_literals(predicate, out),
+    }
+}
+
+fn replace_deferred_literal(
+    expression: &mut Expression,
+    column_id: &str,
+    raw: &str,
+    value: baho_model::ExactDecimal,
+) {
+    match expression {
+        Expression::Compare {
+            column, literal, ..
+        } => {
+            if column == column_id
+                && matches!(literal, Literal::Deferred(existing) if existing == raw)
+            {
+                *literal = Literal::Decimal(value);
+            }
+        }
+        Expression::IsNotBlank { .. } => {}
+        Expression::And { predicates } | Expression::Or { predicates } => {
+            for predicate in predicates {
+                replace_deferred_literal(predicate, column_id, raw, value);
+            }
+        }
+        Expression::Not { predicate } => replace_deferred_literal(predicate, column_id, raw, value),
     }
 }
 
@@ -789,6 +912,34 @@ fn is_numeric_shaped(text: &str) -> bool {
         }
     }
     has_digit
+}
+
+/// Whether a numeric-shaped token that fails strict parsing can be deferred
+/// for policy-aware resolution (Epic 008 locked decision 7).
+///
+/// Format-shaped means only digits, an optional sign, and `.`/`,` separators
+/// with at least one separator, and the token parses under at least one
+/// grouping policy. `10,000` and `1,23` defer; `1e5` and `1.2.3` are invalid
+/// under every policy and still refuse at recognition.
+fn deferrable_numeric_literal(text: &str) -> bool {
+    let mut has_digit = false;
+    let mut has_separator = false;
+    for byte in text.bytes() {
+        match byte {
+            b'0'..=b'9' => has_digit = true,
+            b'+' | b'-' => {}
+            b'.' | b',' => has_separator = true,
+            _ => return false,
+        }
+    }
+    has_digit
+        && has_separator
+        && (NumericParsePolicy::DotDecimalCommaGrouping
+            .parse_decimal(text)
+            .is_ok()
+            || NumericParsePolicy::CommaDecimalDotGrouping
+                .parse_decimal(text)
+                .is_ok())
 }
 
 fn is_boundary_token(word: &PromptWord) -> bool {
@@ -1183,10 +1334,11 @@ impl<'a> RowFilterParser<'a> {
     /// next Boolean connector, parenthesis, or comparison operator. With the
     /// explicit comparison forms an unquoted single token that is
     /// numeric-shaped (see [`is_numeric_shaped`]) must be a strict exact
-    /// decimal, so `10,000`, `1.2.3`, or `1e5` refuse as invalid literals while
-    /// `covid19` or `5th` remain text. The implicit-equality form is sugar for
-    /// `=` with a quoted text literal, so it never produces decimals or literal
-    /// refusals.
+    /// decimal or a deferrable format-shaped numeric (Epic 008 locked decision
+    /// 7). `10,000` defers for policy-aware resolution while `1e5` and
+    /// `1.2.3` refuse as invalid literals; `covid19` or `5th` remain text. The
+    /// implicit-equality form is sugar for `=` with a quoted text literal, so
+    /// it never produces decimals, deferred numerics, or literal refusals.
     fn parse_literal(&mut self, force_text: bool) -> Result<Literal, Bail> {
         let start = self.pos;
         if start >= self.words.len() {
@@ -1228,9 +1380,15 @@ impl<'a> RowFilterParser<'a> {
                     Some(NumericParsePolicy::StrictDecimal),
                 ),
                 Err(error) => {
-                    return Err(Bail::LiteralInvalid {
-                        detail: format!("decimal literal '{raw_text}': {error}"),
-                    });
+                    if deferrable_numeric_literal(&first.raw) {
+                        // Format-shaped numerics defer until the bound
+                        // column's policy is selected (locked decision 7).
+                        (Literal::Deferred(first.raw.clone()), None)
+                    } else {
+                        return Err(Bail::LiteralInvalid {
+                            detail: format!("decimal literal '{raw_text}': {error}"),
+                        });
+                    }
                 }
             }
         } else {
@@ -1755,7 +1913,8 @@ fn row_filter_intent_from_state(
             literals,
             parentheses,
             predicate: Some(predicate.clone()),
-            plan_schema_version: PLAN_SCHEMA_VERSION_2,
+            plan_schema_version: RowFilterEvidence::PLAN_SCHEMA_VERSION,
+            text_match: RowFilterEvidence::TEXT_MATCH,
         }),
     };
     RowFilterIntent {
@@ -1903,7 +2062,7 @@ fn intent_error_from_bail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use baho_model::ExactDecimal;
+    use baho_model::{ExactDecimal, TextMatchPolicy};
     use baho_plan::plan::PLAN_SCHEMA_VERSION_1;
     use baho_plan::validation::{validate_plan_references, validate_plan_structure};
 
@@ -2928,12 +3087,13 @@ mod tests {
                     ],
                 }),
                 plan_schema_version: RowFilterEvidence::PLAN_SCHEMA_VERSION,
+                text_match: RowFilterEvidence::TEXT_MATCH,
             }),
         }
     }
 
     #[test]
-    fn canonical_row_filter_prompt_compiles_to_version_2_plan() {
+    fn canonical_row_filter_prompt_compiles_to_version_3_plan() {
         let cols = job_columns();
         let request = recognize_request(
             "List rows where Job = unemployed or Annual Income < 10000",
@@ -2962,7 +3122,7 @@ mod tests {
         assert_eq!(intent.evidence, canonical_row_filter_expected_evidence());
 
         let plan = compile_request_to_plan(&request, "rev-1", "table-0");
-        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_2);
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_3);
         assert_eq!(
             plan.steps,
             vec![PlanStep::Filter {
@@ -2981,6 +3141,23 @@ mod tests {
                 .any(|step| matches!(step, PlanStep::Select { .. })),
             "row filter retains all columns and needs no select step"
         );
+    }
+
+    #[test]
+    fn row_filter_compilation_emits_version_3_and_retrieval_stays_version_1() {
+        let cols = job_columns();
+        let request = recognize_request("List rows where Job = unemployed", &cols)
+            .unwrap_or_else(|e| panic!("expected a row filter, got {e:?}"));
+        let plan = compile_request_to_plan(&request, "rev-1", "table-0");
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_3);
+        assert_eq!(plan.text_match_policy(), TextMatchPolicy::UnicodeLowercase);
+
+        let income_cols = income_time_columns();
+        let request = recognize_request("List income", &income_cols)
+            .unwrap_or_else(|e| panic!("expected a retrieval, got {e:?}"));
+        let plan = compile_request_to_plan(&request, "rev-1", "table-0");
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION_1);
+        assert_eq!(plan.text_match_policy(), TextMatchPolicy::Exact);
     }
 
     #[test]
@@ -3402,10 +3579,11 @@ mod tests {
     #[test]
     fn grouped_numeric_literals_refuse_as_invalid() {
         let cols = job_columns();
+        // `10,000` defers for policy resolution (covered separately); only
+        // structurally invalid numerics refuse at recognition.
         for prompt in [
-            "List rows where Annual Income < 10,000",
-            "List rows where Job = 10,000",
             "List rows where Annual Income < 1.2.3",
+            "List rows where Annual Income < 1e5",
         ] {
             let err = expect_row_filter(recognize_request(prompt, &cols)).unwrap_err();
             assert!(
@@ -3466,10 +3644,12 @@ mod tests {
     #[test]
     fn numeric_shaped_invalid_literals_refuse_as_invalid() {
         let cols = job_columns();
+        // Structurally invalid numerics are not deferrable under any policy
+        // (Epic 008 locked decision 7) and still refuse at recognition.
         for prompt in [
-            "List rows where Job = 10,000",
             "List rows where Job = 1.2.3",
             "List rows where Job = 1e5",
+            "List rows where Job = 1,234,5",
         ] {
             let err = expect_row_filter(recognize_request(prompt, &cols)).unwrap_err();
             assert!(
@@ -3481,6 +3661,34 @@ mod tests {
                 "intent.literal_invalid",
                 "prompt {prompt}"
             );
+        }
+    }
+
+    #[test]
+    fn grouped_numeric_literals_defer_for_policy_resolution() {
+        let cols = job_columns();
+        for (prompt, raw) in [
+            ("List rows where Job = 10,000", "10,000"),
+            ("List rows where Annual Income < 1,234.5", "1,234.5"),
+        ] {
+            let intent = expect_row_filter_ok(recognize_request(prompt, &cols));
+            assert!(
+                matches!(
+                    &intent.predicate,
+                    Expression::Compare {
+                        literal: Literal::Deferred(deferred),
+                        ..
+                    } if deferred == raw
+                ),
+                "prompt {prompt} must defer {raw}, got {:?}",
+                intent.predicate
+            );
+            let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+            assert_eq!(
+                row_filter.literals[0].literal,
+                Literal::Deferred(raw.to_string())
+            );
+            assert_eq!(row_filter.literals[0].parser_policy, None);
         }
     }
 
@@ -3681,20 +3889,90 @@ mod tests {
     }
 
     #[test]
-    fn compact_grouped_literal_refuses_as_literal_invalid() {
+    fn compact_grouped_literal_defers_for_policy_resolution() {
+        // The compact explicit-`=` form produces a numeric literal, not
+        // implicit-equality text, so a format-shaped numeric defers rather
+        // than refusing at recognition (Epic 008 locked decision 7).
         let cols = job_columns();
-        let err = expect_row_filter(recognize_request("List job = 10,000", &cols)).unwrap_err();
+        let intent = expect_row_filter_ok(recognize_request("List job = 10,000", &cols));
         assert!(
-            matches!(err, IntentError::LiteralInvalid { .. }),
-            "expected LiteralInvalid, got {err:?}"
+            matches!(
+                &intent.predicate,
+                Expression::Compare {
+                    literal: Literal::Deferred(raw),
+                    ..
+                } if raw == "10,000"
+            ),
+            "got {:?}",
+            intent.predicate
         );
-        assert_eq!(refusal_reason_of(&err), "intent.literal_invalid");
-        let IntentError::LiteralInvalid { evidence, .. } = err else {
-            unreachable!()
-        };
-        let evidence = evidence.expect("literal refusal must carry evidence");
-        assert!(evidence.competing_parses.is_empty());
-        assert!(evidence.row_filter.is_none());
+    }
+
+    #[test]
+    fn resolve_deferred_literals_uses_the_selected_column_policy() {
+        let cols = job_columns();
+        let mut intent = expect_row_filter_ok(recognize_request(
+            "List rows where Annual Income < 10,000",
+            &cols,
+        ));
+        resolve_deferred_literals(&mut intent, |_| {
+            Ok(NumericParsePolicy::DotDecimalCommaGrouping)
+        })
+        .expect("10,000 resolves under the grouping policy");
+        assert_eq!(
+            intent.predicate,
+            Expression::Compare {
+                column: "column-1".to_string(),
+                operator: ComparisonOperator::Less,
+                literal: Literal::Decimal(dec("10000")),
+            }
+        );
+        let row_filter = intent.evidence.row_filter.as_ref().unwrap();
+        assert_eq!(
+            row_filter.literals[0].literal,
+            Literal::Decimal(dec("10000"))
+        );
+        assert_eq!(
+            row_filter.literals[0].parser_policy,
+            Some(NumericParsePolicy::DotDecimalCommaGrouping)
+        );
+    }
+
+    #[test]
+    fn resolve_deferred_literals_refuses_under_a_strict_column_policy() {
+        let cols = job_columns();
+        let mut intent = expect_row_filter_ok(recognize_request(
+            "List rows where Annual Income < 10,000",
+            &cols,
+        ));
+        let error =
+            resolve_deferred_literals(&mut intent, |_| Ok(NumericParsePolicy::StrictDecimal))
+                .unwrap_err();
+        assert!(
+            matches!(error, DeferredLiteralError::LiteralInvalid { .. }),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_deferred_literals_surfaces_format_ambiguity() {
+        let cols = job_columns();
+        let mut intent = expect_row_filter_ok(recognize_request(
+            "List rows where Annual Income < 10,000",
+            &cols,
+        ));
+        let error = resolve_deferred_literals(&mut intent, |_| {
+            Err(DeferredLiteralError::FormatAmbiguous {
+                column_id: "column-1".to_string(),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            DeferredLiteralError::FormatAmbiguous {
+                column_id: "column-1".to_string()
+            }
+        );
     }
 
     #[test]

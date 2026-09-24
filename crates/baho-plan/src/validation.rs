@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::plan::{
-    ComparisonOperator, Expression, Literal, PLAN_SCHEMA_VERSION_1, PLAN_SCHEMA_VERSION_2, Plan,
-    PlanStep,
+    ComparisonOperator, Expression, Literal, PLAN_SCHEMA_VERSION_1, PLAN_SCHEMA_VERSION_2,
+    PLAN_SCHEMA_VERSION_3, Plan, PlanStep,
 };
 
 /// Maximum predicate depth accepted by structural validation (locked
@@ -50,6 +50,9 @@ pub enum PlanValidationError {
 
     #[error("excessive expression depth or size: {detail}")]
     ExpressionLimitExceeded { detail: String },
+
+    #[error("unresolved deferred literal: {detail}")]
+    UnresolvedLiteral { detail: String },
 }
 
 impl PlanValidationError {
@@ -69,13 +72,14 @@ impl PlanValidationError {
 /// Validates the structural well-formedness of a plan without reference to a
 /// specific table schema.
 ///
-/// Version 1 plans may contain only `is_not_blank` expressions. Version 2
-/// recursively validates predicate structure, column references, Boolean
+/// Version 1 plans may contain only `is_not_blank` expressions. Versions 2
+/// and 3 recursively validate predicate structure, column references, Boolean
 /// operand lists, depth and node limits, and comparison/literal type
-/// compatibility.
+/// compatibility. Version 3 allows the same expression set as version 2; it
+/// only changes text `=`/`!=` comparison semantics at execution time.
 pub fn validate_plan_structure(plan: &Plan) -> Result<(), PlanValidationError> {
     match plan.schema_version {
-        PLAN_SCHEMA_VERSION_1 | PLAN_SCHEMA_VERSION_2 => {}
+        PLAN_SCHEMA_VERSION_1 | PLAN_SCHEMA_VERSION_2 | PLAN_SCHEMA_VERSION_3 => {}
         version => {
             return Err(PlanValidationError::UnsupportedSchemaVersion { version });
         }
@@ -198,12 +202,21 @@ fn check_nonempty_column(column: &str) -> Result<(), PlanValidationError> {
 
 /// Type-checks one comparison as far as structure allows: ordered comparisons
 /// require a decimal literal, while `=` and `!=` accept text or decimal.
-/// Column-type compatibility is checked later against the selected table.
+/// Deferred literals must be resolved before compilation (Epic 008 locked
+/// decision 7) and are never valid in a persisted plan. Column-type
+/// compatibility is checked later against the selected table.
 fn check_comparison_types(
     column: &str,
     operator: ComparisonOperator,
     literal: &Literal,
 ) -> Result<(), PlanValidationError> {
+    if let Literal::Deferred(raw) = literal {
+        return Err(PlanValidationError::UnresolvedLiteral {
+            detail: format!(
+                "column '{column}' still carries deferred numeric literal '{raw}'; resolve it under the column's parse policy before compilation"
+            ),
+        });
+    }
     if operator.is_ordered() && !matches!(literal, Literal::Decimal(_)) {
         return Err(PlanValidationError::TypeMismatch {
             detail: format!(
@@ -357,7 +370,7 @@ mod tests {
 
     #[test]
     fn reject_unsupported_schema_version() {
-        for version in [0, 3, 4, u32::MAX] {
+        for version in [0, 4, 5, u32::MAX] {
             let mut plan = valid_plan();
             plan.schema_version = version;
             let err = validate_plan_structure(&plan).unwrap_err();
@@ -366,6 +379,31 @@ mod tests {
                 PlanValidationError::UnsupportedSchemaVersion { version: v } if v == version
             ));
         }
+    }
+
+    #[test]
+    fn accept_schema_version_3_with_version_2_expressions() {
+        let mut plan = valid_plan();
+        plan.schema_version = PLAN_SCHEMA_VERSION_3;
+        assert!(validate_plan_structure(&plan).is_ok());
+
+        let predicate = or(vec![
+            compare(
+                "column-0",
+                ComparisonOperator::Equal,
+                Literal::Text("unemployed".to_string()),
+            ),
+            not(and(vec![
+                leaf("column-1"),
+                compare(
+                    "column-1",
+                    ComparisonOperator::Less,
+                    Literal::Decimal(dec("10000")),
+                ),
+            ])),
+        ]);
+        let plan = filter_plan(PLAN_SCHEMA_VERSION_3, predicate);
+        assert!(validate_plan_structure(&plan).is_ok());
     }
 
     #[test]
@@ -579,6 +617,29 @@ mod tests {
             let err = validate_plan_structure(&filter_plan(2, predicate)).unwrap_err();
             assert!(matches!(err, PlanValidationError::TypeMismatch { .. }));
             assert_eq!(err.diagnostic_code(), "plan.type_mismatch");
+        }
+    }
+
+    #[test]
+    fn reject_unresolved_deferred_literals_in_persisted_plans() {
+        // Epic 008 locked decision 7: deferred numerics must be resolved
+        // before compilation and are never valid in a persisted plan.
+        for operator in [
+            ComparisonOperator::Equal,
+            ComparisonOperator::NotEqual,
+            ComparisonOperator::Less,
+        ] {
+            let predicate = compare(
+                "column-1",
+                operator,
+                Literal::Deferred("10,000".to_string()),
+            );
+            let err = validate_plan_structure(&filter_plan(3, predicate)).unwrap_err();
+            assert!(
+                matches!(err, PlanValidationError::UnresolvedLiteral { .. }),
+                "got {err:?}"
+            );
+            assert_eq!(err.diagnostic_code(), "plan.invalid");
         }
     }
 

@@ -44,12 +44,20 @@ pub enum InferredColumnType {
 }
 
 /// Policy that produced a column's parsed values.
+///
+/// Epic 008 locked decision 4: the two grouping variants cover the two common
+/// separator conventions; [`NumericParsePolicy::StrictDecimal`] keeps the
+/// Epic 006 grammar unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NumericParsePolicy {
     /// Accept only the exact decimal literal grammar: optional sign, ASCII
     /// digits, and an optional `.` fractional part. Refuse everything else.
     StrictDecimal,
+    /// `.` marks decimals and `,` groups thousands: `1,234.56`.
+    DotDecimalCommaGrouping,
+    /// `,` marks decimals and `.` groups thousands: `1.234,56`.
+    CommaDecimalDotGrouping,
 }
 
 impl NumericParsePolicy {
@@ -57,6 +65,57 @@ impl NumericParsePolicy {
     pub fn parse_decimal(&self, text: &str) -> Result<ExactDecimal, DecimalParseError> {
         match self {
             NumericParsePolicy::StrictDecimal => ExactDecimal::parse(text),
+            NumericParsePolicy::DotDecimalCommaGrouping => {
+                crate::decimal::parse_grouped_decimal(text, '.', ',')
+            }
+            NumericParsePolicy::CommaDecimalDotGrouping => {
+                crate::decimal::parse_grouped_decimal(text, ',', '.')
+            }
+        }
+    }
+
+    /// The decimal mark of this policy, if it has a fixed one.
+    pub fn decimal_mark(self) -> Option<char> {
+        match self {
+            // StrictDecimal accepts `.` as the only fractional mark but has
+            // no grouping mark; callers that only need the mark can use `'.'`.
+            NumericParsePolicy::StrictDecimal => Some('.'),
+            NumericParsePolicy::DotDecimalCommaGrouping => Some('.'),
+            NumericParsePolicy::CommaDecimalDotGrouping => Some(','),
+        }
+    }
+
+    /// The grouping mark of this policy, when grouping is accepted.
+    pub fn group_mark(self) -> Option<char> {
+        match self {
+            NumericParsePolicy::StrictDecimal => None,
+            NumericParsePolicy::DotDecimalCommaGrouping => Some(','),
+            NumericParsePolicy::CommaDecimalDotGrouping => Some('.'),
+        }
+    }
+
+    /// Build the policy implied by a decimal mark and an optional grouping mark.
+    ///
+    /// `('.', None)` is [`NumericParsePolicy::StrictDecimal`]; a comma decimal
+    /// mark always selects [`NumericParsePolicy::CommaDecimalDotGrouping`]
+    /// even when no grouping mark is evidenced. Anything else is refused.
+    pub fn from_marks(decimal_mark: char, group_mark: Option<char>) -> Option<Self> {
+        match (decimal_mark, group_mark) {
+            ('.', None) => Some(NumericParsePolicy::StrictDecimal),
+            ('.', Some(',')) => Some(NumericParsePolicy::DotDecimalCommaGrouping),
+            (',', None) | (',', Some('.')) => Some(NumericParsePolicy::CommaDecimalDotGrouping),
+            _ => None,
+        }
+    }
+
+    /// Build the policy implied by a grouping mark alone (locked decision 6
+    /// grouping preference): comma grouping means a dot decimal mark, and dot
+    /// grouping means a comma decimal mark.
+    pub fn from_grouping_mark(group_mark: char) -> Option<Self> {
+        match group_mark {
+            ',' => Some(NumericParsePolicy::DotDecimalCommaGrouping),
+            '.' => Some(NumericParsePolicy::CommaDecimalDotGrouping),
+            _ => None,
         }
     }
 }
@@ -162,6 +221,30 @@ mod tests {
     }
 
     #[test]
+    fn numeric_parse_policy_serializes_grouping_variants() {
+        assert_eq!(
+            serde_json::to_value(NumericParsePolicy::DotDecimalCommaGrouping).unwrap(),
+            serde_json::json!("dot_decimal_comma_grouping")
+        );
+        assert_eq!(
+            serde_json::to_value(NumericParsePolicy::CommaDecimalDotGrouping).unwrap(),
+            serde_json::json!("comma_decimal_dot_grouping")
+        );
+        for name in [
+            "strict_decimal",
+            "dot_decimal_comma_grouping",
+            "comma_decimal_dot_grouping",
+        ] {
+            let back: NumericParsePolicy = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+            assert_eq!(
+                serde_json::to_value(back).unwrap(),
+                serde_json::json!(name),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn strict_decimal_policy_parses_and_refuses_literals() {
         let policy = NumericParsePolicy::StrictDecimal;
         assert_eq!(
@@ -172,6 +255,147 @@ mod tests {
             policy.parse_decimal("10,000"),
             Err(DecimalParseError::InvalidCharacter)
         );
+    }
+
+    #[test]
+    fn grouping_policies_parse_comma_and_dot_formats_exactly() {
+        use crate::decimal::ExactDecimal as Dec;
+        let us = NumericParsePolicy::DotDecimalCommaGrouping;
+        let eu = NumericParsePolicy::CommaDecimalDotGrouping;
+        assert_eq!(
+            us.parse_decimal("1,234.56").unwrap(),
+            Dec::parse("1234.56").unwrap()
+        );
+        assert_eq!(
+            eu.parse_decimal("1.234,56").unwrap(),
+            Dec::parse("1234.56").unwrap()
+        );
+        assert_eq!(
+            us.parse_decimal("10,000").unwrap(),
+            Dec::parse("10000").unwrap()
+        );
+        assert_eq!(
+            eu.parse_decimal("1.234").unwrap(),
+            Dec::parse("1234").unwrap()
+        );
+        assert_eq!(us.parse_decimal("2.5").unwrap(), Dec::parse("2.5").unwrap());
+        assert_eq!(eu.parse_decimal("2,5").unwrap(), Dec::parse("2.5").unwrap());
+        assert_eq!(
+            us.parse_decimal("-1,234.50").unwrap(),
+            Dec::parse("-1234.5").unwrap()
+        );
+        assert_eq!(
+            us.parse_decimal("1,234,567").unwrap(),
+            Dec::parse("1234567").unwrap()
+        );
+        assert_eq!(
+            eu.parse_decimal("1.234.567").unwrap(),
+            Dec::parse("1234567").unwrap()
+        );
+    }
+
+    #[test]
+    fn grouping_policies_refuse_invalid_grouping_and_wrong_roles() {
+        let us = NumericParsePolicy::DotDecimalCommaGrouping;
+        let eu = NumericParsePolicy::CommaDecimalDotGrouping;
+        assert_eq!(
+            us.parse_decimal("1,23"),
+            Err(DecimalParseError::InvalidGrouping)
+        );
+        assert_eq!(
+            eu.parse_decimal("1.23"),
+            Err(DecimalParseError::InvalidGrouping)
+        );
+        // `2.5` under the EU policy uses `.` as a grouping mark with a
+        // 1-digit group, so it is wrong-role there and only parses as a
+        // decimal under strict and US policies.
+        assert_eq!(
+            eu.parse_decimal("2.5"),
+            Err(DecimalParseError::InvalidGrouping)
+        );
+        assert_eq!(
+            us.parse_decimal("2.5").unwrap(),
+            ExactDecimal::parse("2.5").unwrap()
+        );
+        assert_eq!(
+            us.parse_decimal("1.2.3"),
+            Err(DecimalParseError::MultipleDecimalPoints)
+        );
+        assert_eq!(
+            eu.parse_decimal("1.2.3"),
+            Err(DecimalParseError::InvalidGrouping)
+        );
+        assert_eq!(
+            us.parse_decimal("1e5"),
+            Err(DecimalParseError::InvalidCharacter)
+        );
+        assert_eq!(
+            eu.parse_decimal("1e5"),
+            Err(DecimalParseError::InvalidCharacter)
+        );
+        assert_eq!(
+            us.parse_decimal("1.234,56"),
+            Err(DecimalParseError::InvalidGrouping)
+        );
+        assert_eq!(
+            eu.parse_decimal("1,234.56"),
+            Err(DecimalParseError::InvalidGrouping)
+        );
+        assert_eq!(
+            us.parse_decimal("1,"),
+            Err(DecimalParseError::InvalidGrouping)
+        );
+        assert_eq!(
+            us.parse_decimal(",234"),
+            Err(DecimalParseError::InvalidGrouping)
+        );
+        assert_eq!(
+            us.parse_decimal("1234,567"),
+            Err(DecimalParseError::InvalidGrouping)
+        );
+        assert_eq!(
+            NumericParsePolicy::StrictDecimal.parse_decimal("1,234.56"),
+            Err(DecimalParseError::InvalidCharacter)
+        );
+    }
+
+    #[test]
+    fn policy_mark_helpers_cover_locked_decisions() {
+        assert_eq!(NumericParsePolicy::StrictDecimal.group_mark(), None);
+        assert_eq!(
+            NumericParsePolicy::DotDecimalCommaGrouping.group_mark(),
+            Some(',')
+        );
+        assert_eq!(
+            NumericParsePolicy::CommaDecimalDotGrouping.group_mark(),
+            Some('.')
+        );
+        assert_eq!(
+            NumericParsePolicy::from_marks('.', None),
+            Some(NumericParsePolicy::StrictDecimal)
+        );
+        assert_eq!(
+            NumericParsePolicy::from_marks('.', Some(',')),
+            Some(NumericParsePolicy::DotDecimalCommaGrouping)
+        );
+        assert_eq!(
+            NumericParsePolicy::from_marks(',', None),
+            Some(NumericParsePolicy::CommaDecimalDotGrouping)
+        );
+        assert_eq!(
+            NumericParsePolicy::from_marks(',', Some('.')),
+            Some(NumericParsePolicy::CommaDecimalDotGrouping)
+        );
+        assert_eq!(NumericParsePolicy::from_marks('.', Some('.')), None);
+        assert_eq!(
+            NumericParsePolicy::from_grouping_mark(','),
+            Some(NumericParsePolicy::DotDecimalCommaGrouping)
+        );
+        assert_eq!(
+            NumericParsePolicy::from_grouping_mark('.'),
+            Some(NumericParsePolicy::CommaDecimalDotGrouping)
+        );
+        assert_eq!(NumericParsePolicy::from_grouping_mark('x'), None);
     }
 
     #[test]
