@@ -7,7 +7,7 @@ use akar_components::{
     data_grid_body_end, data_grid_cell, data_grid_end, data_grid_handle_keyboard,
     data_grid_header_begin, data_grid_header_cell, data_grid_header_end,
 };
-use akar_core::AkarCore;
+use akar_core::{AkarCore, QuadCall, Z_BASE};
 use akar_layout::{
     Dimension, Display, FlexDirection, Layout, NodeId, PageConfig, PageLayout, Size, Style, length,
 };
@@ -62,6 +62,7 @@ struct AppState {
     prompt_node: NodeId,
     submit_node: NodeId,
     status_node: NodeId,
+    grid_container_node: NodeId,
     grid_node: NodeId,
     grid_state: DataGridState,
     selection: SelectionState,
@@ -71,12 +72,16 @@ struct AppState {
 }
 
 const SIDEBAR_WIDTH: f32 = 280.0;
+const GRID_OUTER_MARGIN: f32 = 12.0;
+const GRID_CONTAINER_PADDING: f32 = 8.0;
+const GRID_CONTAINER_RADIUS: f32 = 10.0;
 
 struct AppLayout {
     page: PageLayout,
     prompt: NodeId,
     submit: NodeId,
     status: NodeId,
+    grid_container: NodeId,
     grid: NodeId,
 }
 
@@ -132,6 +137,29 @@ fn build_app_layout(layout: &mut Layout) -> AppLayout {
     });
     layout.set_children(sidebar, &[prompt, submit, status]);
 
+    layout.set_padding(
+        page.main,
+        GRID_OUTER_MARGIN,
+        GRID_OUTER_MARGIN,
+        GRID_OUTER_MARGIN,
+        GRID_OUTER_MARGIN,
+    );
+    let grid_container = layout.new_leaf(Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        size: Size {
+            width: Dimension::percent(1.0),
+            height: Dimension::percent(1.0),
+        },
+        ..Default::default()
+    });
+    layout.set_padding(
+        grid_container,
+        GRID_CONTAINER_PADDING,
+        GRID_CONTAINER_PADDING,
+        GRID_CONTAINER_PADDING,
+        GRID_CONTAINER_PADDING,
+    );
     let grid = layout.new_leaf(Style {
         size: Size {
             width: Dimension::percent(1.0),
@@ -139,12 +167,14 @@ fn build_app_layout(layout: &mut Layout) -> AppLayout {
         },
         ..Default::default()
     });
-    layout.set_children(page.main, &[grid]);
+    layout.set_children(grid_container, &[grid]);
+    layout.set_children(page.main, &[grid_container]);
     for (name, node) in [
         ("sidebar", sidebar),
         ("prompt", prompt),
         ("submit", submit),
         ("status", status),
+        ("grid_container", grid_container),
         ("grid", grid),
     ] {
         layout.register_label(name, node);
@@ -154,7 +184,33 @@ fn build_app_layout(layout: &mut Layout) -> AppLayout {
         prompt,
         submit,
         status,
+        grid_container,
         grid,
+    }
+}
+
+fn theme_color(color: u32) -> [f32; 4] {
+    [
+        ((color >> 24) & 0xff) as f32 / 255.0,
+        ((color >> 16) & 0xff) as f32 / 255.0,
+        ((color >> 8) & 0xff) as f32 / 255.0,
+        (color & 0xff) as f32 / 255.0,
+    ]
+}
+
+fn grid_container_quad(rect: [f32; 4]) -> QuadCall {
+    QuadCall {
+        rect,
+        fill: theme_color(AKAR_THEME_DARK.base_200),
+        border_color: theme_color(AKAR_THEME_DARK.base_300),
+        corner_radii: [GRID_CONTAINER_RADIUS; 4],
+        border_width: 1.0,
+        z: Z_BASE,
+        shadow_blur: 0.0,
+        shadow_spread: 0.0,
+        shadow_color: [0.0; 4],
+        shadow_offset: [0.0; 2],
+        _pad: [0.0; 2],
     }
 }
 
@@ -416,6 +472,7 @@ impl ApplicationHandler for App {
             prompt_node: app_layout.prompt,
             submit_node: app_layout.submit,
             status_node: app_layout.status,
+            grid_container_node: app_layout.grid_container,
             grid_node: app_layout.grid,
             grid_state: DataGridState::new(),
             selection: SelectionState::default(),
@@ -565,6 +622,13 @@ impl App {
             None,
             &AKAR_THEME_DARK,
         );
+        let container_rect = state.layout.rect(state.grid_container_node);
+        if container_rect[2] > 0.0 && container_rect[3] > 0.0 {
+            state
+                .core
+                .draw_list
+                .push_quad(grid_container_quad(container_rect));
+        }
         let style = DataGridStyle::from_theme(&AKAR_THEME_DARK);
         let row_keys = state
             .session
@@ -786,12 +850,12 @@ mod tests {
     use baho_model::{Diagnostic, Severity};
 
     use super::{
-        SIDEBAR_WIDTH, build_app_layout, finish_event_loop, format_startup_diagnostics,
-        grid_has_keyboard_focus,
+        GRID_CONTAINER_RADIUS, SIDEBAR_WIDTH, build_app_layout, finish_event_loop,
+        format_startup_diagnostics, grid_container_quad, grid_has_keyboard_focus,
     };
 
     #[test]
-    fn app_layout_has_fixed_sidebar_and_flexible_grid_with_stable_labels() {
+    fn app_layout_insets_grid_inside_main_content() {
         let mut layout = Layout::new();
         let app = build_app_layout(&mut layout);
         layout.compute(
@@ -805,14 +869,25 @@ mod tests {
             SIDEBAR_WIDTH
         );
         assert_eq!(
+            layout.rect(layout.resolve_label("grid_container").unwrap()),
+            [SIDEBAR_WIDTH + 12.0, 12.0, 496.0, 576.0]
+        );
+        assert_eq!(
             layout.rect(layout.resolve_label("grid").unwrap()),
-            [SIDEBAR_WIDTH, 0.0, 520.0, 600.0]
+            [SIDEBAR_WIDTH + 20.0, 20.0, 480.0, 560.0]
         );
         for label in ["prompt", "submit", "status"] {
             let rect = layout.rect(layout.resolve_label(label).unwrap());
             assert!(rect[2] > 0.0, "{label} has width");
             assert!(rect[3] > 0.0, "{label} has height");
         }
+    }
+
+    #[test]
+    fn grid_container_has_four_rounded_corners() {
+        let quad = grid_container_quad([292.0, 12.0, 496.0, 576.0]);
+        assert_eq!(quad.corner_radii, [GRID_CONTAINER_RADIUS; 4]);
+        assert!(quad.border_width > 0.0);
     }
 
     #[test]
