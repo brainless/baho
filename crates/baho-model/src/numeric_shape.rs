@@ -43,8 +43,10 @@ pub enum NumberShape {
 
 /// Classify the separator shape of one raw numeric token.
 ///
-/// An optional leading `+` or `-` is ignored. After the sign (locked decision
-/// 5):
+/// Epic 008 locked decision 15: surrounding Unicode whitespace is trimmed
+/// before classification, so padded cells contribute the same evidence as
+/// unpadded ones. An optional leading `+` or `-` is ignored. After the sign
+/// (locked decision 5):
 ///
 /// - no `.` or `,` → [`NumberShape::Neutral`];
 /// - both `.` and `,` → the later separator is the decimal mark and the
@@ -57,6 +59,7 @@ pub enum NumberShape {
 /// - one separator occurring once with a 1–3 digit leading group and an
 ///   exactly-3-digit trailing group → [`NumberShape::Undecided`].
 pub fn classify_number_shape(text: &str) -> NumberShape {
+    let text = text.trim();
     let rest = match text.as_bytes().first() {
         Some(b'+') | Some(b'-') => &text[1..],
         _ => text,
@@ -229,6 +232,22 @@ mod tests {
         assert_eq!(
             classify_number_shape("-1,234"),
             NumberShape::Undecided { separator: ',' }
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_before_classification() {
+        assert_eq!(classify_number_shape(" 42 "), NumberShape::Neutral);
+        assert_eq!(
+            classify_number_shape("\t1,234\n"),
+            NumberShape::Undecided { separator: ',' }
+        );
+        assert_eq!(
+            classify_number_shape(" 1,234.56 "),
+            decided(&[
+                (',', SeparatorRole::GroupingMark),
+                ('.', SeparatorRole::DecimalMark)
+            ])
         );
     }
 

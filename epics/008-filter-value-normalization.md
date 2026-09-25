@@ -1,6 +1,6 @@
 # Epic 008: Filter Value Normalization
 
-Status: Implemented (decisions locked 2026-09-24; all tasks complete 2026-09-24)
+Status: Implemented (decisions locked 2026-09-24; all tasks complete 2026-09-24; decision 15 added 2026-09-25 after run 000029)
 
 Motivating run: None supplied. These requests follow a successful manual test
 of Epic 006 using the CSV CLI.
@@ -169,6 +169,20 @@ must be inspected first, per `AGENTS.md`.
     envelope carrying that evidence). `NumericParsePolicy` gains the two
     grouping variants from decision 4 wherever it is serialized. Task 6 owns
     the bumps and compatibility coverage.
+15. **Resolved:** Numeric parsing trims surrounding whitespace (Rust
+   `str::trim`, Unicode whitespace) before separator-shape classification and
+   before policy parsing. Cells such as `"63,876.80 "` parse as `63876.80`
+   under the column's selected policy; raw cell text and prompt literal
+   spelling remain preserved in evidence, diagnostics, and outputs. Interior
+   whitespace is still refused by every policy, and text equality keeps its
+   untrimmed semantics (decision 11). The strict literal grammar in
+   `ExactDecimal` is unchanged; trimming happens at the
+   `NumericParsePolicy::parse_decimal` and `classify_number_shape` entries.
+   `parse.column_mixed` and `parse.value_malformed` prose names the selected
+   policy instead of claiming "strict decimals". Motivated by run 000029:
+   every `Income` value carried trailing padding, 507/507 cells failed as
+   `InvalidCharacter` despite unambiguous `dot_decimal_comma_grouping`
+   evidence, and the run refused with `parse.column_mixed`.
 
 ## Numeric policy selection examples
 
@@ -194,7 +208,9 @@ must be inspected first, per `AGENTS.md`.
   values. A single non-3-digit tail elsewhere in the column (for example
   `1.56`) forces the decimal interpretation. Explicit format overrides are
   out of scope (decision 10).
-- Text equality does not trim outer whitespace (decision 11).
+- Text equality does not trim outer whitespace (decision 11). Numeric parsing
+  does trim surrounding whitespace (decision 15); interior whitespace is
+  refused by every numeric policy.
 - Prompt literals do not invent a format the column did not evidence
   (decision 7): `10,000` against a `strict_decimal` column still refuses.
 - No locale guessing, currency, percentage, exponent, or unit handling.

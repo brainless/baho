@@ -62,7 +62,12 @@ pub enum NumericParsePolicy {
 
 impl NumericParsePolicy {
     /// Parse raw cell text as an exact decimal under this policy.
+    ///
+    /// Epic 008 locked decision 15: surrounding Unicode whitespace is
+    /// trimmed first, so padded cells such as `"1,234.56 "` parse; interior
+    /// whitespace and any other unexpected characters are refused.
     pub fn parse_decimal(&self, text: &str) -> Result<ExactDecimal, DecimalParseError> {
+        let text = text.trim();
         match self {
             NumericParsePolicy::StrictDecimal => ExactDecimal::parse(text),
             NumericParsePolicy::DotDecimalCommaGrouping => {
@@ -71,6 +76,15 @@ impl NumericParsePolicy {
             NumericParsePolicy::CommaDecimalDotGrouping => {
                 crate::decimal::parse_grouped_decimal(text, ',', '.')
             }
+        }
+    }
+
+    /// The stable serialized name of this policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NumericParsePolicy::StrictDecimal => "strict_decimal",
+            NumericParsePolicy::DotDecimalCommaGrouping => "dot_decimal_comma_grouping",
+            NumericParsePolicy::CommaDecimalDotGrouping => "comma_decimal_dot_grouping",
         }
     }
 
@@ -355,6 +369,36 @@ mod tests {
         );
         assert_eq!(
             NumericParsePolicy::StrictDecimal.parse_decimal("1,234.56"),
+            Err(DecimalParseError::InvalidCharacter)
+        );
+    }
+
+    #[test]
+    fn parse_decimal_trims_surrounding_whitespace() {
+        use crate::decimal::ExactDecimal as Dec;
+        let us = NumericParsePolicy::DotDecimalCommaGrouping;
+        let eu = NumericParsePolicy::CommaDecimalDotGrouping;
+        assert_eq!(
+            us.parse_decimal(" 1,234.56 ").unwrap(),
+            Dec::parse("1234.56").unwrap()
+        );
+        assert_eq!(
+            eu.parse_decimal("\t1.234,56\n").unwrap(),
+            Dec::parse("1234.56").unwrap()
+        );
+        assert_eq!(
+            NumericParsePolicy::StrictDecimal
+                .parse_decimal(" 42 ")
+                .unwrap(),
+            Dec::parse("42").unwrap()
+        );
+        // Interior whitespace is still refused by every policy.
+        assert_eq!(
+            us.parse_decimal("1, 234.56"),
+            Err(DecimalParseError::InvalidCharacter)
+        );
+        assert_eq!(
+            NumericParsePolicy::StrictDecimal.parse_decimal("4 2"),
             Err(DecimalParseError::InvalidCharacter)
         );
     }

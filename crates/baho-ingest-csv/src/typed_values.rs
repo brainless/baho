@@ -151,8 +151,9 @@ impl ComparedColumnParse {
                 }
                 MixedRefusalReason::NoParseableValues => {
                     format!(
-                        "{scope}: 0 of {} nonblank values parse as strict decimals",
-                        counts.nonblank()
+                        "{scope}: 0 of {} nonblank values parse as decimals under policy '{}'",
+                        counts.nonblank(),
+                        self.column.policy.as_str()
                     )
                 }
                 MixedRefusalReason::MalformedShareExceeded => {
@@ -183,8 +184,11 @@ impl ComparedColumnParse {
                 severity: Severity::Warning,
                 stage: PARSE_DIAGNOSTIC_STAGE.to_string(),
                 message: format!(
-                    "column '{}': {} malformed value(s) for strict decimal parsing (reason: {})",
-                    evidence.column_id, evidence.total_count, evidence.reason
+                    "column '{}': {} malformed value(s) for decimal parsing under policy '{}' (reason: {})",
+                    evidence.column_id,
+                    evidence.total_count,
+                    self.column.policy.as_str(),
+                    evidence.reason
                 ),
                 location: Some(DiagnosticLocation {
                     row: None,
@@ -571,6 +575,92 @@ mod tests {
         assert_eq!(values[4], ExactDecimal::parse("-0.25").unwrap());
         assert_eq!(parsed.counts().malformed, 0);
         assert!(parsed.malformed_evidence.is_empty());
+    }
+
+    #[test]
+    fn padded_numeric_cells_parse_under_selected_policy() {
+        // Run 000029 regression: padded cells like "1,234.56 " failed every
+        // numeric policy despite unambiguous separator evidence.
+        let records: Vec<LogicalRecord> = ["1,234.56 ", "10,000 ", " 2.5", "300.00 "]
+            .iter()
+            .enumerate()
+            .map(|(offset, value)| record(offset, &[&format!("id-{offset}"), value]))
+            .collect();
+
+        let parsed = parse_compared_column_selecting_policy(
+            &records,
+            0,
+            &income_column(1),
+            &NormalizationConfig::default(),
+        );
+
+        assert_eq!(parsed.verdict, ParseVerdict::Accepted);
+        assert_eq!(
+            parsed.column.policy,
+            NumericParsePolicy::DotDecimalCommaGrouping
+        );
+        assert_eq!(
+            parsed.counts(),
+            ColumnParseCounts {
+                rows: 4,
+                missing: 0,
+                blank: 0,
+                valid: 4,
+                malformed: 0
+            }
+        );
+        let first = &parsed.column.cells[0];
+        assert_eq!(first.raw_text.as_deref(), Some("1,234.56 "));
+        assert_eq!(
+            first.parsed,
+            ParsedCell::Valid(ExactDecimal::parse("1234.56").unwrap())
+        );
+        let undecided = &parsed.column.cells[1];
+        assert_eq!(undecided.raw_text.as_deref(), Some("10,000 "));
+        assert_eq!(
+            undecided.parsed,
+            ParsedCell::Valid(ExactDecimal::parse("10000").unwrap())
+        );
+    }
+
+    #[test]
+    fn mixed_column_diagnostics_name_the_selected_policy() {
+        let records = vec![
+            record(0, &["a", "1,2,3 "]),
+            record(1, &["b", "4,5,6 "]),
+            record(2, &["c", "7,8,9 "]),
+        ];
+
+        let parsed = parse_compared_column(
+            &records,
+            0,
+            &income_column(1),
+            NumericParsePolicy::DotDecimalCommaGrouping,
+            &NormalizationConfig::default(),
+        );
+
+        assert_eq!(
+            parsed.verdict,
+            ParseVerdict::Mixed {
+                reason: MixedRefusalReason::NoParseableValues
+            }
+        );
+        let diagnostics = parsed.diagnostics();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("dot_decimal_comma_grouping"),
+            "unexpected message: {}",
+            diagnostics[0].message
+        );
+        assert!(
+            diagnostics[1]
+                .message
+                .contains("dot_decimal_comma_grouping"),
+            "unexpected message: {}",
+            diagnostics[1].message
+        );
     }
 
     #[test]
