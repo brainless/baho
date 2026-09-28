@@ -576,6 +576,25 @@ pub enum RecognizedRequest {
 pub struct RowFilterIntent {
     pub predicate: Expression,
     pub evidence: RecognitionEvidence,
+    pub ungrounded: Vec<UngroundedClause>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UngroundedClause {
+    pub id: String,
+    pub term: String,
+    pub kind: UngroundedKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum UngroundedKind {
+    Bare {
+        header_ids: Vec<String>,
+    },
+    Comparison {
+        operator: ComparisonOperator,
+        literal: Literal,
+    },
 }
 
 /// Recognize a prompt as either a row filter or a retrieval request.
@@ -950,6 +969,35 @@ fn is_boundary_token(word: &PromptWord) -> bool {
             || comparison_operator_token(&word.normalized).is_some())
 }
 
+fn blank_test_at(words: &[PromptWord], pos: usize) -> Option<(bool, usize)> {
+    let structural = |index: usize, expected: &str| {
+        words
+            .get(index)
+            .is_some_and(|word| !word.quoted && word.normalized == expected)
+    };
+    if !structural(pos, "is") {
+        return None;
+    }
+    if structural(pos + 1, "blank") {
+        Some((false, 2))
+    } else if structural(pos + 1, "not") && structural(pos + 2, "blank") {
+        Some((true, 3))
+    } else {
+        None
+    }
+}
+
+fn blank_test_expression(column: String, is_not_blank: bool) -> Expression {
+    let non_blank = Expression::IsNotBlank { column };
+    if is_not_blank {
+        non_blank
+    } else {
+        Expression::Not {
+            predicate: Box::new(non_blank),
+        }
+    }
+}
+
 struct HeaderPhrase {
     tokens: Vec<String>,
     column_id: String,
@@ -1029,6 +1077,7 @@ struct RowFilterParser<'a> {
     parentheses: Vec<ParenthesisEvidence>,
     prompt_tokens: Vec<PromptToken>,
     action: Option<ActionEvidence>,
+    ungrounded: Vec<UngroundedClause>,
 }
 
 impl<'a> RowFilterParser<'a> {
@@ -1053,6 +1102,7 @@ impl<'a> RowFilterParser<'a> {
             parentheses: Vec::new(),
             prompt_tokens,
             action,
+            ungrounded: Vec::new(),
         }
     }
 
@@ -1258,12 +1308,73 @@ impl<'a> RowFilterParser<'a> {
     fn parse_atomic(&mut self) -> Result<Expression, Bail> {
         match self.bind_header(self.pos) {
             HeaderBinding::None => {
-                let prompt_term = self.words[self.pos..]
+                if let Some(operator) = self
+                    .unquoted_normalized_at(self.pos)
+                    .and_then(comparison_operator_token)
+                {
+                    self.pos += 1;
+                    let literal = self.parse_literal(false)?;
+                    let id = format!("clause-{}", self.ungrounded.len() + 1);
+                    self.ungrounded.push(UngroundedClause {
+                        id: id.clone(),
+                        term: format!("{operator:?} {literal:?}"),
+                        kind: UngroundedKind::Comparison {
+                            operator,
+                            literal: literal.clone(),
+                        },
+                    });
+                    self.atomics_parsed += 1;
+                    return Ok(Expression::Compare {
+                        column: format!("__grounding_{id}"),
+                        operator,
+                        literal,
+                    });
+                }
+                let start = self.pos;
+                while self.pos < self.words.len() && !is_boundary_token(&self.words[self.pos]) {
+                    self.pos += 1;
+                }
+                if self.pos == start {
+                    return Err(Bail::ColumnNotFound {
+                        prompt_term: self.words[start].normalized.clone(),
+                    });
+                }
+                let term = self.words[start..self.pos]
                     .iter()
-                    .map(|word| word.normalized.as_str())
+                    .map(|word| word.raw.as_str())
                     .collect::<Vec<_>>()
                     .join(" ");
-                Err(Bail::ColumnNotFound { prompt_term })
+                if self.pos < self.words.len()
+                    && self
+                        .unquoted_normalized_at(self.pos)
+                        .and_then(comparison_operator_token)
+                        .is_some()
+                {
+                    return Err(Bail::ColumnNotFound {
+                        prompt_term: self.words[start..]
+                            .iter()
+                            .map(|word| word.normalized.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    });
+                }
+                if self.start == 1 && start == self.start && self.pos == self.words.len() {
+                    return Err(Bail::ColumnNotFound { prompt_term: term });
+                }
+                let id = format!("clause-{}", self.ungrounded.len() + 1);
+                self.ungrounded.push(UngroundedClause {
+                    id: id.clone(),
+                    term: term.clone(),
+                    kind: UngroundedKind::Bare {
+                        header_ids: Vec::new(),
+                    },
+                });
+                self.atomics_parsed += 1;
+                Ok(Expression::Compare {
+                    column: format!("__grounding_{id}"),
+                    operator: ComparisonOperator::Equal,
+                    literal: Literal::Text(term),
+                })
             }
             HeaderBinding::Duplicate {
                 display_names,
@@ -1288,6 +1399,11 @@ impl<'a> RowFilterParser<'a> {
                 self.pos += token_count;
                 self.atomics_parsed += 1;
 
+                if let Some((is_not_blank, length)) = blank_test_at(self.words, self.pos) {
+                    self.pos += length;
+                    return Ok(blank_test_expression(column_id, is_not_blank));
+                }
+
                 if let Some(operator) = self
                     .unquoted_normalized_at(self.pos)
                     .and_then(comparison_operator_token)
@@ -1305,18 +1421,13 @@ impl<'a> RowFilterParser<'a> {
                     });
                 }
                 if self.pos >= self.words.len() {
-                    if self.at_bare_start() {
+                    if self.start == 1 && self.at_bare_start() {
                         return Err(Bail::NoPredicate);
                     }
-                    return Err(Bail::Unsupported(
-                        "expected a comparison or a text literal after the column".to_string(),
-                    ));
+                    return Ok(self.bare_header_clause(column_id));
                 }
                 if is_boundary_token(&self.words[self.pos]) {
-                    return Err(Bail::Unsupported(
-                        "expected a comparison operator or a text literal after the column"
-                            .to_string(),
-                    ));
+                    return Ok(self.bare_header_clause(column_id));
                 }
                 let literal = self.parse_literal(true)?;
                 Ok(Expression::Compare {
@@ -1325,6 +1436,25 @@ impl<'a> RowFilterParser<'a> {
                     literal,
                 })
             }
+        }
+    }
+
+    fn bare_header_clause(&mut self, column_id: String) -> Expression {
+        let id = format!("clause-{}", self.ungrounded.len() + 1);
+        let term = self
+            .headers
+            .last()
+            .map(|header| header.tokens.join(" "))
+            .unwrap_or_default();
+        self.ungrounded.push(UngroundedClause {
+            id: id.clone(),
+            term,
+            kind: UngroundedKind::Bare {
+                header_ids: vec![column_id],
+            },
+        });
+        Expression::IsNotBlank {
+            column: format!("__grounding_{id}"),
         }
     }
 
@@ -1555,6 +1685,15 @@ impl<'a> RowFilterParser<'a> {
             });
             state.pos += candidate.token_count;
             state.atomics_parsed += 1;
+
+            if let Some((is_not_blank, length)) = blank_test_at(state.words, state.pos) {
+                state.pos += length;
+                results.push((
+                    blank_test_expression(candidate.column_id, is_not_blank),
+                    state,
+                ));
+                continue;
+            }
 
             if let Some(operator) = state
                 .unquoted_normalized_at(state.pos)
@@ -1892,6 +2031,7 @@ fn row_filter_intent_from_state(
         connectors,
         literals,
         parentheses,
+        ungrounded,
         ..
     } = parser;
     let evidence = RecognitionEvidence {
@@ -1920,6 +2060,7 @@ fn row_filter_intent_from_state(
     RowFilterIntent {
         predicate,
         evidence,
+        ungrounded,
     }
 }
 
@@ -2971,6 +3112,58 @@ mod tests {
 
     fn expect_row_filter_ok(request: Result<RecognizedRequest, IntentError>) -> RowFilterIntent {
         expect_row_filter(request).unwrap_or_else(|e| panic!("expected success, got {e:?}"))
+    }
+
+    #[test]
+    fn explicit_blank_tests_compile_as_two_valued_existing_ir() {
+        let columns = predicate_columns();
+        let blank = expect_row_filter_ok(recognize_request(
+            "List rows where Status is blank",
+            &columns,
+        ));
+        assert_eq!(
+            blank.predicate,
+            Expression::Not {
+                predicate: Box::new(Expression::IsNotBlank {
+                    column: "column-1".to_string(),
+                }),
+            }
+        );
+        let non_blank = expect_row_filter_ok(recognize_request(
+            "List rows where Status is not blank",
+            &columns,
+        ));
+        assert_eq!(
+            non_blank.predicate,
+            Expression::IsNotBlank {
+                column: "column-1".to_string(),
+            }
+        );
+        let negated = expect_row_filter_ok(recognize_request(
+            "List rows where not Status is blank",
+            &columns,
+        ));
+        assert_eq!(
+            negated.predicate,
+            Expression::Not {
+                predicate: Box::new(blank.predicate),
+            }
+        );
+    }
+
+    #[test]
+    fn compact_blank_test_is_filter_but_bare_header_is_retrieval() {
+        let columns = predicate_columns();
+        let compact = expect_row_filter_ok(recognize_request("List Status is blank", &columns));
+        assert!(matches!(compact.predicate, Expression::Not { .. }));
+        assert!(matches!(
+            recognize_request("List Status", &columns),
+            Ok(RecognizedRequest::Retrieval(_))
+        ));
+        assert!(matches!(
+            recognize_request("List unemployed", &columns),
+            Err(IntentError::ColumnNotFound { .. })
+        ));
     }
 
     fn refusal_reason_of(error: &IntentError) -> String {

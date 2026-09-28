@@ -8,10 +8,14 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use baho_core::{CoreOutcome, CoreResult};
+use baho_core::grounding::{
+    CLARIFICATION_SCHEMA_VERSION, ClarificationRequest, ClarificationResponse,
+    GROUNDING_SCHEMA_VERSION, GroundingOutcome, GroundingResult,
+};
+use baho_core::{CoreOutcome, CoreResult, ParserConfig};
 use baho_model::{candidate::TableCandidate, revision::SourceRevision};
 use baho_plan::{evidence::RecognitionEvidence, plan::Plan};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -34,6 +38,8 @@ const RUN_ID_WIDTH: usize = 6;
 /// policy, deferred numeric literals, and the extended `NumericParsePolicy`
 /// value space. Historical envelopes are never rewritten or reinterpreted.
 const PLAN_ARTIFACT_SCHEMA_VERSION: u32 = 5;
+/// Version 2 adds a clarification outcome and optional immutable run links.
+const MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum RunRecordError {
@@ -53,6 +59,8 @@ pub enum RunRecordError {
     RunIdExhausted,
     #[error("input is not a regular file: {0}")]
     NotAFile(PathBuf),
+    #[error("invalid pending clarification: {0}")]
+    InvalidClarification(String),
 }
 
 fn io(context: impl Into<String>, source: std::io::Error) -> RunRecordError {
@@ -72,7 +80,7 @@ pub struct Invocation {
     pub output: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputIdentity {
     pub path: String,
     pub absolute_path: String,
@@ -144,6 +152,108 @@ pub struct RecordedRun {
     pub id: String,
     pub path: PathBuf,
     pub materialized: bool,
+    pub needs_clarification: bool,
+}
+
+/// The immutable request and invocation context needed to resume a run.
+#[derive(Debug, Clone)]
+pub struct PendingClarification {
+    pub run_id: String,
+    pub input_path: PathBuf,
+    pub prompt: String,
+    pub request: ClarificationRequest,
+}
+
+/// Read only a finalized clarification run, checking its artifact index and
+/// request against the recorded input identity. Core revalidates the source.
+pub fn load_pending_clarification(
+    runs_directory: &Path,
+    run_id: &str,
+) -> Result<PendingClarification, RunRecordError> {
+    if run_id.len() < RUN_ID_WIDTH || !run_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(RunRecordError::InvalidClarification(
+            "invalid run ID".into(),
+        ));
+    }
+    let directory = runs_directory.join(run_id);
+    let manifest: StoredManifest = read_json(&directory.join("manifest.json"))?;
+    if manifest.schema_version != MANIFEST_SCHEMA_VERSION
+        || manifest.run_id != run_id
+        || manifest.outcome != "needs_clarification"
+        || !manifest
+            .artifacts
+            .iter()
+            .any(|name| name == "grounding.json")
+    {
+        return Err(RunRecordError::InvalidClarification(
+            "run has no supported pending clarification".into(),
+        ));
+    }
+    let grounding: GroundingResult = read_json(&directory.join("grounding.json"))?;
+    let GroundingOutcome::NeedsClarification { request } = grounding.outcome else {
+        return Err(RunRecordError::InvalidClarification(
+            "grounding artifact does not contain a request".into(),
+        ));
+    };
+    if grounding.schema_version != GROUNDING_SCHEMA_VERSION
+        || request.schema_version != CLARIFICATION_SCHEMA_VERSION
+    {
+        return Err(RunRecordError::InvalidClarification(
+            "unsupported clarification schema".into(),
+        ));
+    }
+    let input = manifest
+        .input
+        .ok_or_else(|| RunRecordError::InvalidClarification("run has no input identity".into()))?;
+    if input.sha256 != request.source_revision.content_hash
+        || input.size_bytes != request.source_revision.file_size
+    {
+        return Err(RunRecordError::InvalidClarification(
+            "request and manifest input identities disagree".into(),
+        ));
+    }
+    let prompt = fs::read_to_string(directory.join("intent.txt"))
+        .map_err(|error| io("could not read intent.txt", error))?;
+    if format!("{:x}", Sha256::digest(prompt.as_bytes())) != request.prompt_identity {
+        return Err(RunRecordError::InvalidClarification(
+            "request and recorded prompt identities disagree".into(),
+        ));
+    }
+    if !manifest
+        .artifacts
+        .iter()
+        .any(|name| name == "parser-config.json")
+    {
+        return Err(RunRecordError::InvalidClarification(
+            "run has no parser configuration artifact".into(),
+        ));
+    }
+    let parser_config: ParserConfig = read_json(&directory.join("parser-config.json"))?;
+    let config_bytes =
+        serde_json::to_vec(&parser_config).map_err(|source| RunRecordError::Json {
+            context: "could not serialize recorded parser configuration".into(),
+            source,
+        })?;
+    if format!("{:x}", Sha256::digest(config_bytes)) != request.parser_config_identity {
+        return Err(RunRecordError::InvalidClarification(
+            "request and recorded parser configuration identities disagree".into(),
+        ));
+    }
+    Ok(PendingClarification {
+        run_id: run_id.into(),
+        input_path: PathBuf::from(input.absolute_path),
+        prompt,
+        request,
+    })
+}
+
+#[derive(Deserialize)]
+struct StoredManifest {
+    schema_version: u32,
+    run_id: String,
+    outcome: String,
+    input: Option<InputIdentity>,
+    artifacts: Vec<String>,
 }
 
 pub struct PendingRun {
@@ -153,6 +263,7 @@ pub struct PendingRun {
     manifest: Manifest,
     events: EventLog,
     timer: Instant,
+    clarification_response: Option<ClarificationResponse>,
 }
 
 impl PendingRun {
@@ -192,7 +303,21 @@ impl PendingRun {
             manifest,
             events,
             timer: Instant::now(),
+            clarification_response: None,
         })
+    }
+
+    /// Link a new reserved run to its immutable clarification source.
+    pub fn link_resolution(
+        mut self,
+        original: &PendingClarification,
+        response: ClarificationResponse,
+    ) -> Result<Self, RunRecordError> {
+        self.manifest.resumes_run_id = Some(original.run_id.clone());
+        self.manifest.clarification_request_id = Some(original.request.request_id.clone());
+        self.clarification_response = Some(response);
+        write_json(&self.absolute_path.join("manifest.json"), &self.manifest)?;
+        Ok(self)
     }
 
     pub fn record_result(
@@ -210,6 +335,7 @@ impl PendingRun {
             ]),
         )?;
         self.manifest.input = Some(input);
+        self.record_clarification_response()?;
         for event in &result.events {
             self.events.write(
                 "INFO",
@@ -252,6 +378,13 @@ impl PendingRun {
             )?;
             self.manifest.artifacts.push("plan.json".into());
         }
+        if let Some(grounding) = result.grounding.as_ref() {
+            write_json(&self.absolute_path.join("grounding.json"), grounding)?;
+            self.manifest.artifacts.push("grounding.json".into());
+            if let GroundingOutcome::NeedsClarification { request } = &grounding.outcome {
+                self.manifest.clarification_request_id = Some(request.request_id.clone());
+            }
+        }
         if let Some(output) = &result.output {
             fs::create_dir_all(self.absolute_path.join("output"))
                 .map_err(|error| io("could not create output directory", error))?;
@@ -270,10 +403,18 @@ impl PendingRun {
                 "schema_version": RUN_SCHEMA_VERSION, "diagnostics": result.diagnostics,
             }),
         )?;
-        let (outcome, label, materialized) = match result.outcome {
-            CoreOutcome::Materialized => (Outcome::Materialized, "materialized", true),
-            CoreOutcome::Recorded => (Outcome::Recorded, "recorded", false),
-            CoreOutcome::Failed => (Outcome::Error, "error", false),
+        let needs_clarification = matches!(
+            result
+                .grounding
+                .as_ref()
+                .map(|grounding| &grounding.outcome),
+            Some(GroundingOutcome::NeedsClarification { .. })
+        );
+        let (outcome, label, materialized) = match (result.outcome.clone(), needs_clarification) {
+            (_, true) => (Outcome::NeedsClarification, "needs_clarification", false),
+            (CoreOutcome::Materialized, _) => (Outcome::Materialized, "materialized", true),
+            (CoreOutcome::Recorded, _) => (Outcome::Recorded, "recorded", false),
+            (CoreOutcome::Failed, _) => (Outcome::Error, "error", false),
         };
         self.events.write(
             "INFO",
@@ -283,7 +424,7 @@ impl PendingRun {
         )?;
         self.manifest.outcome = outcome;
         self.finish_manifest()?;
-        Ok(self.recorded(materialized))
+        Ok(self.recorded(materialized, needs_clarification))
     }
 
     pub fn record_input_error(
@@ -291,6 +432,7 @@ impl PendingRun {
         message: impl Into<String>,
     ) -> Result<RecordedRun, RunRecordError> {
         let message = message.into();
+        self.record_clarification_response()?;
         write_json(
             &self.absolute_path.join("diagnostics.json"),
             &Diagnostics {
@@ -321,7 +463,20 @@ impl PendingRun {
             message,
         });
         self.finish_manifest()?;
-        Ok(self.recorded(false))
+        Ok(self.recorded(false, false))
+    }
+
+    fn record_clarification_response(&mut self) -> Result<(), RunRecordError> {
+        if let Some(response) = &self.clarification_response {
+            write_json(
+                &self.absolute_path.join("clarification-response.json"),
+                response,
+            )?;
+            self.manifest
+                .artifacts
+                .push("clarification-response.json".into());
+        }
+        Ok(())
     }
 
     fn finish_manifest(&mut self) -> Result<(), RunRecordError> {
@@ -330,11 +485,12 @@ impl PendingRun {
         write_json(&self.absolute_path.join("manifest.json"), &self.manifest)
     }
 
-    fn recorded(&self, materialized: bool) -> RecordedRun {
+    fn recorded(&self, materialized: bool, needs_clarification: bool) -> RecordedRun {
         RecordedRun {
             id: self.id.clone(),
             path: self.reported_path.clone(),
             materialized,
+            needs_clarification,
         }
     }
 }
@@ -368,12 +524,16 @@ struct Manifest {
     input: Option<InputIdentity>,
     artifacts: Vec<String>,
     error: Option<RunError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resumes_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clarification_request_id: Option<String>,
 }
 
 impl Manifest {
     fn new(id: &str, invocation: Invocation) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: MANIFEST_SCHEMA_VERSION,
             run_id: id.into(),
             started_at: now(),
             finished_at: None,
@@ -404,6 +564,8 @@ impl Manifest {
                 "diagnostics.json".into(),
             ],
             error: None,
+            resumes_run_id: None,
+            clarification_request_id: None,
         }
     }
 }
@@ -414,6 +576,7 @@ enum Outcome {
     Running,
     Materialized,
     Recorded,
+    NeedsClarification,
     Error,
 }
 #[derive(Serialize)]
@@ -611,6 +774,15 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), RunRecordError>
     writer
         .flush()
         .map_err(|error| io(format!("could not flush {}", path.display()), error))
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, RunRecordError> {
+    let file = File::open(path)
+        .map_err(|error| io(format!("could not open {}", path.display()), error))?;
+    serde_json::from_reader(BufReader::new(file)).map_err(|source| RunRecordError::Json {
+        context: format!("could not deserialize {}", path.display()),
+        source,
+    })
 }
 
 fn now() -> String {

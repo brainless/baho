@@ -35,4 +35,14 @@ pub(crate) enum Command {
         #[arg(long)]
         latest: bool,
     },
+
+    /// Resolve a pending clarification with clause-to-candidate choices.
+    Resolve {
+        /// Run ID containing the pending clarification.
+        run_id: String,
+
+        /// Selections in the form clause_id=candidate_id.
+        #[arg(required = true)]
+        choices: Vec<String>,
+    },
 }

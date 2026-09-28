@@ -60,6 +60,66 @@ pub enum PolicySelectionOutcome {
     Ambiguous(PolicySelectionRefused),
 }
 
+/// Constant-size numeric format evidence for a streamed column.
+#[derive(Debug, Default, Clone)]
+pub struct PolicyEvidenceAccumulator {
+    neutral: usize,
+    decided: usize,
+    undecided: usize,
+    role_assignments: Vec<(char, SeparatorRole)>,
+    conflicting_roles: bool,
+    comma_seen: bool,
+    dot_seen: bool,
+}
+
+impl PolicyEvidenceAccumulator {
+    pub fn observe(&mut self, text: &str) {
+        match classify_number_shape(text) {
+            NumberShape::Neutral => self.neutral += 1,
+            NumberShape::Undecided { separator } => {
+                self.undecided += 1;
+                mark_seen(separator, &mut self.comma_seen, &mut self.dot_seen);
+            }
+            NumberShape::Decided { assignments } => {
+                self.decided += 1;
+                for (separator, role) in assignments {
+                    mark_seen(separator, &mut self.comma_seen, &mut self.dot_seen);
+                    match self
+                        .role_assignments
+                        .iter()
+                        .find(|(existing, _)| *existing == separator)
+                    {
+                        Some((_, existing)) if *existing != role => self.conflicting_roles = true,
+                        Some(_) => {}
+                        None => self.role_assignments.push((separator, role)),
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn finish(self) -> Result<PolicySelection, PolicySelectionRefused> {
+        let Self {
+            neutral,
+            decided,
+            undecided,
+            role_assignments,
+            conflicting_roles,
+            comma_seen,
+            dot_seen,
+        } = self;
+        select_from_evidence(
+            neutral,
+            decided,
+            undecided,
+            role_assignments,
+            conflicting_roles,
+            comma_seen,
+            dot_seen,
+        )
+    }
+}
+
 /// Select the numeric parse policy for one compared column's nonblank texts.
 ///
 /// Blank and missing cells must be excluded by the caller. Classification is
@@ -69,31 +129,23 @@ pub fn select_numeric_policy<'a, I>(texts: I) -> Result<PolicySelection, PolicyS
 where
     I: IntoIterator<Item = &'a str>,
 {
-    let mut neutral = 0usize;
-    let mut decided = 0usize;
-    let mut undecided = 0usize;
-    let mut role_assignments: Vec<(char, SeparatorRole)> = Vec::new();
-    let mut locked_preference: Option<char> = None;
-    let mut comma_seen = false;
-    let mut dot_seen = false;
-    let mut roles: Vec<(char, SeparatorRole)> = Vec::new();
-
+    let mut accumulator = PolicyEvidenceAccumulator::default();
     for text in texts {
-        match classify_number_shape(text) {
-            NumberShape::Neutral => neutral += 1,
-            NumberShape::Undecided { separator } => {
-                undecided += 1;
-                mark_seen(separator, &mut comma_seen, &mut dot_seen);
-            }
-            NumberShape::Decided { assignments } => {
-                decided += 1;
-                for (separator, role) in assignments {
-                    mark_seen(separator, &mut comma_seen, &mut dot_seen);
-                    roles.push((separator, role));
-                }
-            }
-        }
+        accumulator.observe(text);
     }
+    accumulator.finish()
+}
+
+fn select_from_evidence(
+    neutral: usize,
+    decided: usize,
+    undecided: usize,
+    role_assignments: Vec<(char, SeparatorRole)>,
+    conflicting_roles: bool,
+    comma_seen: bool,
+    dot_seen: bool,
+) -> Result<PolicySelection, PolicySelectionRefused> {
+    let mut locked_preference: Option<char> = None;
 
     let evidence = |role_assignments: Vec<(char, SeparatorRole)>,
                     locked_preference: Option<char>| {
@@ -106,21 +158,11 @@ where
         }
     };
 
-    // Merge role assignments in first-occurrence order, refusing conflicts.
-    for (separator, role) in roles {
-        match role_assignments
-            .iter()
-            .find(|(existing, _)| *existing == separator)
-        {
-            Some((_, existing)) if *existing == role => {}
-            Some(_) => {
-                return Err(PolicySelectionRefused {
-                    reason: PolicyAmbiguityReason::ConflictingRoles,
-                    evidence: evidence(Vec::new(), None),
-                });
-            }
-            None => role_assignments.push((separator, role)),
-        }
+    if conflicting_roles {
+        return Err(PolicySelectionRefused {
+            reason: PolicyAmbiguityReason::ConflictingRoles,
+            evidence: evidence(Vec::new(), None),
+        });
     }
     // Two distinct grouping marks cannot describe one convention.
     let grouping_marks = role_assignments

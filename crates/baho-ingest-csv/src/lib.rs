@@ -8,6 +8,7 @@ pub mod candidates;
 pub mod classifier;
 pub mod config;
 pub mod dialect;
+pub mod grounding_scan;
 pub mod header;
 pub mod importer;
 pub mod inspector;
@@ -19,8 +20,15 @@ pub use candidates::{CandidateConfig, detect_candidates, detect_candidates_with_
 pub use classifier::{classify_rows, classify_rows_with_config};
 pub use config::ParserConfig;
 pub use dialect::{CsvDialect, DialectDetectionConfig, DialectDetectionError};
+pub use grounding_scan::{
+    ColumnFlagShape, ColumnValueMatches, CompleteScan, CompleteScanError, ExactValueLookup,
+    FlagShapeLookup, LookupColumn, StreamedColumnEvidence, StreamedGroundingEvidence,
+    lookup_exact_value, scan_complete_table, scan_flag_shapes, scan_grounding_evidence,
+};
 pub use header::{build_header, build_header_with_config, normalize_header_cell};
-pub use importer::{CsvImporter, SelectedRegion, SelectedRegionError, read_selected_region};
+pub use importer::{
+    CsvImporter, SelectedRegion, SelectedRegionError, SelectedTableStream, read_selected_region,
+};
 pub use inspector::{
     InspectionResult, LogicalRecord, MalformedRecord, inspect_csv, inspect_csv_with_config,
 };

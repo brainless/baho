@@ -37,7 +37,7 @@ impl ParserConfig {
 impl Default for ParserConfig {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             dialect: CsvDialect::default(),
             dialect_detection: DialectDetectionConfig::default(),
             inspection: InspectOptions::default(),
@@ -55,6 +55,9 @@ impl Default for ParserConfig {
 pub struct EvidenceLimitsConfig {
     pub max_blank_record_indices: usize,
     pub max_row_classifications: usize,
+    /// Maximum eligible cells inspected by one complete-table grounding scan.
+    #[serde(default = "default_max_grounding_cells_scanned")]
+    pub max_grounding_cells_scanned: u64,
 }
 
 impl Default for EvidenceLimitsConfig {
@@ -62,8 +65,13 @@ impl Default for EvidenceLimitsConfig {
         Self {
             max_blank_record_indices: 10_000,
             max_row_classifications: 1_000,
+            max_grounding_cells_scanned: default_max_grounding_cells_scanned(),
         }
     }
+}
+
+fn default_max_grounding_cells_scanned() -> u64 {
+    1_000_000
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -238,7 +246,7 @@ mod tests {
         .unwrap();
 
         let json = serde_json::to_value(&config).unwrap();
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 2);
         assert_eq!(json["dialect"]["delimiter"], b'\t');
         assert_eq!(json["dialect_detection"]["max_bytes"], 65_536);
         assert_eq!(json["dialect_detection"]["max_records"], 64);
@@ -246,8 +254,29 @@ mod tests {
         assert_eq!(json["candidate_scoring"]["weights"]["header_density"], 0.22);
         assert_eq!(json["candidate_ordering"]["tie_breaker"], "source_order");
         assert_eq!(json["evidence_limits"]["max_blank_record_indices"], 10_000);
+        assert_eq!(
+            json["evidence_limits"]["max_grounding_cells_scanned"],
+            1_000_000
+        );
 
         let decoded: ParserConfig = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn version_one_configuration_without_grounding_limit_uses_default() {
+        let mut value = serde_json::to_value(ParserConfig::default()).unwrap();
+        value["schema_version"] = serde_json::json!(1);
+        value["evidence_limits"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_grounding_cells_scanned");
+
+        let decoded: ParserConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(
+            decoded.evidence_limits.max_grounding_cells_scanned,
+            1_000_000
+        );
     }
 }

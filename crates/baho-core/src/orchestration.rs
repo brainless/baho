@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crate::grounding::{
+    ClarificationRequest, ClarificationResponse, GroundingOutcome, GroundingResult,
+    ground_row_filter,
+};
 use baho_exec::error::ExecutionError;
 use baho_exec::executor::{GridInput, execute_plan};
 use baho_ingest::profile::InputProfile;
@@ -58,6 +62,7 @@ pub struct CoreResult {
     pub intent: Option<RecognizedIntent>,
     pub plan: Option<Plan>,
     pub intent_evidence: Option<RecognitionEvidence>,
+    pub grounding: Option<GroundingResult>,
     pub output: Option<MaterializedView>,
     pub diagnostics: Vec<Diagnostic>,
     pub events: Vec<CoreEvent>,
@@ -81,6 +86,7 @@ pub struct OpenedRow {
 /// The selected source table, before intent recognition or plan execution.
 #[derive(Debug)]
 pub struct OpenedTable {
+    pub source_path: std::path::PathBuf,
     pub source_revision: baho_model::revision::SourceRevision,
     pub source_sheet_index: usize,
     pub source_sheet_name: Option<String>,
@@ -411,6 +417,11 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
                     }),
                 ),
                 SelectedRegionError::Io { .. } => ("core.materialize_region_failed", "core", None),
+                SelectedRegionError::RevisionChanged
+                | SelectedRegionError::RevisionCheck { .. }
+                | SelectedRegionError::SelectedRowMissing { .. } => {
+                    ("core.materialize_region_failed", "core", None)
+                }
             };
             diagnostics.push(Diagnostic {
                 code: code.to_string(),
@@ -486,6 +497,7 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
         })
         .collect();
     Ok(OpenedTable {
+        source_path: path.to_path_buf(),
         source_revision,
         source_sheet_index,
         source_sheet_name,
@@ -513,6 +525,7 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
                 intent: None,
                 plan: None,
                 intent_evidence: None,
+                grounding: None,
                 output: None,
                 diagnostics: failure.diagnostics,
                 events: failure.events,
@@ -523,11 +536,52 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
     execute_prompt(&opened, prompt)
 }
 
+/// Reopen the source, rebuild the selected table and candidate set, then
+/// validate a response before allowing plan compilation or execution.
+pub fn resolve_pipeline(
+    path: &Path,
+    prompt: &str,
+    request: &ClarificationRequest,
+    response: &ClarificationResponse,
+) -> CoreResult {
+    let opened = match open_table(path) {
+        Ok(opened) => opened,
+        Err(failure) => {
+            return CoreResult {
+                input_profile: failure.input_profile,
+                parser_config: failure.parser_config,
+                candidates: failure.candidates,
+                selected_candidate: failure.selected_candidate,
+                intent: None,
+                plan: None,
+                intent_evidence: None,
+                grounding: None,
+                output: None,
+                diagnostics: failure.diagnostics,
+                events: failure.events,
+                outcome: CoreOutcome::Failed,
+            };
+        }
+    };
+    execute_prompt_with_clarification(&opened, prompt, Some(request), Some(response))
+}
+
 /// Recognize and execute one prompt against an already opened source table.
 ///
 /// The opened table is borrowed so callers can issue independent requests
 /// against the same immutable source snapshot.
 pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
+    execute_prompt_with_clarification(opened, prompt, None, None)
+}
+
+/// Execute against an opened source after validating a previously presented
+/// clarification against newly computed source-bound candidates.
+pub fn execute_prompt_with_clarification(
+    opened: &OpenedTable,
+    prompt: &str,
+    prior_request: Option<&ClarificationRequest>,
+    response: Option<&ClarificationResponse>,
+) -> CoreResult {
     let mut result = CoreResult {
         input_profile: Some(opened.input_profile.clone()),
         parser_config: Some(opened.parser_config.clone()),
@@ -536,6 +590,7 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
         intent: None,
         plan: None,
         intent_evidence: None,
+        grounding: None,
         output: None,
         diagnostics: opened.diagnostics.clone(),
         events: opened.events.clone(),
@@ -590,6 +645,76 @@ pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
     };
     push_event(&mut result.events, "intent_recognized", "intent", kind);
     result.intent_evidence = Some(request_evidence(&request).clone());
+    if let RecognizedRequest::RowFilter(intent) = &mut request {
+        let grounding = ground_row_filter(opened, prompt, intent, prior_request, response);
+        let outcome = grounding.outcome.clone();
+        result.grounding = Some(grounding);
+        match outcome {
+            GroundingOutcome::Grounded { .. } => {
+                result.intent_evidence = Some(intent.evidence.clone())
+            }
+            GroundingOutcome::NeedsClarification { request } => {
+                result.diagnostics.push(Diagnostic {
+                    code: "grounding.clarification_required".into(),
+                    severity: Severity::Warning,
+                    stage: "grounding".into(),
+                    message: format!(
+                        "{} clause(s) need an interpretation",
+                        request.unresolved.len()
+                    ),
+                    location: None,
+                });
+                return result;
+            }
+            GroundingOutcome::Refused { code, reason } => {
+                result.diagnostics.push(Diagnostic {
+                    code: match code {
+                        crate::grounding::GroundingRefusalCode::ValueNotFound => {
+                            "grounding.value_not_found"
+                        }
+                        crate::grounding::GroundingRefusalCode::ResourceLimitExceeded => {
+                            "grounding.resource_limit_exceeded"
+                        }
+                        crate::grounding::GroundingRefusalCode::StaleClarification => {
+                            "grounding.stale_clarification"
+                        }
+                        crate::grounding::GroundingRefusalCode::InvalidClarificationResponse => {
+                            "grounding.invalid_clarification_response"
+                        }
+                        crate::grounding::GroundingRefusalCode::IncompatibleTypes => {
+                            "grounding.incompatible_types"
+                        }
+                        crate::grounding::GroundingRefusalCode::InvalidLiteral => {
+                            "grounding.invalid_literal"
+                        }
+                        crate::grounding::GroundingRefusalCode::UnsupportedGrammar => {
+                            "grounding.unsupported_grammar"
+                        }
+                        crate::grounding::GroundingRefusalCode::ColumnHeaderAmbiguous => {
+                            "grounding.column_header_ambiguous"
+                        }
+                    }
+                    .into(),
+                    severity: Severity::Error,
+                    stage: "grounding".into(),
+                    message: reason,
+                    location: None,
+                });
+                result.outcome = CoreOutcome::Failed;
+                return result;
+            }
+        }
+    } else if response.is_some() {
+        result.diagnostics.push(Diagnostic {
+            code: "grounding.invalid_clarification_response".into(),
+            severity: Severity::Error,
+            stage: "grounding".into(),
+            message: "no row-filter clarification is pending".into(),
+            location: None,
+        });
+        result.outcome = CoreOutcome::Failed;
+        return result;
+    }
     // Epic 008 locked decisions 7–8: resolve deferred numeric literals under
     // each bound column's selected policy before plan compilation. Policy
     // ambiguity refuses with `parse.format_ambiguous` before literal
@@ -1634,7 +1759,7 @@ Total,4 items,approximate,extra,notes,more
 
         // Parser config is populated
         let config = result.parser_config.as_ref().unwrap();
-        assert_eq!(config.schema_version, 1);
+        assert_eq!(config.schema_version, 2);
 
         // Selected candidate has populated header
         let selected = result.selected_candidate.as_ref().unwrap();

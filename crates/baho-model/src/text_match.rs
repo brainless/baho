@@ -1,3 +1,5 @@
+use crate::column::InferredColumnType;
+use crate::document::{ParsedCell, Value};
 use serde::{Deserialize, Serialize};
 
 /// Policy for comparing text values against text literals in plan predicates.
@@ -34,9 +36,33 @@ impl TextMatchPolicy {
     }
 }
 
+/// Result of text equality on one source cell. `None` means the predicate is
+/// unknown for that cell, including blank and missing values. A materially
+/// mixed column requires typed evidence: only malformed, nonnumeric cells
+/// are eligible for text comparison.
+pub fn text_cell_equality(
+    value: Option<&Value>,
+    parsed: Option<&ParsedCell>,
+    inferred: Option<InferredColumnType>,
+    expected: &str,
+    policy: TextMatchPolicy,
+) -> Option<bool> {
+    if inferred == Some(InferredColumnType::Mixed)
+        && !matches!(parsed, Some(ParsedCell::Malformed { .. }))
+    {
+        return None;
+    }
+    match value {
+        Some(Value::Text(text)) => Some(policy.text_eq(text, expected)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::ExactDecimal;
 
     #[test]
     fn exact_policy_compares_raw_strings() {
@@ -96,5 +122,46 @@ mod tests {
         assert_eq!(back, TextMatchPolicy::Exact);
         let back: TextMatchPolicy = serde_json::from_str("\"unicode_lowercase\"").unwrap();
         assert_eq!(back, TextMatchPolicy::UnicodeLowercase);
+    }
+
+    #[test]
+    fn text_cell_equality_respects_mixed_numeric_and_blank_cells() {
+        let policy = TextMatchPolicy::UnicodeLowercase;
+        let numeric = Value::Text("500".to_string());
+        let valid = ParsedCell::Valid(ExactDecimal::parse("500").unwrap());
+        assert_eq!(
+            text_cell_equality(
+                Some(&numeric),
+                Some(&valid),
+                Some(InferredColumnType::Mixed),
+                "500",
+                policy
+            ),
+            None
+        );
+        let text = Value::Text("Unemployed".to_string());
+        let malformed = ParsedCell::Malformed {
+            raw_text: "Unemployed".to_string(),
+            reason: ExactDecimal::parse("Unemployed").unwrap_err(),
+        };
+        assert_eq!(
+            text_cell_equality(
+                Some(&text),
+                Some(&malformed),
+                Some(InferredColumnType::Mixed),
+                "unemployed",
+                policy
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            text_cell_equality(Some(&Value::Blank), None, None, "", policy),
+            None
+        );
+        assert_eq!(text_cell_equality(None, None, None, "", policy), None);
+        assert_eq!(
+            text_cell_equality(Some(&text), None, None, "unemployed ", policy),
+            Some(false)
+        );
     }
 }

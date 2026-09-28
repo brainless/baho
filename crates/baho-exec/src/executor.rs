@@ -6,7 +6,7 @@ use baho_model::column::{ColumnDefinition, InferredColumnType, ParsedColumn};
 use baho_model::diagnostic::{Diagnostic, Severity};
 use baho_model::document::{CellAddress, ParsedCell, SourcedCell, Value};
 use baho_model::materialized::{MaterializedRow, MaterializedView, RowProvenance};
-use baho_model::text_match::TextMatchPolicy;
+use baho_model::text_match::{TextMatchPolicy, text_cell_equality};
 use baho_plan::plan::{ComparisonOperator, DistinctKeep, Expression, Literal, Plan, PlanStep};
 use baho_plan::validation::validate_plan_structure;
 
@@ -490,36 +490,26 @@ fn evaluate_compare(
             // In a materially mixed column, cells that strict-parse as valid
             // decimals are type-incompatible with a text literal and evaluate
             // to `unknown`; malformed non-numeric cells still string-compare.
-            let mixed = evaluator
-                .typed
-                .get(column)
-                .is_some_and(|data| data.inferred == InferredColumnType::Mixed);
-            if mixed {
-                let cell = evaluator.typed_cell(column, source_row)?;
-                if !matches!(cell.parsed, ParsedCell::Malformed { .. }) {
-                    return Ok(TruthValue::Unknown);
-                }
-            }
+            let typed = evaluator.typed.get(column);
+            let parsed = if typed.is_some_and(|data| data.inferred == InferredColumnType::Mixed) {
+                Some(&evaluator.typed_cell(column, source_row)?.parsed)
+            } else {
+                None
+            };
             let value = evaluator.raw_value(values, column)?;
-            Ok(match value {
-                None | Some(Value::Blank) => TruthValue::Unknown,
-                Some(Value::Text(text)) => {
-                    // Epic 008 locked decision 1: fold both sides under the
-                    // plan's text-match policy; raw spellings never change.
-                    let equal = evaluator.text_match.text_eq(text, expected);
-                    match operator {
-                        ComparisonOperator::Equal => TruthValue::from_bool(equal),
-                        ComparisonOperator::NotEqual => TruthValue::from_bool(!equal),
-                        // Ordered text comparisons are rejected by plan
-                        // structural validation; unknown keeps evaluation
-                        // total for direct callers.
-                        ComparisonOperator::Less
-                        | ComparisonOperator::LessOrEqual
-                        | ComparisonOperator::Greater
-                        | ComparisonOperator::GreaterOrEqual => TruthValue::Unknown,
-                    }
-                }
-                Some(_) => TruthValue::Unknown,
+            let equal = text_cell_equality(
+                value,
+                parsed,
+                typed.map(|data| data.inferred),
+                expected,
+                evaluator.text_match,
+            );
+            Ok(match (operator, equal) {
+                (ComparisonOperator::Equal, Some(equal)) => TruthValue::from_bool(equal),
+                (ComparisonOperator::NotEqual, Some(equal)) => TruthValue::from_bool(!equal),
+                // Ordered text comparisons are rejected by plan structural
+                // validation; unknown keeps evaluation total for direct callers.
+                _ => TruthValue::Unknown,
             })
         }
         Literal::Decimal(expected) => {

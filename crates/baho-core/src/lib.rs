@@ -7,12 +7,14 @@
 
 pub mod candidate_selection;
 pub mod error;
+pub mod grounding;
 pub mod intent;
 pub mod orchestration;
 
 pub use baho_ingest_csv::{CandidateConfig, ParserConfig};
 pub use candidate_selection::select_candidate;
 pub use error::{CoreError, IntentError};
+pub use grounding::*;
 pub use intent::{
     CanonicalAction, CanonicalOperation, DeferredLiteralError, RecognizedIntent, RecognizedRequest,
     RowFilterIntent, compile_intent_to_plan, compile_request_to_plan, recognize_intent,
@@ -20,5 +22,6 @@ pub use intent::{
 };
 pub use orchestration::{
     CoreEvent, CoreOutcome, CoreResult, OpenTableFailure, OpenedRow, OpenedTable, RawCell,
-    dispatch_format, execute_prompt, open_table, run_pipeline,
+    dispatch_format, execute_prompt, execute_prompt_with_clarification, open_table,
+    resolve_pipeline, run_pipeline,
 };

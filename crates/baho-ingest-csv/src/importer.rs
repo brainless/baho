@@ -21,6 +21,12 @@ use crate::row_features::compute_row_features_with_config;
 /// Errors encountered while reparsing the selected source region.
 #[derive(Debug, thiserror::Error)]
 pub enum SelectedRegionError {
+    #[error("source revision changed while grounding")]
+    RevisionChanged,
+    #[error("could not verify source revision: {detail}")]
+    RevisionCheck { detail: String },
+    #[error("selected source row {row} is missing")]
+    SelectedRowMissing { row: usize },
     #[error("I/O error reading `{path}`: {source}")]
     Io {
         path: PathBuf,
@@ -48,6 +54,124 @@ pub struct SelectedRegion {
     pub body_end_row: usize,
     pub classifications: Vec<RowClassification>,
     pub classification_count: usize,
+}
+
+/// Reopen only the selected source rows for grounding. The row numbers come
+/// from the selected region, so notes and blank separators are excluded.
+pub struct SelectedTableStream<I> {
+    path: PathBuf,
+    expected_hash: String,
+    reader: csv::Reader<BufReader<fs::File>>,
+    selected: I,
+    next_selected: Option<usize>,
+    next_source_row: usize,
+    finished: bool,
+    max_field_size: usize,
+}
+
+impl<I: Iterator<Item = usize>> SelectedTableStream<I> {
+    pub fn open(
+        path: &Path,
+        expected_hash: &str,
+        config: &ParserConfig,
+        mut selected: I,
+    ) -> Result<Self, SelectedRegionError> {
+        verify_revision(path, expected_hash)?;
+        let file = fs::File::open(path).map_err(|source| SelectedRegionError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let reader = csv::ReaderBuilder::new()
+            .delimiter(config.dialect.delimiter)
+            .quote(config.dialect.quote)
+            .escape(Some(config.dialect.quote_escape))
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(BufReader::new(file));
+        let next_selected = selected.next();
+        Ok(Self {
+            path: path.to_path_buf(),
+            expected_hash: expected_hash.to_owned(),
+            reader,
+            selected,
+            next_selected,
+            next_source_row: 0,
+            finished: false,
+            max_field_size: config.inspection.max_field_size,
+        })
+    }
+}
+
+fn verify_revision(path: &Path, expected_hash: &str) -> Result<(), SelectedRegionError> {
+    let actual =
+        compute_content_hash(path).map_err(|error| SelectedRegionError::RevisionCheck {
+            detail: error.to_string(),
+        })?;
+    if actual != expected_hash {
+        return Err(SelectedRegionError::RevisionChanged);
+    }
+    Ok(())
+}
+
+impl<I: Iterator<Item = usize>> Iterator for SelectedTableStream<I> {
+    type Item = Result<crate::inspector::LogicalRecord, SelectedRegionError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        loop {
+            let Some(wanted) = self.next_selected else {
+                self.finished = true;
+                return match verify_revision(&self.path, &self.expected_hash) {
+                    Ok(()) => None,
+                    Err(error) => Some(Err(error)),
+                };
+            };
+            let mut record = csv::StringRecord::new();
+            let row = self.next_source_row;
+            match self.reader.read_record(&mut record) {
+                Ok(true) => self.next_source_row += 1,
+                Ok(false) => {
+                    self.finished = true;
+                    return Some(Err(SelectedRegionError::SelectedRowMissing { row: wanted }));
+                }
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(SelectedRegionError::MalformedRecord {
+                        row,
+                        detail: error.to_string(),
+                    }));
+                }
+            }
+            if row < wanted {
+                continue;
+            }
+            if row != wanted {
+                self.finished = true;
+                return Some(Err(SelectedRegionError::SelectedRowMissing { row: wanted }));
+            }
+            self.next_selected = self.selected.next();
+            if let Some((col, field)) = record
+                .iter()
+                .enumerate()
+                .find(|(_, field)| field.len() > self.max_field_size)
+            {
+                self.finished = true;
+                return Some(Err(SelectedRegionError::FieldTooLarge {
+                    row,
+                    col,
+                    size: field.len(),
+                    max_size: self.max_field_size,
+                }));
+            }
+            return Some(Ok(crate::inspector::LogicalRecord {
+                index: row,
+                fields: record.iter().map(str::to_owned).collect(),
+                is_blank: false,
+            }));
+        }
+    }
 }
 
 /// CSV format importer.

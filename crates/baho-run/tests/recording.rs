@@ -1,6 +1,7 @@
 use std::{fs, thread};
 
-use baho_run::{InputIdentity, Invocation, PendingRun};
+use baho_core::{ClarificationChoice, ClarificationResponse};
+use baho_run::{InputIdentity, Invocation, PendingRun, load_pending_clarification};
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -108,4 +109,140 @@ fn concurrent_shared_reservations_are_unique() {
             ]
         );
     });
+}
+
+#[test]
+fn clarification_is_versioned_and_resolution_links_a_new_immutable_run() {
+    let workspace = tempdir().unwrap();
+    let input = workspace.path().join("sample.csv");
+    fs::write(
+        &input,
+        "ID,Job,Note,Amount\n1,unemployed,other,5\n2,employed,unemployed,20\n3,employed,other,1\n",
+    )
+    .unwrap();
+    let prompt = "List rows where unemployed and < 10";
+    let runs = workspace.path().join(".baho/runs");
+    let pending = PendingRun::reserve(&runs, invocation(workspace.path(), "run"), prompt).unwrap();
+    let original_result = baho_core::run_pipeline(&input, prompt);
+    let original = pending
+        .record_result(
+            InputIdentity::inspect(&input, &input).unwrap(),
+            &original_result,
+        )
+        .unwrap();
+    assert!(original.needs_clarification);
+    assert!(!original.materialized);
+    let original_manifest: Value =
+        serde_json::from_slice(&fs::read(runs.join("000001/manifest.json")).unwrap()).unwrap();
+    assert_eq!(original_manifest["schema_version"], 2);
+    assert_eq!(original_manifest["outcome"], "needs_clarification");
+    assert!(original_manifest["clarification_request_id"].is_string());
+    assert!(
+        original_manifest["artifacts"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from("grounding.json"))
+    );
+    assert!(!runs.join("000001/output/result.json").exists());
+    let saved = load_pending_clarification(&runs, &original.id).unwrap();
+    assert_eq!(saved.prompt, prompt);
+    assert_eq!(saved.input_path, input);
+    let grounding: Value =
+        serde_json::from_slice(&fs::read(runs.join("000001/grounding.json")).unwrap()).unwrap();
+    assert_eq!(grounding["schema_version"], 2);
+    assert_eq!(grounding["outcome"]["status"], "needs_clarification");
+    let response = ClarificationResponse {
+        schema_version: saved.request.schema_version,
+        request_id: saved.request.request_id.clone(),
+        choices: saved
+            .request
+            .unresolved
+            .iter()
+            .map(|clause| ClarificationChoice {
+                clause_id: clause.clause_id.clone(),
+                selected_candidate_id: clause.candidates[0].candidate_id.clone(),
+            })
+            .collect(),
+    };
+    let before = fs::read(runs.join("000001/manifest.json")).unwrap();
+    let resumed_result =
+        baho_core::resolve_pipeline(&saved.input_path, &saved.prompt, &saved.request, &response);
+    let resumed = PendingRun::reserve(&runs, invocation(workspace.path(), "resolve"), prompt)
+        .unwrap()
+        .link_resolution(&saved, response.clone())
+        .unwrap()
+        .record_result(
+            InputIdentity::inspect(&input, &input).unwrap(),
+            &resumed_result,
+        )
+        .unwrap();
+    assert_eq!(resumed.id, "000002");
+    assert!(resumed.materialized);
+    assert_eq!(fs::read(runs.join("000001/manifest.json")).unwrap(), before);
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(runs.join("000002/manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["resumes_run_id"], "000001");
+    assert_eq!(manifest["clarification_request_id"], response.request_id);
+    assert!(
+        manifest["artifacts"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from("clarification-response.json"))
+    );
+    assert!(runs.join("000002/output/result.json").is_file());
+}
+
+#[test]
+fn pending_loader_rejects_tampered_prompt_and_parser_configuration() {
+    let workspace = tempdir().unwrap();
+    let input = workspace.path().join("sample.csv");
+    fs::write(
+        &input,
+        "ID,Job,Note\n1,unemployed,other\n2,employed,unemployed\n",
+    )
+    .unwrap();
+    let prompt = "List rows where unemployed";
+    let runs = workspace.path().join(".baho/runs");
+    let result = baho_core::run_pipeline(&input, prompt);
+    PendingRun::reserve(&runs, invocation(workspace.path(), "run"), prompt)
+        .unwrap()
+        .record_result(InputIdentity::inspect(&input, &input).unwrap(), &result)
+        .unwrap();
+    let directory = runs.join("000001");
+    assert!(load_pending_clarification(&runs, "000001").is_ok());
+    let grounding_path = directory.join("grounding.json");
+    let mut grounding: Value = serde_json::from_slice(&fs::read(&grounding_path).unwrap()).unwrap();
+    grounding["schema_version"] = Value::from(1);
+    fs::write(&grounding_path, serde_json::to_vec(&grounding).unwrap()).unwrap();
+    assert!(load_pending_clarification(&runs, "000001").is_err());
+    grounding["schema_version"] = Value::from(2);
+    fs::write(&grounding_path, serde_json::to_vec(&grounding).unwrap()).unwrap();
+    fs::write(directory.join("intent.txt"), "changed prompt").unwrap();
+    assert!(load_pending_clarification(&runs, "000001").is_err());
+    fs::write(directory.join("intent.txt"), prompt).unwrap();
+    let config_path = directory.join("parser-config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["dialect"]["delimiter"] = Value::from(59);
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(load_pending_clarification(&runs, "000001").is_err());
+}
+
+#[test]
+fn historical_and_nonpending_runs_cannot_be_loaded_as_clarifications() {
+    let workspace = tempdir().unwrap();
+    let runs = workspace.path().join(".baho/runs");
+    let input = workspace.path().join("sample.csv");
+    fs::write(&input, "name\nAda\n").unwrap();
+    let result = baho_core::run_pipeline(&input, "List name");
+    PendingRun::reserve(&runs, invocation(workspace.path(), "run"), "List name")
+        .unwrap()
+        .record_result(InputIdentity::inspect(&input, &input).unwrap(), &result)
+        .unwrap();
+    assert!(load_pending_clarification(&runs, "000001").is_err());
+    assert!(load_pending_clarification(&runs, "../000001").is_err());
+    let manifest_path = runs.join("000001/manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["schema_version"] = Value::from(1);
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(load_pending_clarification(&runs, "000001").is_err());
 }

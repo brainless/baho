@@ -53,7 +53,7 @@ fn run_records_the_request_and_input_identity() {
     let manifest: Value =
         serde_json::from_slice(&fs::read(run.join("manifest.json")).expect("read manifest"))
             .expect("valid manifest JSON");
-    assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(manifest["schema_version"], 2);
     assert_eq!(manifest["run_id"], "000001");
     assert_eq!(manifest["outcome"], "materialized");
     assert_eq!(manifest["invocation"]["subcommand"], "run");
@@ -114,7 +114,7 @@ fn run_records_the_request_and_input_identity() {
         &fs::read(run.join("parser-config.json")).expect("read parser-config"),
     )
     .expect("valid parser-config JSON");
-    assert_eq!(parser_config["schema_version"], 1);
+    assert_eq!(parser_config["schema_version"], 2);
     assert_eq!(parser_config["dialect"]["delimiter"], b',');
     assert_eq!(parser_config["dialect"]["quote"], b'"');
     assert_eq!(parser_config["inspection"]["max_sample_records"], 1000);
@@ -750,7 +750,8 @@ fn mixed_compared_column_refusal_writes_parse_diagnostics() {
             "input-profile.json",
             "parser-config.json",
             "candidates.json",
-            "plan.json"
+            "plan.json",
+            "grounding.json"
         ]
     );
 
