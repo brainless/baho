@@ -28,14 +28,16 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-use baho_gui::{GuiSession, SelectionState};
+use baho_gui::{GuiSession, SelectionState, SubmissionStatus, SubmitRequest};
 mod script;
 use script::{ScriptRunner, parse_script};
 
 #[derive(Debug, Parser)]
 #[command(name = "baho-gui", about = "View a selected baho table")]
 struct Args {
-    input: std::path::PathBuf,
+    /// A CSV file to open at startup. When omitted, drop a file onto the
+    /// window to open it.
+    input: Option<std::path::PathBuf>,
     #[arg(long)]
     screenshot: Option<std::path::PathBuf>,
     #[arg(long, default_value_t = 1.0)]
@@ -61,12 +63,19 @@ struct AppState {
     page: PageLayout,
     prompt_node: NodeId,
     submit_node: NodeId,
+    history_node: NodeId,
     status_node: NodeId,
     grid_container_node: NodeId,
     grid_node: NodeId,
     grid_state: DataGridState,
     selection: SelectionState,
-    session: GuiSession,
+    session: Option<GuiSession>,
+    empty_state_message: String,
+    /// Prompts the user has typed, kept in memory only and keyed by the
+    /// absolute source path so switching files (via drag-and-drop) does not
+    /// mix histories or require persistence.
+    history: std::collections::BTreeMap<std::path::PathBuf, Vec<String>>,
+    current_input_path: Option<std::path::PathBuf>,
     runs_directory: std::path::PathBuf,
     invocation: Invocation,
 }
@@ -80,6 +89,7 @@ struct AppLayout {
     page: PageLayout,
     prompt: NodeId,
     submit: NodeId,
+    history: NodeId,
     status: NodeId,
     grid_container: NodeId,
     grid: NodeId,
@@ -127,6 +137,15 @@ fn build_app_layout(layout: &mut Layout) -> AppLayout {
         },
         ..Default::default()
     });
+    let history = layout.new_leaf(Style {
+        flex_grow: 1.0,
+        flex_shrink: 1.0,
+        size: Size {
+            width: Dimension::percent(1.0),
+            height: length(0.0_f32),
+        },
+        ..Default::default()
+    });
     let status = layout.new_leaf(Style {
         flex_shrink: 0.0,
         size: Size {
@@ -135,7 +154,7 @@ fn build_app_layout(layout: &mut Layout) -> AppLayout {
         },
         ..Default::default()
     });
-    layout.set_children(sidebar, &[prompt, submit, status]);
+    layout.set_children(sidebar, &[history, prompt, submit, status]);
 
     layout.set_padding(
         page.main,
@@ -173,6 +192,7 @@ fn build_app_layout(layout: &mut Layout) -> AppLayout {
         ("sidebar", sidebar),
         ("prompt", prompt),
         ("submit", submit),
+        ("history", history),
         ("status", status),
         ("grid_container", grid_container),
         ("grid", grid),
@@ -183,6 +203,7 @@ fn build_app_layout(layout: &mut Layout) -> AppLayout {
         page,
         prompt,
         submit,
+        history,
         status,
         grid_container,
         grid,
@@ -218,10 +239,65 @@ fn grid_has_keyboard_focus(layout: &Layout, grid: NodeId, focused_id: Option<u64
     focused_id == Some(layout.widget_id_keyed(grid, 0))
 }
 
+const HISTORY_PATH_BUDGET: usize = 36;
+
+/// Shortens a path for a narrow sidebar while always keeping the file name
+/// fully visible, e.g. `…/deep/nested/report.csv`.
+fn truncate_path_for_display(path: &std::path::Path, budget: usize) -> String {
+    let full = path.display().to_string();
+    if full.chars().count() <= budget {
+        return full;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&full);
+    if file_name.chars().count() + 1 >= budget {
+        return format!("…{}", tail_chars(file_name, budget.saturating_sub(1)));
+    }
+    let remaining = budget - file_name.chars().count() - 1;
+    let head = tail_chars(&full[..full.len() - file_name.len()], remaining);
+    format!("…{head}{file_name}")
+}
+
+fn tail_chars(text: &str, count: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let start = chars.len().saturating_sub(count);
+    chars[start..].iter().collect()
+}
+
+/// Renders the sidebar history panel text for `path`: a truncated header
+/// followed by every prompt recorded for it, most recent first. History is
+/// in-memory only (Epic: GUI drag-and-drop follow-up) and keyed by absolute
+/// path, so switching files never mixes histories.
+fn render_history_panel(
+    path: Option<&std::path::Path>,
+    history: &std::collections::BTreeMap<std::path::PathBuf, Vec<String>>,
+) -> String {
+    let Some(path) = path else {
+        return String::new();
+    };
+    let header = truncate_path_for_display(path, HISTORY_PATH_BUDGET);
+    let entries = history.get(path).map(Vec::as_slice).unwrap_or_default();
+    if entries.is_empty() {
+        return format!("{header}\nNo searches yet");
+    }
+    let mut lines = vec![header];
+    lines.extend(
+        entries
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(index, prompt)| format!("{}. {}", index + 1, prompt)),
+    );
+    lines.join("\n")
+}
+
 struct App {
     state: Option<AppState>,
     args: Args,
     initial_session: Option<GuiSession>,
+    initial_input_path: Option<std::path::PathBuf>,
     fatal_error: Option<anyhow::Error>,
     script: Option<ScriptRunner>,
     start_time: Option<Instant>,
@@ -250,6 +326,30 @@ fn main() {
     }
 }
 
+const DEFAULT_EMPTY_STATE_MESSAGE: &str = "Drop a CSV file here to open it";
+
+/// Opens `input` (relative paths are resolved against `working_directory`)
+/// and adapts it into a fresh `GuiSession`. Shared by startup and by
+/// drag-and-drop, which both need to turn a path into a ready session.
+fn open_session(
+    input: &std::path::Path,
+    working_directory: &std::path::Path,
+) -> Result<(GuiSession, Vec<Diagnostic>, std::path::PathBuf)> {
+    let absolute_input = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        working_directory.join(input)
+    };
+    let table =
+        open_table(&absolute_input).map_err(|failure| anyhow::anyhow!(failure.to_string()))?;
+    let diagnostics = table.diagnostics.clone();
+    let input_identity =
+        InputIdentity::from_snapshot(input, &absolute_input, &table.source_revision);
+    let session =
+        GuiSession::new(table, input_identity).context("could not adapt opened table to a grid")?;
+    Ok((session, diagnostics, absolute_input))
+}
+
 fn run() -> Result<()> {
     let args = Args::parse();
     if args.delay < 0.0 || !args.delay.is_finite() {
@@ -273,25 +373,22 @@ fn run() -> Result<()> {
         })
         .transpose()?;
     let working_directory = std::env::current_dir().context("could not read working directory")?;
-    let absolute_input = if args.input.is_absolute() {
-        args.input.clone()
-    } else {
-        working_directory.join(&args.input)
+    let (initial_session, initial_input_path) = match &args.input {
+        Some(input) => {
+            let (session, diagnostics, absolute_input) = open_session(input, &working_directory)?;
+            if let Some(summary) = format_startup_diagnostics(&diagnostics) {
+                eprintln!("{summary}");
+            }
+            (Some(session), Some(absolute_input))
+        }
+        None => (None, None),
     };
-    let table =
-        open_table(&absolute_input).map_err(|failure| anyhow::anyhow!(failure.to_string()))?;
-    if let Some(summary) = format_startup_diagnostics(&table.diagnostics) {
-        eprintln!("{summary}");
-    }
-    let input_identity =
-        InputIdentity::from_snapshot(&args.input, &absolute_input, &table.source_revision);
-    let session =
-        GuiSession::new(table, input_identity).context("could not adapt opened table to a grid")?;
     let event_loop = EventLoop::new().context("could not create event loop")?;
     let mut app = App {
         state: None,
         args,
-        initial_session: Some(session),
+        initial_session,
+        initial_input_path,
         fatal_error: None,
         script,
         start_time: None,
@@ -370,14 +467,16 @@ impl ApplicationHandler for App {
         if self.state.is_some() {
             return;
         }
-        let title = format!(
-            "baho — {}",
-            self.args
-                .input
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("table")
-        );
+        let title = match &self.args.input {
+            Some(input) => format!(
+                "baho — {}",
+                input
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("table")
+            ),
+            None => "baho — drop a CSV file to begin".to_owned(),
+        };
         let window = match event_loop.create_window(
             WindowAttributes::default()
                 .with_title(title)
@@ -455,10 +554,8 @@ impl ApplicationHandler for App {
         );
         let mut layout = Layout::new();
         let app_layout = build_app_layout(&mut layout);
-        let Some(session) = self.initial_session.take() else {
-            self.fail(event_loop, anyhow::anyhow!("table was already initialized"));
-            return;
-        };
+        let session = self.initial_session.take();
+        let current_input_path = self.initial_input_path.take();
         self.start_time = Some(Instant::now());
         self.state = Some(AppState {
             window,
@@ -471,12 +568,16 @@ impl ApplicationHandler for App {
             page: app_layout.page,
             prompt_node: app_layout.prompt,
             submit_node: app_layout.submit,
+            history_node: app_layout.history,
             status_node: app_layout.status,
             grid_container_node: app_layout.grid_container,
             grid_node: app_layout.grid,
             grid_state: DataGridState::new(),
             selection: SelectionState::default(),
             session,
+            empty_state_message: DEFAULT_EMPTY_STATE_MESSAGE.to_owned(),
+            history: std::collections::BTreeMap::new(),
+            current_input_path,
             runs_directory: self.working_directory.join(".baho/runs"),
             invocation: Invocation {
                 command: "baho-gui".to_owned(),
@@ -517,6 +618,19 @@ impl ApplicationHandler for App {
             _ => {}
         }
         process_window_event(&mut state.core.input, &event);
+        // The unpositioned drops queue is drained here, before the next
+        // redraw's `AkarCore::begin_frame` clears it (winit reports drops
+        // without a cursor position, so they are window-level, not
+        // targeted at a layout node).
+        if !state.core.input.unpositioned_file_drops.is_empty() {
+            let drops = std::mem::take(&mut state.core.input.unpositioned_file_drops);
+            if let Some(path) = drops.into_iter().flatten().next_back() {
+                self.load_dropped_file(path);
+            }
+        }
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
         state.window.request_redraw();
     }
 
@@ -550,6 +664,44 @@ impl App {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
         self.fatal_error = Some(error);
         event_loop.exit();
+    }
+
+    /// Opens a dropped file as a fresh session, replacing whatever table (if
+    /// any) was already open. A failed open never tears down an existing
+    /// session; it reports the error where the user is currently looking.
+    fn load_dropped_file(&mut self, path: std::path::PathBuf) {
+        let working_directory = self.working_directory.clone();
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        match open_session(&path, &working_directory) {
+            Ok((session, diagnostics, absolute_input)) => {
+                if let Some(summary) = format_startup_diagnostics(&diagnostics) {
+                    eprintln!("{summary}");
+                }
+                let title = format!(
+                    "baho — {}",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("table")
+                );
+                state.window.set_title(&title);
+                state.grid_state = DataGridState::new();
+                state.selection = SelectionState::default();
+                state.session = Some(session);
+                state.current_input_path = Some(absolute_input);
+            }
+            Err(error) => {
+                let message = format!("Could not open {}: {error:#}", path.display());
+                match state.session.as_mut() {
+                    Some(session) => {
+                        session.status = SubmissionStatus::Failure {
+                            run_id: None,
+                            message,
+                        }
+                    }
+                    None => state.empty_state_message = message,
+                }
+            }
+        }
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
@@ -592,152 +744,197 @@ impl App {
         if dump_this_frame {
             state.core.draw_list.start_recording();
         }
-        let _prompt_response = akar_text_input(
-            &mut state.core,
-            &state.layout,
-            state.prompt_node,
-            &mut state.session.prompt,
-            &mut state.session.prompt_edit,
-            "Describe the result",
-            true,
-            &AKAR_THEME_DARK,
-        );
-        let submit = akar_button(
-            &mut state.core,
-            &state.layout,
-            state.submit_node,
-            "Submit",
-            ButtonVariant::Solid,
-            &AKAR_THEME_DARK,
-        );
-        if submit.clicked {
-            let _ = state.session.request_submit();
-        }
-        let status = state.session.status.message();
-        akar_paragraph(
-            &mut state.core,
-            &state.layout,
-            state.status_node,
-            &status,
-            None,
-            &AKAR_THEME_DARK,
-        );
-        let container_rect = state.layout.rect(state.grid_container_node);
-        if container_rect[2] > 0.0 && container_rect[3] > 0.0 {
-            state
-                .core
-                .draw_list
-                .push_quad(grid_container_quad(container_rect));
-        }
-        let style = DataGridStyle::from_theme(&AKAR_THEME_DARK);
-        let row_keys = state
-            .session
-            .display
-            .rows()
-            .iter()
-            .map(|row| row.key)
-            .collect::<Vec<_>>();
-        let descriptors = state
-            .session
-            .display
-            .columns()
-            .iter()
-            .map(|column| column.descriptor)
-            .collect::<Vec<_>>();
-        // Akar consumes navigation input before begin so the same frame uses
-        // the updated active cell and scroll position.
-        if grid_has_keyboard_focus(&state.layout, state.grid_node, state.core.input.focused_id) {
-            let _ = data_grid_handle_keyboard(
+        let mut dumped_visible: Option<(std::ops::Range<usize>, std::ops::Range<usize>)> = None;
+        let processed = if let Some(session) = state.session.as_mut() {
+            let _prompt_response = akar_text_input(
+                &mut state.core,
+                &state.layout,
+                state.prompt_node,
+                &mut session.prompt,
+                &mut session.prompt_edit,
+                "Describe the result",
+                true,
+                &AKAR_THEME_DARK,
+            );
+            let submit = akar_button(
+                &mut state.core,
+                &state.layout,
+                state.submit_node,
+                "Submit",
+                ButtonVariant::Solid,
+                &AKAR_THEME_DARK,
+            );
+            if submit.clicked {
+                let prompt = session.prompt.trim().to_owned();
+                if session.request_submit() == SubmitRequest::Queued {
+                    if let Some(path) = &state.current_input_path {
+                        state.history.entry(path.clone()).or_default().push(prompt);
+                    }
+                }
+            }
+            let status = session.status.message();
+            akar_paragraph(
+                &mut state.core,
+                &state.layout,
+                state.status_node,
+                &status,
+                None,
+                &AKAR_THEME_DARK,
+            );
+            let history_text =
+                render_history_panel(state.current_input_path.as_deref(), &state.history);
+            akar_paragraph(
+                &mut state.core,
+                &state.layout,
+                state.history_node,
+                &history_text,
+                None,
+                &AKAR_THEME_DARK,
+            );
+            let container_rect = state.layout.rect(state.grid_container_node);
+            if container_rect[2] > 0.0 && container_rect[3] > 0.0 {
+                state
+                    .core
+                    .draw_list
+                    .push_quad(grid_container_quad(container_rect));
+            }
+            let style = DataGridStyle::from_theme(&AKAR_THEME_DARK);
+            let row_keys = session
+                .display
+                .rows()
+                .iter()
+                .map(|row| row.key)
+                .collect::<Vec<_>>();
+            let descriptors = session
+                .display
+                .columns()
+                .iter()
+                .map(|column| column.descriptor)
+                .collect::<Vec<_>>();
+            // Akar consumes navigation input before begin so the same frame uses
+            // the updated active cell and scroll position.
+            if grid_has_keyboard_focus(&state.layout, state.grid_node, state.core.input.focused_id)
+            {
+                let _ = data_grid_handle_keyboard(
+                    &mut state.core,
+                    &state.layout,
+                    state.grid_node,
+                    &mut state.grid_state,
+                    session.display.rows().len(),
+                    &row_keys,
+                    &descriptors,
+                    &style,
+                );
+            }
+            let selected = state
+                .grid_state
+                .has_active_cell
+                .then_some(state.grid_state.active_row_key)
+                .into_iter()
+                .collect::<Vec<_>>();
+            let response = data_grid_begin(
                 &mut state.core,
                 &state.layout,
                 state.grid_node,
                 &mut state.grid_state,
-                state.session.display.rows().len(),
+                session.display.rows().len(),
                 &row_keys,
+                style.row_height,
+                style.header_height,
                 &descriptors,
                 &style,
             );
-        }
-        let selected = state
-            .grid_state
-            .has_active_cell
-            .then_some(state.grid_state.active_row_key)
-            .into_iter()
-            .collect::<Vec<_>>();
-        let response = data_grid_begin(
-            &mut state.core,
-            &state.layout,
-            state.grid_node,
-            &mut state.grid_state,
-            state.session.display.rows().len(),
-            &row_keys,
-            style.row_height,
-            style.header_height,
-            &descriptors,
-            &style,
-        );
-        data_grid_header_begin(&mut state.core, &response, &style);
-        for column_index in response.visible_columns.clone() {
-            if let Some(column) = state.session.display.columns().get(column_index) {
-                let _ = data_grid_header_cell(
-                    &mut state.core,
-                    &state.layout,
-                    &response,
-                    state.grid_node,
-                    column_index,
-                    &descriptors,
-                    &style,
-                    &column.display_name,
-                    DataGridSortDirection::None,
-                );
-            }
-        }
-        data_grid_header_end(&mut state.core);
-        data_grid_body_begin(&mut state.core, &response, &row_keys, &style, &selected);
-        for row_index in response.visible_rows.clone() {
+            data_grid_header_begin(&mut state.core, &response, &style);
             for column_index in response.visible_columns.clone() {
-                let Some(row) = state.session.display.rows().get(row_index) else {
-                    continue;
-                };
-                let Some(column) = state.session.display.columns().get(column_index) else {
-                    continue;
-                };
-                let text = state
-                    .session
-                    .display
-                    .cell_text(row_index, column_index)
-                    .unwrap_or("");
-                let cell = data_grid_cell(
-                    &mut state.core,
-                    &state.layout,
-                    &response,
-                    state.grid_node,
-                    row_index,
-                    row.key,
-                    column_index,
-                    &descriptors,
-                    &style,
-                    text,
-                    selected.contains(&row.key),
-                );
-                if cell.clicked {
-                    state.grid_state.active_row_key = row.key;
-                    state.grid_state.active_column_key = column.descriptor.key;
-                    state.grid_state.has_active_cell = true;
-                    state.selection.activate(row.key, column.descriptor.key);
-                    state.core.input.focused_id =
-                        Some(state.layout.widget_id_keyed(state.grid_node, 0));
+                if let Some(column) = session.display.columns().get(column_index) {
+                    let _ = data_grid_header_cell(
+                        &mut state.core,
+                        &state.layout,
+                        &response,
+                        state.grid_node,
+                        column_index,
+                        &descriptors,
+                        &style,
+                        &column.display_name,
+                        DataGridSortDirection::None,
+                    );
                 }
             }
-        }
-        data_grid_body_end(&mut state.core);
-        data_grid_end(&mut state.core);
-        let processed = state.session.process_pending(
-            &state.runs_directory,
-            state.invocation.clone(),
-            &mut state.grid_state,
-            &mut state.selection,
-        );
+            data_grid_header_end(&mut state.core);
+            data_grid_body_begin(&mut state.core, &response, &row_keys, &style, &selected);
+            for row_index in response.visible_rows.clone() {
+                for column_index in response.visible_columns.clone() {
+                    let Some(row) = session.display.rows().get(row_index) else {
+                        continue;
+                    };
+                    let Some(column) = session.display.columns().get(column_index) else {
+                        continue;
+                    };
+                    let text = session
+                        .display
+                        .cell_text(row_index, column_index)
+                        .unwrap_or("");
+                    let cell = data_grid_cell(
+                        &mut state.core,
+                        &state.layout,
+                        &response,
+                        state.grid_node,
+                        row_index,
+                        row.key,
+                        column_index,
+                        &descriptors,
+                        &style,
+                        text,
+                        selected.contains(&row.key),
+                    );
+                    if cell.clicked {
+                        state.grid_state.active_row_key = row.key;
+                        state.grid_state.active_column_key = column.descriptor.key;
+                        state.grid_state.has_active_cell = true;
+                        state.selection.activate(row.key, column.descriptor.key);
+                        state.core.input.focused_id =
+                            Some(state.layout.widget_id_keyed(state.grid_node, 0));
+                    }
+                }
+            }
+            data_grid_body_end(&mut state.core);
+            data_grid_end(&mut state.core);
+            dumped_visible = Some((
+                response.visible_rows.clone(),
+                response.visible_columns.clone(),
+            ));
+            session.process_pending(
+                &state.runs_directory,
+                state.invocation.clone(),
+                &mut state.grid_state,
+                &mut state.selection,
+            )
+        } else {
+            akar_paragraph(
+                &mut state.core,
+                &state.layout,
+                state.status_node,
+                &state.empty_state_message,
+                None,
+                &AKAR_THEME_DARK,
+            );
+            let container_rect = state.layout.rect(state.grid_container_node);
+            if container_rect[2] > 0.0 && container_rect[3] > 0.0 {
+                state
+                    .core
+                    .draw_list
+                    .push_quad(grid_container_quad(container_rect));
+            }
+            akar_paragraph(
+                &mut state.core,
+                &state.layout,
+                state.grid_node,
+                "Drop a CSV file here to open it",
+                None,
+                &AKAR_THEME_DARK,
+            );
+            false
+        };
         let timed_capture = !self.screenshot_taken
             && self.args.screenshot.is_some()
             && self
@@ -787,7 +984,8 @@ impl App {
             let _ = state.core.end_frame(&state.device, &state.queue, &mut pass);
         }
         if let Some(path) = self.args.dump_frame.as_ref().filter(|_| dump_this_frame) {
-            let dump = serde_json::json!({ "recorded_calls": state.core.draw_list.recorded_calls(), "labeled_rects": state.layout.labeled_rects(), "visible_rows": response.visible_rows, "visible_columns": response.visible_columns });
+            let (visible_rows, visible_columns) = dumped_visible.unwrap_or((0..0, 0..0));
+            let dump = serde_json::json!({ "recorded_calls": state.core.draw_list.recorded_calls(), "labeled_rects": state.layout.labeled_rects(), "visible_rows": visible_rows, "visible_columns": visible_columns });
             if let Err(error) = std::fs::File::create(path).and_then(|file| {
                 serde_json::to_writer_pretty(file, &dump).map_err(std::io::Error::other)
             }) {
@@ -848,10 +1046,12 @@ impl App {
 mod tests {
     use akar_layout::{Layout, Size};
     use baho_model::{Diagnostic, Severity};
+    use clap::Parser;
 
     use super::{
-        GRID_CONTAINER_RADIUS, SIDEBAR_WIDTH, build_app_layout, finish_event_loop,
-        format_startup_diagnostics, grid_container_quad, grid_has_keyboard_focus,
+        Args, GRID_CONTAINER_RADIUS, SIDEBAR_WIDTH, build_app_layout, finish_event_loop,
+        format_startup_diagnostics, grid_container_quad, grid_has_keyboard_focus, open_session,
+        render_history_panel, truncate_path_for_display,
     };
 
     #[test]
@@ -876,11 +1076,21 @@ mod tests {
             layout.rect(layout.resolve_label("grid").unwrap()),
             [SIDEBAR_WIDTH + 20.0, 20.0, 480.0, 560.0]
         );
-        for label in ["prompt", "submit", "status"] {
+        for label in ["prompt", "submit", "history", "status"] {
             let rect = layout.rect(layout.resolve_label(label).unwrap());
             assert!(rect[2] > 0.0, "{label} has width");
             assert!(rect[3] > 0.0, "{label} has height");
         }
+        // History sits at the top of the sidebar and grows to fill the
+        // remaining space; the prompt, submit, and status sit at the bottom.
+        let history_rect = layout.rect(layout.resolve_label("history").unwrap());
+        let prompt_rect = layout.rect(layout.resolve_label("prompt").unwrap());
+        let submit_rect = layout.rect(layout.resolve_label("submit").unwrap());
+        let status_rect = layout.rect(layout.resolve_label("status").unwrap());
+        assert_eq!(history_rect[1], 16.0);
+        assert!(prompt_rect[1] > history_rect[1]);
+        assert!(submit_rect[1] > prompt_rect[1]);
+        assert!(status_rect[1] > submit_rect[1]);
     }
 
     #[test]
@@ -956,5 +1166,89 @@ mod tests {
     #[test]
     fn startup_diagnostics_are_silent_when_none_exist() {
         assert_eq!(format_startup_diagnostics(&[]), None);
+    }
+
+    #[test]
+    fn input_argument_is_optional_so_the_gui_can_start_empty() {
+        let without_input = Args::try_parse_from(["baho-gui"]).unwrap();
+        assert!(without_input.input.is_none());
+
+        let with_input = Args::try_parse_from(["baho-gui", "table.csv"]).unwrap();
+        assert_eq!(
+            with_input.input.unwrap(),
+            std::path::PathBuf::from("table.csv")
+        );
+    }
+
+    #[test]
+    fn open_session_adapts_a_relative_path_against_the_working_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("table.csv"), "Name\nAda\n").unwrap();
+
+        let (session, diagnostics, absolute_input) =
+            open_session(std::path::Path::new("table.csv"), workspace.path()).unwrap();
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(session.display.columns()[0].display_name, "Name");
+        assert_eq!(absolute_input, workspace.path().join("table.csv"));
+    }
+
+    #[test]
+    fn open_session_reports_an_error_for_an_unreadable_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let error = open_session(std::path::Path::new("missing.csv"), workspace.path())
+            .expect_err("a missing file cannot be opened");
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn short_paths_are_shown_in_full() {
+        let path = std::path::Path::new("/tmp/report.csv");
+        assert_eq!(truncate_path_for_display(path, 36), "/tmp/report.csv");
+    }
+
+    #[test]
+    fn long_paths_are_truncated_but_keep_the_file_name() {
+        let path = std::path::Path::new("/Users/example/Projects/baho/data/very/deep/report.csv");
+        let truncated = truncate_path_for_display(path, 30);
+        assert!(truncated.chars().count() <= 30, "{truncated}");
+        assert!(truncated.starts_with('…'));
+        assert!(truncated.ends_with("report.csv"));
+    }
+
+    #[test]
+    fn a_file_name_alone_longer_than_the_budget_is_never_dropped() {
+        let path =
+            std::path::Path::new("/an-exceptionally-long-file-name-that-alone-exceeds-budget.csv");
+        let truncated = truncate_path_for_display(path, 20);
+        assert!(truncated.ends_with(".csv"));
+    }
+
+    #[test]
+    fn history_panel_is_empty_without_an_open_file() {
+        assert_eq!(render_history_panel(None, &Default::default()), "");
+    }
+
+    #[test]
+    fn history_panel_shows_the_header_even_with_no_searches_yet() {
+        let path = std::path::PathBuf::from("/tmp/report.csv");
+        let panel = render_history_panel(Some(&path), &Default::default());
+        assert_eq!(panel, "/tmp/report.csv\nNo searches yet");
+    }
+
+    #[test]
+    fn history_panel_lists_prompts_most_recent_first_for_the_current_file() {
+        let path = std::path::PathBuf::from("/tmp/report.csv");
+        let other = std::path::PathBuf::from("/tmp/other.csv");
+        let mut history = std::collections::BTreeMap::new();
+        history.insert(
+            path.clone(),
+            vec!["List name".to_owned(), "List city".to_owned()],
+        );
+        history.insert(other, vec!["List unrelated".to_owned()]);
+
+        let panel = render_history_panel(Some(&path), &history);
+
+        assert_eq!(panel, "/tmp/report.csv\n1. List city\n2. List name");
     }
 }

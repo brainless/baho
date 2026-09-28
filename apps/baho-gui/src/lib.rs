@@ -1,7 +1,9 @@
 use std::{ops::Range, path::Path};
 
 use akar_components::{DataGridAlign, DataGridColumn, DataGridState, TextEditState};
-use baho_core::{CoreOutcome, OpenedTable, RawCell, execute_prompt};
+use baho_core::{
+    CoreOutcome, GroundingOutcome, OpenedTable, PredicateForm, RawCell, execute_prompt,
+};
 use baho_model::{MaterializedView, Value};
 use baho_run::{InputIdentity, Invocation, PendingRun};
 use thiserror::Error;
@@ -162,6 +164,10 @@ pub enum SubmissionStatus {
     Success {
         run_id: String,
     },
+    NeedsClarification {
+        run_id: String,
+        message: String,
+    },
     Failure {
         run_id: Option<String>,
         message: String,
@@ -171,8 +177,11 @@ pub enum SubmissionStatus {
 impl SubmissionStatus {
     pub fn message(&self) -> String {
         match self {
-            Self::Idle => "Ready".to_owned(),
+            Self::Idle => String::new(),
             Self::Success { run_id } => format!("Run {run_id} materialized"),
+            Self::NeedsClarification { run_id, message } => {
+                format!("Run {run_id} needs clarification: {message}")
+            }
             Self::Failure {
                 run_id: Some(run_id),
                 message,
@@ -183,6 +192,35 @@ impl SubmissionStatus {
             } => message.clone(),
         }
     }
+}
+
+/// Render a pending clarification the way the noninteractive CLI presents it
+/// (Epic 007): every unresolved clause with its candidates, so the user can
+/// re-prompt with a more specific request. A full interactive
+/// clause-to-candidate resolution flow is deferred, matching the CLI.
+fn render_clarification(request: &baho_core::ClarificationRequest) -> String {
+    request
+        .unresolved
+        .iter()
+        .map(|clause| {
+            let candidates = clause
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    let form = match candidate.predicate_form {
+                        PredicateForm::EqualsValue => "equals value",
+                        PredicateForm::FlagIsTrue => "flag is true",
+                        PredicateForm::IsNotBlank => "is not blank",
+                        PredicateForm::Compare => "compare",
+                    };
+                    format!("{} ({form})", candidate.display_name)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("\"{}\" could mean: {candidates}", clause.rendered_condition)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,15 +331,33 @@ impl GuiSession {
                 };
             }
             _ => {
-                let message = result
-                    .diagnostics
-                    .iter()
-                    .find(|diagnostic| matches!(diagnostic.severity, baho_model::Severity::Error))
-                    .map(|diagnostic| diagnostic.message.clone())
-                    .unwrap_or_else(|| "Request was not materialized".to_owned());
-                self.status = SubmissionStatus::Failure {
-                    run_id: Some(recorded.id),
-                    message,
+                let pending_clarification =
+                    result
+                        .grounding
+                        .as_ref()
+                        .and_then(|grounding| match &grounding.outcome {
+                            GroundingOutcome::NeedsClarification { request } => Some(request),
+                            _ => None,
+                        });
+                self.status = match pending_clarification {
+                    Some(request) => SubmissionStatus::NeedsClarification {
+                        run_id: recorded.id,
+                        message: render_clarification(request),
+                    },
+                    None => {
+                        let message = result
+                            .diagnostics
+                            .iter()
+                            .find(|diagnostic| {
+                                matches!(diagnostic.severity, baho_model::Severity::Error)
+                            })
+                            .map(|diagnostic| diagnostic.message.clone())
+                            .unwrap_or_else(|| "Request was not materialized".to_owned());
+                        SubmissionStatus::Failure {
+                            run_id: Some(recorded.id),
+                            message,
+                        }
+                    }
                 };
             }
         }
@@ -950,5 +1006,36 @@ mod tests {
         assert_eq!(session.display.cell_text(0, 0), Some("London"));
         assert!(runs.join("000001").is_dir());
         assert!(runs.join("000002").is_dir());
+    }
+
+    #[test]
+    fn ambiguous_row_filter_reports_clarification_instead_of_a_generic_failure() {
+        let (workspace, mut session) = session_for(
+            "ID,Job,Note,Amount\n1,unemployed,other,5\n2,employed,unemployed,20\n3,employed,other,1\n",
+        );
+        let runs = workspace.path().join(".baho/runs");
+        let mut grid_state = DataGridState::new();
+        let mut selection = SelectionState::default();
+
+        session.prompt = "List rows where unemployed and < 10".to_owned();
+        assert_eq!(session.request_submit(), SubmitRequest::Queued);
+        session.process_pending(
+            &runs,
+            gui_invocation(workspace.path()),
+            &mut grid_state,
+            &mut selection,
+        );
+
+        match &session.status {
+            SubmissionStatus::NeedsClarification { run_id, message } => {
+                assert_eq!(run_id, "000001");
+                assert!(message.contains("unemployed"), "{message}");
+                assert!(message.contains("Amount (compare)"), "{message}");
+            }
+            other => panic!("expected a clarification status, got {other:?}"),
+        }
+        assert!(session.status.message().contains("needs clarification"));
+        // The source table remains displayed; nothing was materialized.
+        assert!(matches!(session.display, DisplayGrid::Source(_)));
     }
 }
