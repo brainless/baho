@@ -7,12 +7,17 @@
 pub mod error;
 pub mod profile;
 pub mod registry;
+pub mod selected_source;
 pub mod traits;
 
 pub use error::{ImportError, UnsupportedFormat};
 pub use profile::{InputProfile, InspectOptions};
 pub use registry::{DetectedFormat, ImportRegistry, detect_format};
-pub use traits::{FormatImporter, FormatInspector};
+pub use selected_source::{
+    RowCount, RowReadLimits, SelectedRow, SelectedRowBatch, SelectedSourceMetadata,
+    SelectedSourceReadError, SourceCellValue,
+};
+pub use traits::{FormatImporter, FormatInspector, SelectedSourceReader};
 
 use baho_model::diagnostic::Diagnostic;
 use baho_model::document::Document;

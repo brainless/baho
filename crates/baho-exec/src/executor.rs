@@ -33,6 +33,33 @@ pub struct GridInput {
     pub typed_columns: BTreeMap<String, ParsedColumn>,
 }
 
+/// Format independent row supplied by a selected-source reader.
+pub struct InputRow {
+    pub source_row: usize,
+    pub values: Vec<Option<Value>>,
+}
+
+/// Limits on state that grows with input or output. A caller may set tighter
+/// limits; exceeding one returns a typed execution error before adding a row.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionLimits {
+    pub max_output_rows: usize,
+    pub max_output_bytes: usize,
+    pub max_distinct_keys: usize,
+    pub max_distinct_bytes: usize,
+}
+
+impl Default for ExecutionLimits {
+    fn default() -> Self {
+        Self {
+            max_output_rows: 1_000_000,
+            max_output_bytes: 512 * 1024 * 1024,
+            max_distinct_keys: 1_000_000,
+            max_distinct_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
 /// Three-valued predicate result.
 ///
 /// Truth tables follow the Epic 006 Boolean semantics: `not unknown` is
@@ -92,6 +119,253 @@ pub struct ExecutionResult {
     pub diagnostics: Vec<Diagnostic>,
     pub rows_processed: usize,
     pub rows_output: usize,
+}
+
+/// Execute source rows as they arrive. Filter and select are applied before
+/// retaining output; distinct keeps bounded key state in source order.
+pub fn execute_plan_stream<I>(
+    plan: &Plan,
+    grid: &GridInput,
+    rows: I,
+    limits: ExecutionLimits,
+) -> Result<ExecutionResult, ExecutionError>
+where
+    I: IntoIterator<Item = Result<InputRow, ExecutionError>>,
+{
+    validate_plan_structure(plan)?;
+    if plan.source.table_id != grid.table_id {
+        return Err(ExecutionError::TableNotFound {
+            table_id: plan.source.table_id.clone(),
+        });
+    }
+    if plan.source.revision != grid.source_revision {
+        return Err(ExecutionError::SourceRevisionMismatch {
+            expected: plan.source.revision.clone(),
+            actual: grid.source_revision.clone(),
+        });
+    }
+    let typed = build_typed_columns(grid);
+    let initial_index: HashMap<String, usize> = grid
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| (column.id.clone(), index))
+        .collect();
+    validate_column_refs(plan, &initial_index)?;
+    validate_typed_predicates(plan, &typed)?;
+
+    let mut columns = grid.columns.clone();
+    let mut column_index = initial_index;
+    let mut layouts = Vec::with_capacity(plan.steps.len());
+    for step in &plan.steps {
+        let indices = match step {
+            PlanStep::Select { columns } | PlanStep::Distinct { columns, .. } => columns
+                .iter()
+                .map(|column| resolve_column_index(column, &column_index))
+                .collect::<Result<Vec<_>, _>>()?,
+            PlanStep::Filter { .. } => Vec::new(),
+        };
+        if matches!(step, PlanStep::Select { .. }) {
+            columns = indices
+                .iter()
+                .enumerate()
+                .map(|(ordinal, &index)| {
+                    let mut column = columns[index].clone();
+                    column.ordinal = ordinal;
+                    column
+                })
+                .collect();
+            column_index = columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| (column.id.clone(), index))
+                .collect();
+        }
+        layouts.push(indices);
+    }
+    let mut seen: Vec<HashSet<Vec<String>>> = plan.steps.iter().map(|_| HashSet::new()).collect();
+    let mut removed = vec![0usize; plan.steps.len()];
+    let mut output = Vec::new();
+    let mut provenance = Vec::new();
+    let mut output_bytes = 0usize;
+    let mut distinct_bytes = 0usize;
+    let mut rows_processed = 0usize;
+    for row in rows {
+        let row = row?;
+        rows_processed += 1;
+        let mut values = row.values;
+        let mut source_columns: Vec<usize> =
+            grid.columns.iter().map(|column| column.ordinal).collect();
+        let mut current_index: HashMap<String, usize> = grid
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| (column.id.clone(), index))
+            .collect();
+        let mut keep = true;
+        for (step_index, step) in plan.steps.iter().enumerate() {
+            match step {
+                PlanStep::Filter { predicate } => {
+                    let evaluator = PredicateEvaluator {
+                        col_index: &current_index,
+                        typed: &typed,
+                        text_match: plan.text_match_policy(),
+                    };
+                    if evaluate_expression(predicate, &evaluator, &values, row.source_row)?
+                        != TruthValue::True
+                    {
+                        removed[step_index] += 1;
+                        keep = false;
+                        break;
+                    }
+                }
+                PlanStep::Select { .. } => {
+                    let indices = &layouts[step_index];
+                    values = indices
+                        .iter()
+                        .map(|&index| values.get(index).cloned().flatten())
+                        .collect();
+                    source_columns = indices
+                        .iter()
+                        .filter_map(|&index| source_columns.get(index).copied())
+                        .collect();
+                    current_index = current_index
+                        .into_iter()
+                        .filter_map(|(id, old)| {
+                            indices
+                                .iter()
+                                .position(|&index| index == old)
+                                .map(|index| (id, index))
+                        })
+                        .collect();
+                }
+                PlanStep::Distinct { .. } => {
+                    let key = distinct_key(&values, &layouts[step_index]);
+                    if seen[step_index].contains(&key) {
+                        removed[step_index] += 1;
+                        keep = false;
+                        break;
+                    }
+                    if seen[step_index].len() >= limits.max_distinct_keys {
+                        return Err(ExecutionError::LimitExceeded {
+                            limit: "max_distinct_keys".into(),
+                            detail: format!(
+                                "distinct key count exceeds {}",
+                                limits.max_distinct_keys
+                            ),
+                        });
+                    }
+                    distinct_bytes = distinct_bytes.saturating_add(
+                        key.iter()
+                            .map(String::len)
+                            .sum::<usize>()
+                            .saturating_add(key.len() * std::mem::size_of::<String>()),
+                    );
+                    if distinct_bytes > limits.max_distinct_bytes {
+                        return Err(ExecutionError::LimitExceeded {
+                            limit: "max_distinct_bytes".into(),
+                            detail: format!(
+                                "distinct key bytes exceed {}",
+                                limits.max_distinct_bytes
+                            ),
+                        });
+                    }
+                    seen[step_index].insert(key);
+                }
+            }
+        }
+        if !keep {
+            continue;
+        }
+        if output.len() >= limits.max_output_rows {
+            return Err(ExecutionError::LimitExceeded {
+                limit: "max_output_rows".into(),
+                detail: format!("output row count exceeds {}", limits.max_output_rows),
+            });
+        }
+        let row_bytes = values
+            .iter()
+            .filter_map(|value| match value {
+                Some(Value::Text(text)) => Some(text.len()),
+                _ => None,
+            })
+            .sum::<usize>()
+            + values.len() * std::mem::size_of::<Option<Value>>();
+        output_bytes = output_bytes.saturating_add(row_bytes);
+        if output_bytes > limits.max_output_bytes {
+            return Err(ExecutionError::LimitExceeded {
+                limit: "max_output_bytes".into(),
+                detail: format!("output bytes exceed {}", limits.max_output_bytes),
+            });
+        }
+        output.push(MaterializedRow { values });
+        provenance.push(RowProvenance {
+            source_row: row.source_row,
+            source_addresses: source_columns
+                .into_iter()
+                .map(|col| CellAddress {
+                    sheet_index: grid.source_sheet_index,
+                    row: row.source_row,
+                    col,
+                })
+                .collect(),
+        });
+    }
+    let diagnostics = plan
+        .steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| {
+            let count = removed[index];
+            if count == 0 {
+                return None;
+            }
+            let (code, message) = match step {
+                PlanStep::Filter { .. } => (
+                    "exec.rows_filtered",
+                    format!("{count} rows removed by filter"),
+                ),
+                PlanStep::Distinct { .. } => (
+                    "exec.duplicates_removed",
+                    format!("{count} duplicate rows removed"),
+                ),
+                PlanStep::Select { .. } => return None,
+            };
+            Some(Diagnostic {
+                code: code.into(),
+                severity: Severity::Info,
+                stage: "exec".into(),
+                message,
+                location: None,
+            })
+        })
+        .collect();
+    let rows_output = output.len();
+    Ok(ExecutionResult {
+        view: MaterializedView {
+            columns,
+            rows: output,
+            provenance,
+        },
+        diagnostics,
+        rows_processed,
+        rows_output,
+    })
+}
+
+fn distinct_key(values: &[Option<Value>], indices: &[usize]) -> Vec<String> {
+    indices
+        .iter()
+        .map(
+            |&index| match values.get(index).and_then(|value| value.as_ref()) {
+                None => String::new(),
+                Some(Value::Blank) => "\0blank".into(),
+                Some(Value::Text(text)) => format!("t:{text}"),
+                Some(Value::Number(number)) => format!("n:{number}"),
+                Some(Value::Boolean(value)) => format!("b:{value}"),
+            },
+        )
+        .collect()
 }
 
 /// Executes a validated plan against the provided grid data.
@@ -643,6 +917,65 @@ mod tests {
 
     fn none_val() -> Option<Value> {
         None
+    }
+
+    #[test]
+    fn streamed_rows_match_materialized_filter_select_distinct_and_obey_limits() {
+        let grid = GridInput {
+            table_id: "table-0".into(),
+            source_revision: "hash".into(),
+            source_sheet_index: 0,
+            columns: grid_columns(),
+            rows: vec![
+                vec![text("A"), text("x"), text("1")],
+                vec![blank(), text("y"), text("2")],
+                vec![text("B"), text("x"), text("3")],
+            ],
+            source_rows: vec![4, 5, 6],
+            typed_columns: BTreeMap::new(),
+        };
+        let plan = Plan {
+            schema_version: 1,
+            source: PlanSource {
+                revision: "hash".into(),
+                table_id: "table-0".into(),
+            },
+            steps: vec![
+                PlanStep::Filter {
+                    predicate: Expression::IsNotBlank {
+                        column: "column-0".into(),
+                    },
+                },
+                PlanStep::Select {
+                    columns: vec!["column-1".into(), "column-0".into()],
+                },
+                PlanStep::Distinct {
+                    columns: vec!["column-1".into()],
+                    keep: DistinctKeep::First,
+                },
+            ],
+        };
+        let prior = execute_plan(&plan, &grid).unwrap();
+        let stream = || {
+            grid.rows
+                .iter()
+                .zip(&grid.source_rows)
+                .map(|(values, &source_row)| {
+                    Ok(InputRow {
+                        source_row,
+                        values: values.clone(),
+                    })
+                })
+        };
+        let result =
+            execute_plan_stream(&plan, &grid, stream(), ExecutionLimits::default()).unwrap();
+        assert_eq!(result.view, prior.view);
+        assert_eq!(result.diagnostics, prior.diagnostics);
+        assert!(
+            matches!(execute_plan_stream(&plan, &grid, stream(), ExecutionLimits {
+            max_output_rows: 0, ..ExecutionLimits::default()
+        }), Err(ExecutionError::LimitExceeded { limit, .. }) if limit == "max_output_rows")
+        );
     }
 
     #[test]

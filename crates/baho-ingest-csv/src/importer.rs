@@ -23,6 +23,8 @@ use crate::row_features::compute_row_features_with_config;
 pub enum SelectedRegionError {
     #[error("source revision changed while grounding")]
     RevisionChanged,
+    #[error("selected source batch read failed: {detail}")]
+    Reader { detail: String },
     #[error("could not verify source revision: {detail}")]
     RevisionCheck { detail: String },
     #[error("selected source row {row} is missing")]
@@ -47,131 +49,16 @@ pub enum SelectedRegionError {
     },
 }
 
-/// Selected records and bounded classification evidence from a streaming pass.
+/// Selected-region boundaries and bounded classification evidence from a
+/// streaming pass. `data_records` is populated only by `read_selected_region`;
+/// `scan_selected_region` returns the same summary without retaining rows.
 #[derive(Debug)]
 pub struct SelectedRegion {
     pub data_records: Vec<crate::inspector::LogicalRecord>,
+    pub data_record_count: usize,
     pub body_end_row: usize,
     pub classifications: Vec<RowClassification>,
     pub classification_count: usize,
-}
-
-/// Reopen only the selected source rows for grounding. The row numbers come
-/// from the selected region, so notes and blank separators are excluded.
-pub struct SelectedTableStream<I> {
-    path: PathBuf,
-    expected_hash: String,
-    reader: csv::Reader<BufReader<fs::File>>,
-    selected: I,
-    next_selected: Option<usize>,
-    next_source_row: usize,
-    finished: bool,
-    max_field_size: usize,
-}
-
-impl<I: Iterator<Item = usize>> SelectedTableStream<I> {
-    pub fn open(
-        path: &Path,
-        expected_hash: &str,
-        config: &ParserConfig,
-        mut selected: I,
-    ) -> Result<Self, SelectedRegionError> {
-        verify_revision(path, expected_hash)?;
-        let file = fs::File::open(path).map_err(|source| SelectedRegionError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let reader = csv::ReaderBuilder::new()
-            .delimiter(config.dialect.delimiter)
-            .quote(config.dialect.quote)
-            .escape(Some(config.dialect.quote_escape))
-            .has_headers(false)
-            .flexible(true)
-            .from_reader(BufReader::new(file));
-        let next_selected = selected.next();
-        Ok(Self {
-            path: path.to_path_buf(),
-            expected_hash: expected_hash.to_owned(),
-            reader,
-            selected,
-            next_selected,
-            next_source_row: 0,
-            finished: false,
-            max_field_size: config.inspection.max_field_size,
-        })
-    }
-}
-
-fn verify_revision(path: &Path, expected_hash: &str) -> Result<(), SelectedRegionError> {
-    let actual =
-        compute_content_hash(path).map_err(|error| SelectedRegionError::RevisionCheck {
-            detail: error.to_string(),
-        })?;
-    if actual != expected_hash {
-        return Err(SelectedRegionError::RevisionChanged);
-    }
-    Ok(())
-}
-
-impl<I: Iterator<Item = usize>> Iterator for SelectedTableStream<I> {
-    type Item = Result<crate::inspector::LogicalRecord, SelectedRegionError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
-            return None;
-        }
-        loop {
-            let Some(wanted) = self.next_selected else {
-                self.finished = true;
-                return match verify_revision(&self.path, &self.expected_hash) {
-                    Ok(()) => None,
-                    Err(error) => Some(Err(error)),
-                };
-            };
-            let mut record = csv::StringRecord::new();
-            let row = self.next_source_row;
-            match self.reader.read_record(&mut record) {
-                Ok(true) => self.next_source_row += 1,
-                Ok(false) => {
-                    self.finished = true;
-                    return Some(Err(SelectedRegionError::SelectedRowMissing { row: wanted }));
-                }
-                Err(error) => {
-                    self.finished = true;
-                    return Some(Err(SelectedRegionError::MalformedRecord {
-                        row,
-                        detail: error.to_string(),
-                    }));
-                }
-            }
-            if row < wanted {
-                continue;
-            }
-            if row != wanted {
-                self.finished = true;
-                return Some(Err(SelectedRegionError::SelectedRowMissing { row: wanted }));
-            }
-            self.next_selected = self.selected.next();
-            if let Some((col, field)) = record
-                .iter()
-                .enumerate()
-                .find(|(_, field)| field.len() > self.max_field_size)
-            {
-                self.finished = true;
-                return Some(Err(SelectedRegionError::FieldTooLarge {
-                    row,
-                    col,
-                    size: field.len(),
-                    max_size: self.max_field_size,
-                }));
-            }
-            return Some(Ok(crate::inspector::LogicalRecord {
-                index: row,
-                fields: record.iter().map(str::to_owned).collect(),
-                is_blank: false,
-            }));
-        }
-    }
 }
 
 /// CSV format importer.
@@ -302,7 +189,7 @@ impl CsvImporter {
 
         let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
-        let content_hash = compute_content_hash(path)?;
+        let content_hash = inspection.content_hash;
 
         let document = Document {
             source: SourceRevision {
@@ -338,29 +225,6 @@ impl CsvImporter {
     }
 }
 
-fn compute_content_hash(path: &Path) -> Result<String, ImportError> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-
-    let mut file = fs::File::open(path).map_err(|source| ImportError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|source| ImportError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
 /// Stream and materialize the rows belonging to a selected table candidate.
 ///
 /// Classification evidence is capped independently of the selected data. The
@@ -371,6 +235,27 @@ pub fn read_selected_region(
     header_width: usize,
     body_start_row: usize,
     config: &ParserConfig,
+) -> Result<SelectedRegion, SelectedRegionError> {
+    scan_selected_region_impl(path, header_width, body_start_row, config, true)
+}
+
+/// Inspect selected-region boundaries and bounded row-classification
+/// evidence without retaining source cell values.
+pub fn scan_selected_region(
+    path: &Path,
+    header_width: usize,
+    body_start_row: usize,
+    config: &ParserConfig,
+) -> Result<SelectedRegion, SelectedRegionError> {
+    scan_selected_region_impl(path, header_width, body_start_row, config, false)
+}
+
+fn scan_selected_region_impl(
+    path: &Path,
+    header_width: usize,
+    body_start_row: usize,
+    config: &ParserConfig,
+    retain_data_records: bool,
 ) -> Result<SelectedRegion, SelectedRegionError> {
     let file = fs::File::open(path).map_err(|source| SelectedRegionError::Io {
         path: path.to_path_buf(),
@@ -385,6 +270,7 @@ pub fn read_selected_region(
         .from_reader(BufReader::new(file));
 
     let mut data_records = Vec::new();
+    let mut data_record_count = 0usize;
     let mut classifications = Vec::new();
     let mut classification_count = 0usize;
     let mut body_end_row = body_start_row;
@@ -484,11 +370,14 @@ pub fn read_selected_region(
         };
 
         if classification.kind == RowKind::Data {
-            data_records.push(crate::inspector::LogicalRecord {
-                index,
-                fields,
-                is_blank: false,
-            });
+            data_record_count += 1;
+            if retain_data_records {
+                data_records.push(crate::inspector::LogicalRecord {
+                    index,
+                    fields,
+                    is_blank: false,
+                });
+            }
         }
         record_classification(
             &mut classifications,
@@ -500,6 +389,7 @@ pub fn read_selected_region(
 
     Ok(SelectedRegion {
         data_records,
+        data_record_count,
         body_end_row,
         classifications,
         classification_count,
@@ -638,6 +528,25 @@ mod tests {
                 max_size: 100,
             }
         ));
+    }
+
+    #[test]
+    fn selected_region_scan_matches_materialization_without_retaining_rows() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "Title,,\n,,\nA,B\n1,x\n2\n\nFooter,note,extra\n").unwrap();
+        let config = ParserConfig::default();
+
+        let materialized = read_selected_region(file.path(), 2, 3, &config).unwrap();
+        let scanned = scan_selected_region(file.path(), 2, 3, &config).unwrap();
+
+        assert_eq!(scanned.data_records.len(), 0);
+        assert_eq!(scanned.data_record_count, materialized.data_records.len());
+        assert_eq!(scanned.body_end_row, materialized.body_end_row);
+        assert_eq!(
+            scanned.classification_count,
+            materialized.classification_count
+        );
+        assert_eq!(scanned.classifications, materialized.classifications);
     }
 
     fn import_tsv_from_str(tsv: &str) -> ImportedDocument {

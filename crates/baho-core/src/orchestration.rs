@@ -6,9 +6,12 @@ use crate::grounding::{
     ground_row_filter,
 };
 use baho_exec::error::ExecutionError;
-use baho_exec::executor::{GridInput, execute_plan};
+use baho_exec::executor::{ExecutionLimits, GridInput, InputRow, execute_plan_stream};
 use baho_ingest::profile::InputProfile;
-use baho_ingest::{DetectedFormat, ImportError, InspectOptions, detect_format};
+use baho_ingest::{
+    DetectedFormat, ImportError, InspectOptions, RowCount, RowReadLimits, SelectedSourceMetadata,
+    SelectedSourceReadError, SelectedSourceReader, SourceCellValue, detect_format,
+};
 use baho_ingest_csv::header::build_header_with_config;
 use baho_ingest_csv::row_features::compute_row_features_with_config;
 use baho_ingest_csv::typed_values::{
@@ -17,7 +20,7 @@ use baho_ingest_csv::typed_values::{
 };
 use baho_ingest_csv::{
     CsvImporter, DialectDetectionError, ParserConfig, SelectedRegionError,
-    detect_candidates_with_config, read_selected_region, select_numeric_policy,
+    detect_candidates_with_config, scan_selected_region, select_numeric_policy,
 };
 use baho_model::candidate::TableCandidate;
 use baho_model::column::NumericParsePolicy;
@@ -94,6 +97,7 @@ pub struct OpenedTable {
     pub candidates: Vec<TableCandidate>,
     pub columns: Vec<baho_model::column::ColumnDefinition>,
     pub rows: Vec<OpenedRow>,
+    pub selected_row_count: usize,
     pub input_profile: InputProfile,
     pub parser_config: ParserConfig,
     pub diagnostics: Vec<Diagnostic>,
@@ -123,6 +127,34 @@ impl std::error::Error for OpenTableFailure {
     }
 }
 
+impl OpenedTable {
+    /// Format-independent description of the selected region used by row
+    /// readers. `open_table` currently establishes an exact row count while
+    /// classifying the selected region.
+    pub fn selected_source_metadata(&self) -> SelectedSourceMetadata {
+        SelectedSourceMetadata {
+            source_revision: self.source_revision.clone(),
+            source_sheet_index: self.source_sheet_index,
+            source_sheet_name: self.source_sheet_name.clone(),
+            region: self.selected_candidate.region.clone(),
+            header: self.selected_candidate.header.clone(),
+            columns: self.columns.clone(),
+            row_count: RowCount::Exact(self.selected_row_count),
+        }
+    }
+
+    /// Reopen this selected table through the shared sequential row contract.
+    pub fn selected_source_reader(
+        &self,
+    ) -> Result<baho_ingest_csv::CsvSelectedSourceReader, SelectedSourceReadError> {
+        baho_ingest_csv::CsvSelectedSourceReader::open(
+            &self.source_path,
+            self.selected_source_metadata(),
+            self.parser_config.clone(),
+        )
+    }
+}
+
 /// Dispatch an input to a supported format importer without parsing it.
 pub fn dispatch_format(path: &Path) -> Result<DetectedFormat, CoreError> {
     Ok(detect_format(path, &InspectOptions::default())?)
@@ -148,8 +180,41 @@ fn opening_failure(
     }
 }
 
+fn selected_source_error(error: SelectedSourceReadError) -> SelectedRegionError {
+    match error {
+        SelectedSourceReadError::RevisionChanged => SelectedRegionError::RevisionChanged,
+        SelectedSourceReadError::MalformedRecord { row, detail } => {
+            SelectedRegionError::MalformedRecord { row, detail }
+        }
+        SelectedSourceReadError::FieldTooLarge {
+            row,
+            column,
+            size,
+            limit,
+        } => SelectedRegionError::FieldTooLarge {
+            row,
+            col: column,
+            size,
+            max_size: limit,
+        },
+        other => SelectedRegionError::Reader {
+            detail: other.to_string(),
+        },
+    }
+}
+
 /// Open and classify the selected CSV table without a prompt or plan.
 pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
+    open_table_with_rows(path, true)
+}
+
+/// Open selected metadata for a viewport without retaining source cells.
+pub fn open_table_metadata(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
+    open_table_with_rows(path, false)
+}
+
+fn open_table_with_rows(path: &Path, retain_rows: bool) -> Result<OpenedTable, OpenTableFailure> {
+    let opened_at = std::time::Instant::now();
     let mut diagnostics = Vec::new();
     let mut events = Vec::new();
     let mut input_profile = None;
@@ -245,6 +310,7 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
         "ingest",
         serde_json::json!({
             "encoding": profile.encoding, "record_count": profile.logical_record_count,
+            "elapsed_ms": opened_at.elapsed().as_millis(),
         }),
     );
 
@@ -304,7 +370,7 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
         &mut events,
         "table_candidates_detected",
         "detect",
-        serde_json::json!({ "count": candidates.len() }),
+        serde_json::json!({ "count": candidates.len(), "elapsed_ms": opened_at.elapsed().as_millis() }),
     );
 
     let mut selected = match select_candidate(&candidates, &config.candidate_detection) {
@@ -369,7 +435,7 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
         &mut events,
         "table_candidate_selected",
         "select",
-        serde_json::json!({ "candidate_id": selected.id, "score": selected.score.total }),
+        serde_json::json!({ "candidate_id": selected.id, "score": selected.score.total, "elapsed_ms": opened_at.elapsed().as_millis() }),
     );
 
     let header_idx = selected.region.header_row.unwrap_or(0);
@@ -384,10 +450,10 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
         &mut events,
         "header_selected",
         "header",
-        serde_json::json!({ "source_row": header_decision.source_row, "column_count": header_decision.cells.len() }),
+        serde_json::json!({ "source_row": header_decision.source_row, "column_count": header_decision.cells.len(), "elapsed_ms": opened_at.elapsed().as_millis() }),
     );
 
-    let selected_region = match read_selected_region(
+    let selected_region = match scan_selected_region(
         path,
         features[header_idx].physical_width,
         selected.region.body_start_row,
@@ -419,7 +485,8 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
                 SelectedRegionError::Io { .. } => ("core.materialize_region_failed", "core", None),
                 SelectedRegionError::RevisionChanged
                 | SelectedRegionError::RevisionCheck { .. }
-                | SelectedRegionError::SelectedRowMissing { .. } => {
+                | SelectedRegionError::SelectedRowMissing { .. }
+                | SelectedRegionError::Reader { .. } => {
                     ("core.materialize_region_failed", "core", None)
                 }
             };
@@ -450,8 +517,9 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
         "body_rows_classified",
         "classify",
         serde_json::json!({
-            "data_rows": selected_region.data_records.len(), "total_classified": selected_region.classification_count,
+            "data_rows": selected_region.data_record_count, "total_classified": selected_region.classification_count,
             "classification_evidence_retained": selected_region.classifications.len(),
+            "elapsed_ms": opened_at.elapsed().as_millis(),
         }),
     );
     for candidate in &mut candidates {
@@ -479,23 +547,75 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
             },
         })
         .collect::<Vec<_>>();
-    let rows = selected_region
-        .data_records
-        .iter()
-        .map(|record| OpenedRow {
-            source_row: record.index,
-            cells: (0..columns.len())
-                .map(|col| {
-                    record
-                        .fields
-                        .get(col)
-                        .cloned()
-                        .map(RawCell::Present)
-                        .unwrap_or(RawCell::Missing)
-                })
-                .collect(),
-        })
-        .collect();
+    let metadata = SelectedSourceMetadata {
+        source_revision: source_revision.clone(),
+        source_sheet_index,
+        source_sheet_name: source_sheet_name.clone(),
+        region: selected.region.clone(),
+        header: header_decision.clone(),
+        columns: columns.clone(),
+        row_count: RowCount::Exact(selected_region.data_record_count),
+    };
+    let mut rows = Vec::new();
+    if retain_rows {
+        let mut reader =
+            baho_ingest_csv::CsvSelectedSourceReader::open(path, metadata, config.clone())
+                .map_err(|error| {
+                    let error = selected_source_error(error);
+                    opening_failure(
+                        CoreError::Ingest(ImportError::FormatDetectionFailed {
+                            detail: error.to_string(),
+                        }),
+                        input_profile.clone(),
+                        parser_config.clone(),
+                        candidates.clone(),
+                        selected_candidate.clone(),
+                        diagnostics.clone(),
+                        events.clone(),
+                    )
+                })?;
+        let limits = RowReadLimits {
+            max_rows: 256,
+            max_bytes: config
+                .inspection
+                .max_field_size
+                .saturating_mul(columns.len())
+                .max(1),
+        };
+        rows.reserve(selected_region.data_record_count);
+        loop {
+            let batch = reader.read_next(limits).map_err(|error| {
+                let error = selected_source_error(error);
+                opening_failure(
+                    CoreError::Ingest(ImportError::FormatDetectionFailed {
+                        detail: error.to_string(),
+                    }),
+                    input_profile.clone(),
+                    parser_config.clone(),
+                    candidates.clone(),
+                    selected_candidate.clone(),
+                    diagnostics.clone(),
+                    events.clone(),
+                )
+            })?;
+            rows.extend(batch.rows.into_iter().map(|row| {
+                OpenedRow {
+                    source_row: row.source_row,
+                    cells: row
+                        .cells
+                        .into_iter()
+                        .map(|cell| match cell {
+                            SourceCellValue::Present(value) => RawCell::Present(value),
+                            SourceCellValue::Missing => RawCell::Missing,
+                        })
+                        .collect(),
+                }
+            }));
+            if batch.complete {
+                break;
+            }
+        }
+    }
     Ok(OpenedTable {
         source_path: path.to_path_buf(),
         source_revision,
@@ -505,6 +625,7 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
         candidates,
         columns,
         rows,
+        selected_row_count: selected_region.data_record_count,
         input_profile: input_profile.expect("import profile stored"),
         parser_config: parser_config.expect("parser config stored"),
         diagnostics,
@@ -514,7 +635,7 @@ pub fn open_table(path: &Path) -> Result<OpenedTable, OpenTableFailure> {
 
 /// Run the full pipeline: ingest, detect, select, plan, validate, execute.
 pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
-    let opened = match open_table(path) {
+    let opened = match open_table_metadata(path) {
         Ok(opened) => opened,
         Err(failure) => {
             return CoreResult {
@@ -544,7 +665,7 @@ pub fn resolve_pipeline(
     request: &ClarificationRequest,
     response: &ClarificationResponse,
 ) -> CoreResult {
-    let opened = match open_table(path) {
+    let opened = match open_table_metadata(path) {
         Ok(opened) => opened,
         Err(failure) => {
             return CoreResult {
@@ -772,7 +893,20 @@ pub fn execute_prompt_with_clarification(
     let decimal_column_ids = decimal_compared_column_ids(&plan);
     let mut typed_columns: BTreeMap<String, baho_model::column::ParsedColumn> = BTreeMap::new();
     if !all_compared_column_ids.is_empty() {
-        let records = selected_region_records(opened);
+        let records = match selected_region_records(opened) {
+            Ok(records) => records,
+            Err(error) => {
+                result.diagnostics.push(Diagnostic {
+                    code: "execution.source_read_failed".into(),
+                    severity: Severity::Error,
+                    stage: "ingest-csv".into(),
+                    message: error.to_string(),
+                    location: None,
+                });
+                result.outcome = CoreOutcome::Failed;
+                return result;
+            }
+        };
         let mut parsed_columns = Vec::with_capacity(all_compared_column_ids.len());
         for column_id in &all_compared_column_ids {
             if let Some(column) = opened.columns.iter().find(|column| &column.id == column_id) {
@@ -863,28 +997,70 @@ pub fn execute_prompt_with_clarification(
         source_revision: opened.source_revision.content_hash.clone(),
         source_sheet_index: opened.source_sheet_index,
         columns: opened.columns.clone(),
-        rows: opened
-            .rows
-            .iter()
-            .map(|row| {
-                row.cells
-                    .iter()
-                    .map(|cell| match cell {
-                        RawCell::Present(text)
-                            if opened.parser_config.normalization.is_blank(text) =>
-                        {
-                            Some(Value::Blank)
-                        }
-                        RawCell::Present(text) => Some(Value::Text(text.clone())),
-                        RawCell::Missing => None,
-                    })
-                    .collect()
-            })
-            .collect(),
-        source_rows: opened.rows.iter().map(|row| row.source_row).collect(),
+        rows: Vec::new(),
+        source_rows: Vec::new(),
         typed_columns,
     };
-    let execution = match execute_plan(&plan, &grid) {
+    let reader = opened.selected_source_reader();
+    let execution = match reader {
+        Ok(mut reader) => {
+            let limits = RowReadLimits {
+                max_rows: 256,
+                max_bytes: opened
+                    .parser_config
+                    .inspection
+                    .max_field_size
+                    .saturating_mul(opened.columns.len())
+                    .max(1),
+            };
+            let mut pending: std::collections::VecDeque<baho_ingest::SelectedRow> =
+                std::collections::VecDeque::new();
+            let mut complete = false;
+            let rows = std::iter::from_fn(move || {
+                loop {
+                    if let Some(row) = pending.pop_front() {
+                        let values = row
+                            .cells
+                            .into_iter()
+                            .map(|cell| match cell {
+                                SourceCellValue::Present(text)
+                                    if opened.parser_config.normalization.is_blank(&text) =>
+                                {
+                                    Some(Value::Blank)
+                                }
+                                SourceCellValue::Present(text) => Some(Value::Text(text)),
+                                SourceCellValue::Missing => None,
+                            })
+                            .collect();
+                        return Some(Ok(InputRow {
+                            source_row: row.source_row,
+                            values,
+                        }));
+                    }
+                    if complete {
+                        return None;
+                    }
+                    match reader.read_next(limits) {
+                        Ok(batch) => {
+                            complete = batch.complete;
+                            pending.extend(batch.rows);
+                        }
+                        Err(error) => {
+                            complete = true;
+                            return Some(Err(ExecutionError::SourceRead {
+                                detail: error.to_string(),
+                            }));
+                        }
+                    }
+                }
+            });
+            execute_plan_stream(&plan, &grid, rows, ExecutionLimits::default())
+        }
+        Err(error) => Err(ExecutionError::SourceRead {
+            detail: error.to_string(),
+        }),
+    };
+    let execution = match execution {
         Ok(execution) => execution,
         Err(error) => {
             let (code, stage) = execution_error_diagnostic(&error);
@@ -964,7 +1140,20 @@ fn resolve_row_filter_deferred_literals(
     let RecognizedRequest::RowFilter(intent) = request else {
         return true;
     };
-    let records = selected_region_records(opened);
+    let records = match selected_region_records(opened) {
+        Ok(records) => records,
+        Err(error) => {
+            result.diagnostics.push(Diagnostic {
+                code: "execution.source_read_failed".into(),
+                severity: Severity::Error,
+                stage: "ingest-csv".into(),
+                message: error.to_string(),
+                location: None,
+            });
+            result.outcome = CoreOutcome::Failed;
+            return false;
+        }
+    };
     let mut policy_cache: BTreeMap<String, NumericParsePolicy> = BTreeMap::new();
     let resolution = resolve_deferred_literals(intent, |column_id| {
         if let Some(policy) = policy_cache.get(column_id) {
@@ -1101,29 +1290,74 @@ fn collect_decimal_compared_columns(expression: &Expression, ids: &mut BTreeSet<
 /// `RawCell::Missing` occurs only as a ragged tail, so truncating the field
 /// list at the first missing cell reproduces the original record widths; the
 /// blank flag is unused by typed parsing.
-fn selected_region_records(opened: &OpenedTable) -> Vec<baho_ingest_csv::inspector::LogicalRecord> {
-    opened
-        .rows
-        .iter()
-        .map(|row| {
-            let mut fields = Vec::with_capacity(row.cells.len());
-            for cell in &row.cells {
-                match cell {
-                    RawCell::Present(text) => fields.push(text.clone()),
-                    RawCell::Missing => break,
-                }
+fn selected_region_records(
+    opened: &OpenedTable,
+) -> Result<Vec<baho_ingest_csv::inspector::LogicalRecord>, SelectedSourceReadError> {
+    const MAX_TYPED_EVIDENCE_BYTES: usize = 256 * 1024 * 1024;
+    let mut reader = opened.selected_source_reader()?;
+    let limits = RowReadLimits {
+        max_rows: 256,
+        max_bytes: opened
+            .parser_config
+            .inspection
+            .max_field_size
+            .saturating_mul(opened.columns.len())
+            .max(1),
+    };
+    let mut records = Vec::new();
+    let mut retained_bytes = 0usize;
+    loop {
+        let batch = reader.read_next(limits)?;
+        for row in batch.rows {
+            retained_bytes = retained_bytes.saturating_add(
+                row.cells
+                    .iter()
+                    .map(|cell| match cell {
+                        SourceCellValue::Present(text) => text.len(),
+                        SourceCellValue::Missing => 0,
+                    })
+                    .sum::<usize>()
+                    .saturating_add(row.cells.len() * std::mem::size_of::<String>()),
+            );
+            if retained_bytes > MAX_TYPED_EVIDENCE_BYTES {
+                return Err(SelectedSourceReadError::Io {
+                    detail: format!("typed evidence exceeds {MAX_TYPED_EVIDENCE_BYTES} byte limit"),
+                });
             }
-            baho_ingest_csv::inspector::LogicalRecord {
+            let fields = row
+                .cells
+                .into_iter()
+                .take_while(|cell| !matches!(cell, SourceCellValue::Missing))
+                .filter_map(|cell| match cell {
+                    SourceCellValue::Present(text) => Some(text),
+                    SourceCellValue::Missing => None,
+                })
+                .collect();
+            records.push(baho_ingest_csv::inspector::LogicalRecord {
                 index: row.source_row,
                 fields,
                 is_blank: false,
-            }
-        })
-        .collect()
+            });
+        }
+        if batch.complete {
+            break;
+        }
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
 mod tests {
+    fn stable_events(events: &[super::CoreEvent]) -> serde_json::Value {
+        let mut value = serde_json::to_value(events).unwrap();
+        for event in value.as_array_mut().unwrap() {
+            event["fields"]
+                .as_object_mut()
+                .unwrap()
+                .remove("elapsed_ms");
+        }
+        value
+    }
     use super::*;
     use baho_plan::plan::{PLAN_SCHEMA_VERSION_3, PlanStep};
     use std::io::Write;
@@ -1132,6 +1366,25 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(content.as_bytes()).unwrap();
         file
+    }
+
+    #[test]
+    fn metadata_only_open_executes_from_selected_batches() {
+        let file = write_temp_csv("Report title,,\n,,\nID,Name,City\n1,Ada,Pune\n2,Bob,Delhi\n");
+        let opened = open_table_metadata(file.path()).unwrap();
+        assert!(opened.rows.is_empty());
+        assert_eq!(opened.selected_row_count, 2);
+        let result = execute_prompt(&opened, "List Name");
+        assert_eq!(result.outcome, CoreOutcome::Materialized);
+        let view = result.output.unwrap();
+        assert_eq!(view.rows.len(), 2);
+        assert_eq!(
+            view.provenance
+                .iter()
+                .map(|row| row.source_row)
+                .collect::<Vec<_>>(),
+            [3, 4]
+        );
     }
 
     #[test]
@@ -1144,6 +1397,19 @@ mod tests {
 
         assert_eq!(opened.source_sheet_index, 0);
         assert!(!opened.source_revision.content_hash.is_empty());
+        assert_eq!(opened.selected_candidate.region.header_row, Some(2));
+        assert_eq!(opened.selected_candidate.region.body_start_row, 3);
+        assert_eq!(opened.selected_candidate.header.source_row, 2);
+        assert_eq!(
+            opened
+                .selected_candidate
+                .header
+                .cells
+                .iter()
+                .map(|cell| cell.raw_text.as_str())
+                .collect::<Vec<_>>(),
+            ["ID", "Name", "Note"]
+        );
         assert_eq!(
             opened
                 .columns
@@ -1176,6 +1442,44 @@ mod tests {
                 .iter()
                 .any(|event| event.name == "body_rows_classified")
         );
+        assert!(
+            opened.diagnostics.iter().all(|diagnostic| {
+                diagnostic.stage == "ingest-csv" || diagnostic.stage == "core"
+            })
+        );
+
+        use baho_ingest::SelectedSourceReader;
+        let mut reader = opened.selected_source_reader().unwrap();
+        assert_eq!(
+            reader.metadata().row_count,
+            RowCount::Exact(opened.rows.len())
+        );
+        let mut streamed = Vec::new();
+        loop {
+            let batch = reader
+                .read_next(baho_ingest::RowReadLimits::new(2, 1024).unwrap())
+                .unwrap();
+            streamed.extend(batch.rows);
+            if batch.complete {
+                break;
+            }
+        }
+        assert_eq!(streamed.len(), opened.rows.len());
+        for (streamed, materialized) in streamed.iter().zip(&opened.rows) {
+            assert_eq!(streamed.source_row, materialized.source_row);
+            for (streamed_cell, materialized_cell) in streamed.cells.iter().zip(&materialized.cells)
+            {
+                assert_eq!(
+                    streamed_cell,
+                    &match materialized_cell {
+                        RawCell::Present(value) => {
+                            baho_ingest::SourceCellValue::Present(value.clone())
+                        }
+                        RawCell::Missing => baho_ingest::SourceCellValue::Missing,
+                    }
+                );
+            }
+        }
     }
 
     #[test]
@@ -1239,8 +1543,8 @@ mod tests {
             assert_eq!(borrowed.output, pipeline.output);
             assert_eq!(borrowed.diagnostics, pipeline.diagnostics);
             assert_eq!(
-                serde_json::to_value(&borrowed.events).unwrap(),
-                serde_json::to_value(&pipeline.events).unwrap()
+                stable_events(&borrowed.events),
+                stable_events(&pipeline.events)
             );
         }
     }
@@ -2470,8 +2774,8 @@ ID,Job,Annual Income,Note
             serde_json::to_value(&result.diagnostics).unwrap()
         );
         assert_eq!(
-            serde_json::to_value(&borrowed.events).unwrap(),
-            serde_json::to_value(&result.events).unwrap()
+            stable_events(&borrowed.events),
+            stable_events(&result.events)
         );
     }
 

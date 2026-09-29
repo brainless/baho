@@ -294,6 +294,8 @@ dependencies = [
  "akar-winit",
  "anyhow",
  "baho-core",
+ "baho-ingest",
+ "baho-ingest-csv",
  "baho-model",
  "baho-run",
  "clap",

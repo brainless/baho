@@ -46,7 +46,15 @@ fn opened_snapshot_can_be_recorded_without_rehashing_changed_disk_bytes() {
     assert_eq!(manifest["invocation"]["command"], "baho-gui");
     assert_eq!(manifest["invocation"]["subcommand"], "submit");
     assert_eq!(manifest["input"]["sha256"], original_hash);
-    assert!(run.join("output/result.json").is_file());
+    assert_eq!(manifest["outcome"], "error");
+    assert!(!run.join("output/result.json").exists());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "execution.failed"
+                && diagnostic.message.contains("source revision changed"))
+    );
 }
 
 #[test]

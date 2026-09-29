@@ -4,6 +4,10 @@ use akar_components::{DataGridAlign, DataGridColumn, DataGridState, TextEditStat
 use baho_core::{
     CoreOutcome, GroundingOutcome, OpenedTable, PredicateForm, RawCell, execute_prompt,
 };
+use baho_ingest::{
+    RowReadLimits, SelectedRow, SelectedSourceReadError, SelectedSourceReader, SourceCellValue,
+};
+use baho_ingest_csv::{CsvRowCheckpoint, CsvSelectedSourceReader};
 use baho_model::{MaterializedView, Value};
 use baho_run::{InputIdentity, Invocation, PendingRun};
 use thiserror::Error;
@@ -12,9 +16,135 @@ pub const MIN_COLUMN_WIDTH: f32 = 72.0;
 pub const MAX_COLUMN_WIDTH: f32 = 320.0;
 pub const COLUMN_HORIZONTAL_PADDING: f32 = 24.0;
 pub const WIDTH_SAMPLE_ROWS: usize = 64;
+const SOURCE_OVERSCAN_ROWS: usize = 16;
+const CHECKPOINT_INTERVAL: usize = 256;
+
+pub struct SourceRangeCache {
+    reader: CsvSelectedSourceReader,
+    checkpoints: Vec<(usize, CsvRowCheckpoint)>,
+    start: usize,
+    rows: Vec<SelectedRow>,
+    limits: RowReadLimits,
+}
+
+impl std::fmt::Debug for SourceRangeCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceRangeCache")
+            .field("start", &self.start)
+            .field("cached_rows", &self.rows.len())
+            .field("checkpoints", &self.checkpoints.len())
+            .finish()
+    }
+}
+
+impl SourceRangeCache {
+    fn new(opened: &OpenedTable) -> Result<(Self, Vec<GridRow>), SelectedSourceReadError> {
+        let mut reader = opened.selected_source_reader()?;
+        let max_bytes = opened
+            .parser_config
+            .inspection
+            .max_field_size
+            .saturating_mul(opened.columns.len())
+            .max(1);
+        let limits = RowReadLimits {
+            max_rows: 1,
+            max_bytes,
+        };
+        let mut checkpoints = vec![(0, reader.checkpoint())];
+        let mut keys = Vec::with_capacity(opened.selected_row_count);
+        loop {
+            let batch = reader.read_next(limits)?;
+            for row in batch.rows {
+                let key = source_key("row", row.source_row).map_err(|error| {
+                    SelectedSourceReadError::Io {
+                        detail: error.to_string(),
+                    }
+                })?;
+                keys.push(GridRow {
+                    source_row: row.source_row,
+                    key,
+                });
+                if keys.len() % CHECKPOINT_INTERVAL == 0 {
+                    checkpoints.push((keys.len(), reader.checkpoint()));
+                }
+            }
+            if batch.complete {
+                break;
+            }
+        }
+        let mut cache = Self {
+            reader,
+            checkpoints,
+            start: 0,
+            rows: Vec::new(),
+            limits,
+        };
+        cache.reader.restore(&cache.checkpoints[0].1)?;
+        Ok((cache, keys))
+    }
+
+    pub fn load(
+        &mut self,
+        visible: Range<usize>,
+        total: usize,
+    ) -> Result<(), SelectedSourceReadError> {
+        if let Err(error) = self.reader.verify_source_stamp() {
+            self.rows.clear();
+            return Err(error);
+        }
+        let start = visible.start.saturating_sub(SOURCE_OVERSCAN_ROWS);
+        let end = visible.end.saturating_add(SOURCE_OVERSCAN_ROWS).min(total);
+        if start >= self.start && end <= self.start + self.rows.len() {
+            return Ok(());
+        }
+        let (checkpoint_index, checkpoint) = self
+            .checkpoints
+            .iter()
+            .rev()
+            .find(|(index, _)| *index <= start)
+            .expect("initial checkpoint exists");
+        self.reader.restore(checkpoint)?;
+        self.start = start;
+        self.rows.clear();
+        let mut logical = *checkpoint_index;
+        while logical < end {
+            let batch = self.reader.read_next(self.limits)?;
+            let count = batch.rows.len();
+            if logical >= start {
+                self.rows.extend(batch.rows);
+            }
+            logical += count;
+            if batch.complete || count == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn cell_text(&self, row: usize, column: usize) -> Option<&str> {
+        match self
+            .rows
+            .get(row.checked_sub(self.start)?)?
+            .cells
+            .get(column)?
+        {
+            SourceCellValue::Present(value) => Some(value),
+            SourceCellValue::Missing => Some(""),
+        }
+    }
+
+    pub fn cached_row_count(&self) -> usize {
+        self.rows.len()
+    }
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
+    }
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AdapterError {
+    #[error("could not read selected source: {0}")]
+    Source(#[from] SelectedSourceReadError),
     #[error("{kind} source index {index} cannot be represented as a grid key")]
     KeyOverflow { kind: &'static str, index: usize },
     #[error("duplicate {kind} grid key {key}")]
@@ -123,7 +253,6 @@ impl SelectionState {
 pub struct GridAdapter {
     pub columns: Vec<GridColumn>,
     pub rows: Vec<GridRow>,
-    cells: Vec<Vec<RawCell>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,11 +276,16 @@ impl DisplayGrid {
         }
     }
 
-    pub fn cell_text(&self, row: usize, column: usize) -> Option<&str> {
+    pub fn cell_text<'a>(
+        &'a self,
+        opened: &'a OpenedTable,
+        row: usize,
+        column: usize,
+    ) -> Option<&'a str> {
         match self {
             Self::Source(adapter) => {
                 let ordinal = adapter.columns.get(column)?.source_ordinal;
-                adapter.cell_text(row, ordinal)
+                adapter.cell_text(opened, row, ordinal)
             }
             Self::Materialized(adapter) => adapter.cell_text(row, column),
         }
@@ -237,6 +371,8 @@ pub struct GuiSession {
     pub prompt: String,
     pub prompt_edit: TextEditState,
     pub display: DisplayGrid,
+    pub source_cache: SourceRangeCache,
+    pub row_keys: Vec<u64>,
     pub last_successful: Option<MaterializedView>,
     pub status: SubmissionStatus,
     pending_prompt: Option<String>,
@@ -244,13 +380,19 @@ pub struct GuiSession {
 
 impl GuiSession {
     pub fn new(opened: OpenedTable, input_identity: InputIdentity) -> Result<Self, AdapterError> {
-        let display = DisplayGrid::Source(GridAdapter::from_opened_table(&opened)?);
+        let (source_cache, source_rows) = SourceRangeCache::new(&opened)?;
+        let mut adapter = GridAdapter::from_opened_table(&opened)?;
+        adapter.rows = source_rows;
+        let row_keys = adapter.rows.iter().map(|row| row.key).collect();
+        let display = DisplayGrid::Source(adapter);
         Ok(Self {
             opened,
             input_identity,
             prompt: String::new(),
             prompt_edit: TextEditState::default(),
             display,
+            source_cache,
+            row_keys,
             last_successful: None,
             status: SubmissionStatus::Idle,
             pending_prompt: None,
@@ -297,7 +439,25 @@ impl GuiSession {
             }
         };
         let run_id = pending.id().to_owned();
-        let result = execute_prompt(&self.opened, &prompt);
+        let materialized_open = baho_core::open_table_metadata(&self.opened.source_path);
+        let result = match materialized_open {
+            Ok(opened) if opened.source_revision != self.opened.source_revision => {
+                self.status = SubmissionStatus::Failure {
+                    run_id: Some(run_id),
+                    message: "Source changed since opening; reopen it before running a prompt"
+                        .to_owned(),
+                };
+                return true;
+            }
+            Ok(opened) => execute_prompt(&opened, &prompt),
+            Err(error) => {
+                self.status = SubmissionStatus::Failure {
+                    run_id: Some(run_id),
+                    message: error.to_string(),
+                };
+                return true;
+            }
+        };
         let next_display = result
             .output
             .as_ref()
@@ -317,6 +477,7 @@ impl GuiSession {
 
         match (result.outcome, result.output, next_display) {
             (CoreOutcome::Materialized, Some(view), Ok(Some(adapter))) => {
+                self.row_keys = adapter.rows.iter().map(|row| row.key).collect();
                 self.display = DisplayGrid::Materialized(adapter);
                 self.last_successful = Some(view);
                 reset_grid_interaction(grid_state, selection);
@@ -535,25 +696,29 @@ impl GridAdapter {
                 })
             })
             .collect::<Result<Vec<_>, AdapterError>>()?;
-        let cells = table.rows.iter().map(|row| row.cells.clone()).collect();
-
-        Ok(Self {
-            columns,
-            rows,
-            cells,
-        })
+        Ok(Self { columns, rows })
     }
 
-    pub fn cell(&self, logical_row: usize, source_ordinal: usize) -> Option<&RawCell> {
+    pub fn cell<'a>(
+        &self,
+        table: &'a OpenedTable,
+        logical_row: usize,
+        source_ordinal: usize,
+    ) -> Option<&'a RawCell> {
         let column_index = self
             .columns
             .iter()
             .position(|column| column.source_ordinal == source_ordinal)?;
-        self.cells.get(logical_row)?.get(column_index)
+        table.rows.get(logical_row)?.cells.get(column_index)
     }
 
-    pub fn cell_text(&self, logical_row: usize, source_ordinal: usize) -> Option<&str> {
-        match self.cell(logical_row, source_ordinal)? {
+    pub fn cell_text<'a>(
+        &self,
+        table: &'a OpenedTable,
+        logical_row: usize,
+        source_ordinal: usize,
+    ) -> Option<&'a str> {
+        match self.cell(table, logical_row, source_ordinal)? {
             RawCell::Present(text) => Some(text.as_str()),
             RawCell::Missing => Some(""),
         }
@@ -561,6 +726,7 @@ impl GridAdapter {
 
     pub fn visible_cells(
         &self,
+        table: &OpenedTable,
         visible_rows: Range<usize>,
         visible_columns: Range<usize>,
     ) -> Vec<VisibleCell> {
@@ -573,7 +739,7 @@ impl GridAdapter {
                 column_range.clone().filter_map(move |column_index| {
                     let row = &self.rows[row_index];
                     let column = &self.columns[column_index];
-                    let cell = self.cell(row_index, column.source_ordinal)?;
+                    let cell = self.cell(table, row_index, column.source_ordinal)?;
                     Some(VisibleCell {
                         row_key: row.key,
                         source_row: row.source_row,
@@ -645,11 +811,12 @@ mod tests {
     use std::{fs, io::Write};
     use tempfile::{NamedTempFile, TempDir};
 
-    fn adapter_for(input: &str) -> GridAdapter {
+    fn adapter_for(input: &str) -> (OpenedTable, GridAdapter) {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(input.as_bytes()).unwrap();
         let table = open_table(file.path()).unwrap();
-        GridAdapter::from_opened_table(&table).unwrap()
+        let adapter = GridAdapter::from_opened_table(&table).unwrap();
+        (table, adapter)
     }
 
     fn materialized_view() -> MaterializedView {
@@ -732,8 +899,38 @@ mod tests {
     }
 
     #[test]
+    fn source_cache_bounds_rows_across_distant_and_backward_ranges() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("sample.csv");
+        let mut input = String::from("Name,Value\n");
+        for index in 0..1200 {
+            input.push_str(&format!("item{index},{index}\n"));
+        }
+        fs::write(&path, input).unwrap();
+        let opened = baho_core::open_table_metadata(&path).unwrap();
+        assert!(opened.rows.is_empty());
+        let identity = InputIdentity::from_snapshot(&path, &path, &opened.source_revision);
+        let mut session = GuiSession::new(opened, identity).unwrap();
+        assert_eq!(session.display.rows().len(), 1200);
+        assert!(session.source_cache.checkpoint_count() > 1);
+        session.source_cache.load(1050..1060, 1200).unwrap();
+        assert_eq!(session.source_cache.cell_text(1050, 0), Some("item1050"));
+        assert!(session.source_cache.cached_row_count() <= 42);
+        session.source_cache.load(4..10, 1200).unwrap();
+        assert_eq!(session.source_cache.cell_text(4, 0), Some("item4"));
+        assert!(session.source_cache.cached_row_count() <= 42);
+        assert_eq!(session.row_keys[1050], source_key("row", 1051).unwrap());
+        fs::write(&path, "Name,Value\nchanged,1\n").unwrap();
+        assert!(matches!(
+            session.source_cache.load(4..10, 1200),
+            Err(SelectedSourceReadError::RevisionChanged)
+        ));
+        assert_eq!(session.source_cache.cached_row_count(), 0);
+    }
+
+    #[test]
     fn keys_derive_from_source_coordinates() {
-        let adapter = adapter_for("Name,Amount\nAlice,10\nBob,20\n");
+        let (_table, adapter) = adapter_for("Name,Amount\nAlice,10\nBob,20\n");
         assert_eq!(adapter.columns[0].descriptor.key, 1 << 32);
         assert_eq!(adapter.columns[1].descriptor.key, 2 << 32);
         assert_eq!(adapter.rows[0].key, 2);
@@ -743,17 +940,24 @@ mod tests {
 
     #[test]
     fn raw_present_empty_and_missing_remain_distinct() {
-        let adapter = adapter_for("Name,Amount\nAlice,\nBob\n");
-        assert_eq!(adapter.cell(0, 1), Some(&RawCell::Present(String::new())));
-        assert_eq!(adapter.cell(1, 1), Some(&RawCell::Missing));
-        assert_eq!(adapter.cell_text(1, 1), Some(""));
+        let (table, adapter) = adapter_for("Name,Amount\nAlice,\nBob\n");
+        assert_eq!(
+            adapter.cell(&table, 0, 1),
+            Some(&RawCell::Present(String::new()))
+        );
+        assert_eq!(adapter.cell(&table, 1, 1), Some(&RawCell::Missing));
+        assert_eq!(adapter.cell_text(&table, 1, 1), Some(""));
+        assert!(std::ptr::eq(
+            adapter.cell(&table, 0, 1).unwrap(),
+            &table.rows[0].cells[1]
+        ));
     }
 
     #[test]
     fn widths_are_deterministic_and_bounded() {
-        let adapter =
+        let (_table, adapter) =
             adapter_for("Name,Notes\na,short\nb,an exceptionally long value that is capped\n");
-        let again =
+        let (_again_table, again) =
             adapter_for("Name,Notes\na,short\nb,an exceptionally long value that is capped\n");
         let widths = adapter
             .columns
@@ -786,8 +990,8 @@ mod tests {
 
     #[test]
     fn visible_ranges_bound_adaptation_to_requested_cells() {
-        let adapter = adapter_for("A,B,C\n1,2,3\n4,5,6\n7,8,9\n");
-        let cells = adapter.visible_cells(1..3, 0..2);
+        let (table, adapter) = adapter_for("A,B,C\n1,2,3\n4,5,6\n7,8,9\n");
+        let cells = adapter.visible_cells(&table, 1..3, 0..2);
         assert_eq!(cells.len(), 4);
         assert_eq!(cells[0].source_row, adapter.rows[1].source_row);
         assert_eq!(cells[0].text, "4");
@@ -796,7 +1000,7 @@ mod tests {
 
     #[test]
     fn selection_transitions_follow_source_keys() {
-        let adapter = adapter_for("Name,Amount\nAlice,10\nBob,20\n");
+        let (_table, adapter) = adapter_for("Name,Amount\nAlice,10\nBob,20\n");
         let mut selection = SelectionState::default();
         assert!(selection.activate(adapter.rows[0].key, adapter.columns[0].descriptor.key));
         assert_eq!(selection.selected_row_key, Some(adapter.rows[0].key));
@@ -977,7 +1181,10 @@ mod tests {
         );
 
         assert_eq!(session.last_successful.as_ref(), Some(&successful));
-        assert_eq!(session.display.cell_text(0, 0), Some("Ada"));
+        assert_eq!(
+            session.display.cell_text(&session.opened, 0, 0),
+            Some("Ada")
+        );
         assert!(
             matches!(session.status, SubmissionStatus::Failure { run_id: Some(ref id), .. } if id == "000002")
         );
@@ -1003,7 +1210,10 @@ mod tests {
         }
 
         assert_eq!(session.display.columns()[0].display_name, "City");
-        assert_eq!(session.display.cell_text(0, 0), Some("London"));
+        assert_eq!(
+            session.display.cell_text(&session.opened, 0, 0),
+            Some("London")
+        );
         assert!(runs.join("000001").is_dir());
         assert!(runs.join("000002").is_dir());
     }

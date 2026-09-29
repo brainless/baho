@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use baho_ingest::error::ImportError;
@@ -7,6 +7,20 @@ use baho_ingest::profile::InspectOptions;
 use baho_model::diagnostic::{Diagnostic, DiagnosticLocation, Severity};
 
 use crate::dialect::CsvDialect;
+use sha2::{Digest, Sha256};
+
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..count]);
+        Ok(count)
+    }
+}
 
 /// A parsed logical CSV record.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +40,7 @@ pub struct MalformedRecord {
 /// Result of inspecting a CSV file.
 #[derive(Debug, Clone)]
 pub struct InspectionResult {
+    pub content_hash: String,
     pub dialect: CsvDialect,
     pub logical_record_count: Option<usize>,
     pub sampled_records: Vec<LogicalRecord>,
@@ -83,7 +98,10 @@ pub fn inspect_csv_with_config(
         .escape(Some(dialect.quote_escape))
         .has_headers(false)
         .flexible(true)
-        .from_reader(BufReader::new(file));
+        .from_reader(HashingReader {
+            inner: BufReader::new(file),
+            hasher: Sha256::new(),
+        });
 
     let mut sampled_records = Vec::new();
     let mut blank_record_indices = Vec::new();
@@ -218,7 +236,9 @@ pub fn inspect_csv_with_config(
     // are capped. The aggregate count therefore remains available.
     let logical_record_count = Some(valid_count);
 
+    let content_hash = format!("{:x}", reader.into_inner().hasher.finalize());
     Ok(InspectionResult {
+        content_hash,
         dialect: dialect.clone(),
         logical_record_count,
         sampled_records,
@@ -235,6 +255,25 @@ pub fn inspect_csv_with_config(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn inspection_hashes_the_complete_source_with_quoted_newlines() {
+        let source = b"name,note\nAlice,\"line one\nline two\"\nBob,done\n";
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(source).unwrap();
+        let result = inspect_csv(
+            file.path(),
+            &CsvDialect::default(),
+            &InspectOptions {
+                max_sample_records: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.logical_record_count, Some(3));
+        assert_eq!(result.sampled_records.len(), 1);
+        assert_eq!(result.content_hash, format!("{:x}", Sha256::digest(source)));
+    }
 
     fn inspect_from_str(csv: &str, max_samples: usize) -> InspectionResult {
         let mut file = tempfile::NamedTempFile::new().unwrap();

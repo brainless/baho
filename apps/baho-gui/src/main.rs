@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use akar_components::{
@@ -13,7 +14,6 @@ use akar_layout::{
 };
 use akar_winit::process_window_event;
 use anyhow::{Context, Result};
-use baho_core::open_table;
 use baho_model::{Diagnostic, Severity};
 use baho_run::{InputIdentity, Invocation};
 use clap::Parser;
@@ -28,7 +28,7 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-use baho_gui::{GuiSession, SelectionState, SubmissionStatus, SubmitRequest};
+use baho_gui::{DisplayGrid, GuiSession, SelectionState, SubmitRequest};
 mod script;
 use script::{ScriptRunner, parse_script};
 
@@ -296,8 +296,8 @@ fn render_history_panel(
 struct App {
     state: Option<AppState>,
     args: Args,
-    initial_session: Option<GuiSession>,
-    initial_input_path: Option<std::path::PathBuf>,
+    startup_input: Option<std::path::PathBuf>,
+    pending_open: Option<Receiver<OpenResult>>,
     fatal_error: Option<anyhow::Error>,
     script: Option<ScriptRunner>,
     start_time: Option<Instant>,
@@ -305,6 +305,38 @@ struct App {
     layout_dumped: bool,
     frame_dumped: bool,
     working_directory: std::path::PathBuf,
+}
+
+type OpenResult = Result<(GuiSession, Vec<Diagnostic>, std::path::PathBuf)>;
+
+fn open_in_background(
+    path: std::path::PathBuf,
+    working_directory: std::path::PathBuf,
+) -> Receiver<OpenResult> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = open_session_with_progress(&path, &working_directory, || {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "name": "gui.source_open_progress", "stage": "source_index",
+                    "elapsed_ms": started.elapsed().as_millis(),
+                })
+            );
+        });
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "name": "gui.source_open_completed",
+                "stage": "source_open",
+                "elapsed_ms": started.elapsed().as_millis(),
+                "outcome": if result.is_ok() { "verified" } else { "failed" },
+            })
+        );
+        let _ = sender.send(result);
+    });
+    receiver
 }
 
 fn write_png(path: &std::path::Path, frame: akar_core::CapturedFrame) -> Result<()> {
@@ -331,17 +363,27 @@ const DEFAULT_EMPTY_STATE_MESSAGE: &str = "Drop a CSV file here to open it";
 /// Opens `input` (relative paths are resolved against `working_directory`)
 /// and adapts it into a fresh `GuiSession`. Shared by startup and by
 /// drag-and-drop, which both need to turn a path into a ready session.
+#[cfg(test)]
 fn open_session(
     input: &std::path::Path,
     working_directory: &std::path::Path,
+) -> Result<(GuiSession, Vec<Diagnostic>, std::path::PathBuf)> {
+    open_session_with_progress(input, working_directory, || {})
+}
+
+fn open_session_with_progress(
+    input: &std::path::Path,
+    working_directory: &std::path::Path,
+    metadata_ready: impl FnOnce(),
 ) -> Result<(GuiSession, Vec<Diagnostic>, std::path::PathBuf)> {
     let absolute_input = if input.is_absolute() {
         input.to_path_buf()
     } else {
         working_directory.join(input)
     };
-    let table =
-        open_table(&absolute_input).map_err(|failure| anyhow::anyhow!(failure.to_string()))?;
+    let table = baho_core::open_table_metadata(&absolute_input)
+        .map_err(|failure| anyhow::anyhow!(failure.to_string()))?;
+    metadata_ready();
     let diagnostics = table.diagnostics.clone();
     let input_identity =
         InputIdentity::from_snapshot(input, &absolute_input, &table.source_revision);
@@ -373,22 +415,13 @@ fn run() -> Result<()> {
         })
         .transpose()?;
     let working_directory = std::env::current_dir().context("could not read working directory")?;
-    let (initial_session, initial_input_path) = match &args.input {
-        Some(input) => {
-            let (session, diagnostics, absolute_input) = open_session(input, &working_directory)?;
-            if let Some(summary) = format_startup_diagnostics(&diagnostics) {
-                eprintln!("{summary}");
-            }
-            (Some(session), Some(absolute_input))
-        }
-        None => (None, None),
-    };
+    let initial_input = args.input.clone();
     let event_loop = EventLoop::new().context("could not create event loop")?;
     let mut app = App {
         state: None,
         args,
-        initial_session,
-        initial_input_path,
+        startup_input: initial_input,
+        pending_open: None,
         fatal_error: None,
         script,
         start_time: None,
@@ -554,8 +587,6 @@ impl ApplicationHandler for App {
         );
         let mut layout = Layout::new();
         let app_layout = build_app_layout(&mut layout);
-        let session = self.initial_session.take();
-        let current_input_path = self.initial_input_path.take();
         self.start_time = Some(Instant::now());
         self.state = Some(AppState {
             window,
@@ -574,10 +605,10 @@ impl ApplicationHandler for App {
             grid_node: app_layout.grid,
             grid_state: DataGridState::new(),
             selection: SelectionState::default(),
-            session,
+            session: None,
             empty_state_message: DEFAULT_EMPTY_STATE_MESSAGE.to_owned(),
             history: std::collections::BTreeMap::new(),
-            current_input_path,
+            current_input_path: None,
             runs_directory: self.working_directory.join(".baho/runs"),
             invocation: Invocation {
                 command: "baho-gui".to_owned(),
@@ -590,6 +621,9 @@ impl ApplicationHandler for App {
         });
         if let Some(state) = &self.state {
             state.window.request_redraw();
+        }
+        if let Some(path) = self.startup_input.take() {
+            self.load_dropped_file(path);
         }
     }
 
@@ -635,14 +669,24 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.finish_pending_open();
         let now = Instant::now();
-        let screenshot_deadline = (!self.screenshot_taken)
+        let screenshot_deadline = (!self.screenshot_taken && self.pending_open.is_none())
             .then(|| self.args.screenshot.as_ref())
             .flatten()
             .and_then(|_| self.start_time)
             .map(|start| start + Duration::from_secs_f64(self.args.delay));
-        let script_deadline = self.script.as_ref().and_then(ScriptRunner::next_deadline);
-        let deadline = [screenshot_deadline, script_deadline]
+        let script_deadline = self
+            .pending_open
+            .is_none()
+            .then(|| self.script.as_ref())
+            .flatten()
+            .and_then(ScriptRunner::next_deadline);
+        let open_deadline = self
+            .pending_open
+            .as_ref()
+            .map(|_| now + Duration::from_millis(30));
+        let deadline = [screenshot_deadline, script_deadline, open_deadline]
             .into_iter()
             .flatten()
             .min();
@@ -666,22 +710,50 @@ impl App {
         event_loop.exit();
     }
 
-    /// Opens a dropped file as a fresh session, replacing whatever table (if
-    /// any) was already open. A failed open never tears down an existing
-    /// session; it reports the error where the user is currently looking.
     fn load_dropped_file(&mut self, path: std::path::PathBuf) {
-        let working_directory = self.working_directory.clone();
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        match open_session(&path, &working_directory) {
+        state.session = None;
+        state.current_input_path = None;
+        state.empty_state_message = format!(
+            "Loading {} — scanning and verifying source…",
+            path.display()
+        );
+        state.window.request_redraw();
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "name": "gui.source_open_started", "stage": "source_open",
+                "path": path.to_string_lossy(),
+            })
+        );
+        self.pending_open = Some(open_in_background(path, self.working_directory.clone()));
+    }
+
+    fn finish_pending_open(&mut self) {
+        let result = match self.pending_open.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => result,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => Err(anyhow::anyhow!(
+                "source loading worker stopped unexpectedly"
+            )),
+            _ => return,
+        };
+        self.pending_open = None;
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        match result {
             Ok((session, diagnostics, absolute_input)) => {
                 if let Some(summary) = format_startup_diagnostics(&diagnostics) {
                     eprintln!("{summary}");
                 }
                 let title = format!(
                     "baho — {}",
-                    path.file_name().and_then(|n| n.to_str()).unwrap_or("table")
+                    absolute_input
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("table")
                 );
                 state.window.set_title(&title);
                 state.grid_state = DataGridState::new();
@@ -690,18 +762,10 @@ impl App {
                 state.current_input_path = Some(absolute_input);
             }
             Err(error) => {
-                let message = format!("Could not open {}: {error:#}", path.display());
-                match state.session.as_mut() {
-                    Some(session) => {
-                        session.status = SubmissionStatus::Failure {
-                            run_id: None,
-                            message,
-                        }
-                    }
-                    None => state.empty_state_message = message,
-                }
+                state.empty_state_message = format!("Could not open source: {error:#}");
             }
         }
+        state.window.request_redraw();
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
@@ -735,9 +799,13 @@ impl App {
             event_loop.exit();
             return;
         }
-        let script_capture = self.script.as_mut().and_then(|runner| {
-            runner.advance(&mut state.core.input, &state.layout, Instant::now())
-        });
+        let script_capture = if self.pending_open.is_none() {
+            self.script.as_mut().and_then(|runner| {
+                runner.advance(&mut state.core.input, &state.layout, Instant::now())
+            })
+        } else {
+            None
+        };
         let dump_this_frame = self.args.dump_frame.is_some()
             && !self.frame_dumped
             && (self.script.is_none() || script_capture.is_some());
@@ -799,12 +867,12 @@ impl App {
                     .push_quad(grid_container_quad(container_rect));
             }
             let style = DataGridStyle::from_theme(&AKAR_THEME_DARK);
-            let row_keys = session
-                .display
-                .rows()
-                .iter()
-                .map(|row| row.key)
-                .collect::<Vec<_>>();
+            if let DisplayGrid::Materialized(_) = &session.display {
+                if session.row_keys.len() != session.display.rows().len() {
+                    session.row_keys = session.display.rows().iter().map(|row| row.key).collect();
+                }
+            }
+            let row_keys = &session.row_keys;
             let descriptors = session
                 .display
                 .columns()
@@ -821,7 +889,7 @@ impl App {
                     state.grid_node,
                     &mut state.grid_state,
                     session.display.rows().len(),
-                    &row_keys,
+                    row_keys,
                     &descriptors,
                     &style,
                 );
@@ -838,7 +906,7 @@ impl App {
                 state.grid_node,
                 &mut state.grid_state,
                 session.display.rows().len(),
-                &row_keys,
+                row_keys,
                 style.row_height,
                 style.header_height,
                 &descriptors,
@@ -861,7 +929,18 @@ impl App {
                 }
             }
             data_grid_header_end(&mut state.core);
-            data_grid_body_begin(&mut state.core, &response, &row_keys, &style, &selected);
+            if matches!(session.display, DisplayGrid::Source(_)) {
+                if let Err(error) = session
+                    .source_cache
+                    .load(response.visible_rows.clone(), session.display.rows().len())
+                {
+                    session.status = baho_gui::SubmissionStatus::Failure {
+                        run_id: None,
+                        message: error.to_string(),
+                    };
+                }
+            }
+            data_grid_body_begin(&mut state.core, &response, row_keys, &style, &selected);
             for row_index in response.visible_rows.clone() {
                 for column_index in response.visible_columns.clone() {
                     let Some(row) = session.display.rows().get(row_index) else {
@@ -870,10 +949,15 @@ impl App {
                     let Some(column) = session.display.columns().get(column_index) else {
                         continue;
                     };
-                    let text = session
-                        .display
-                        .cell_text(row_index, column_index)
-                        .unwrap_or("");
+                    let text = match &session.display {
+                        DisplayGrid::Source(_) => {
+                            session.source_cache.cell_text(row_index, column_index)
+                        }
+                        DisplayGrid::Materialized(adapter) => {
+                            adapter.cell_text(row_index, column_index)
+                        }
+                    }
+                    .unwrap_or("");
                     let cell = data_grid_cell(
                         &mut state.core,
                         &state.layout,
@@ -935,7 +1019,8 @@ impl App {
             );
             false
         };
-        let timed_capture = !self.screenshot_taken
+        let timed_capture = self.pending_open.is_none()
+            && !self.screenshot_taken
             && self.args.screenshot.is_some()
             && self
                 .start_time
@@ -1199,6 +1284,24 @@ mod tests {
         let error = open_session(std::path::Path::new("missing.csv"), workspace.path())
             .expect_err("a missing file cannot be opened");
         assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn background_open_reports_a_verified_session() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("table.csv"), "Name\nAda\n").unwrap();
+        let receiver = super::open_in_background(
+            std::path::PathBuf::from("table.csv"),
+            workspace.path().to_path_buf(),
+        );
+        let (session, _, _) = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.opened.source_revision.content_hash,
+            session.input_identity.sha256
+        );
     }
 
     #[test]

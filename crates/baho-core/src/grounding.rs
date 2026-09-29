@@ -4,8 +4,11 @@
 //! IDs identify predicate interpretations, since two interpretations may use
 //! the same column with different predicate forms.
 
+use baho_ingest::{
+    RowReadLimits, SelectedRow, SelectedSourceReadError, SelectedSourceReader, SourceCellValue,
+};
 use baho_ingest_csv::{
-    CompleteScanError, ExactValueLookup, FlagShapeLookup, SelectedRegionError, SelectedTableStream,
+    CompleteScanError, ExactValueLookup, FlagShapeLookup, SelectedRegionError,
     scan_grounding_evidence,
 };
 use baho_model::column::{ColumnDefinition, InferredColumnType, NumericParsePolicy};
@@ -13,9 +16,99 @@ use baho_model::{CellAddress, SourceRevision, TextMatchPolicy};
 use baho_plan::{ComparisonOperator, Expression, Literal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 
 use crate::intent::{RowFilterIntent, UngroundedKind};
 use crate::orchestration::OpenedTable;
+
+struct SelectedSourceRecords {
+    reader: baho_ingest_csv::CsvSelectedSourceReader,
+    rows: VecDeque<SelectedRow>,
+    batch_complete: bool,
+    max_bytes: usize,
+}
+
+impl SelectedSourceRecords {
+    fn new(reader: baho_ingest_csv::CsvSelectedSourceReader, max_field_size: usize) -> Self {
+        let columns = reader.metadata().columns.len();
+        Self {
+            reader,
+            rows: VecDeque::new(),
+            batch_complete: false,
+            max_bytes: max_field_size.saturating_mul(columns).max(1),
+        }
+    }
+}
+
+impl Iterator for SelectedSourceRecords {
+    type Item = Result<baho_ingest_csv::inspector::LogicalRecord, SelectedRegionError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(row) = self.rows.pop_front() {
+                let fields = row
+                    .cells
+                    .into_iter()
+                    .map(|cell| match cell {
+                        SourceCellValue::Present(value) => value,
+                        SourceCellValue::Missing => String::new(),
+                    })
+                    .collect();
+                return Some(Ok(baho_ingest_csv::inspector::LogicalRecord {
+                    index: row.source_row,
+                    fields,
+                    is_blank: false,
+                }));
+            }
+            if self.batch_complete {
+                return None;
+            }
+            let limits = match RowReadLimits::new(128, self.max_bytes) {
+                Ok(limits) => limits,
+                Err(error) => {
+                    self.batch_complete = true;
+                    return Some(Err(SelectedRegionError::Reader {
+                        detail: error.to_string(),
+                    }));
+                }
+            };
+            match self.reader.read_next(limits) {
+                Ok(batch) => {
+                    self.rows.extend(batch.rows);
+                    self.batch_complete = batch.complete;
+                }
+                Err(SelectedSourceReadError::RevisionChanged) => {
+                    self.batch_complete = true;
+                    return Some(Err(SelectedRegionError::RevisionChanged));
+                }
+                Err(SelectedSourceReadError::MalformedRecord { row, detail }) => {
+                    self.batch_complete = true;
+                    return Some(Err(SelectedRegionError::MalformedRecord { row, detail }));
+                }
+                Err(SelectedSourceReadError::FieldTooLarge {
+                    row,
+                    column,
+                    size,
+                    limit,
+                }) => {
+                    self.batch_complete = true;
+                    return Some(Err(SelectedRegionError::FieldTooLarge {
+                        row,
+                        col: column,
+                        size,
+                        max_size: limit,
+                    }));
+                }
+                Err(error) => {
+                    self.batch_complete = true;
+                    return Some(Err(SelectedRegionError::Reader {
+                        detail: error.to_string(),
+                    }));
+                }
+            }
+        }
+    }
+}
 
 /// First persisted grounding and clarification contract.
 pub const GROUNDING_SCHEMA_VERSION: u32 = 2;
@@ -376,16 +469,17 @@ pub fn ground_row_filter(
             matches!(clause.kind, UngroundedKind::Bare { .. }).then_some(clause.term.as_str())
         })
         .collect::<Vec<_>>();
-    let source_rows = opened.rows.iter().map(|row| row.source_row);
-    let stream = match SelectedTableStream::open(
-        &opened.source_path,
-        &opened.source_revision.content_hash,
-        &opened.parser_config,
-        source_rows,
-    ) {
-        Ok(stream) => stream,
-        Err(error) => return refusal(GroundingRefusalCode::StaleClarification, error.to_string()),
+    let reader = match opened.selected_source_reader() {
+        Ok(reader) => reader,
+        Err(SelectedSourceReadError::RevisionChanged) => {
+            return refusal(
+                GroundingRefusalCode::StaleClarification,
+                "source revision changed while grounding",
+            );
+        }
+        Err(error) => return refusal(GroundingRefusalCode::IncompatibleTypes, error.to_string()),
     };
+    let stream = SelectedSourceRecords::new(reader, opened.parser_config.inspection.max_field_size);
     let scanned = match scan_grounding_evidence(
         stream,
         columns,

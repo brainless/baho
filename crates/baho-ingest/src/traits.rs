@@ -3,6 +3,9 @@ use std::path::Path;
 use crate::ImportedDocument;
 use crate::error::ImportError;
 use crate::profile::InspectOptions;
+use crate::selected_source::{
+    RowReadLimits, SelectedRowBatch, SelectedSourceMetadata, SelectedSourceReadError,
+};
 
 /// Detect whether a format importer can handle a given file.
 pub trait FormatInspector {
@@ -25,4 +28,22 @@ pub trait FormatImporter {
         path: &Path,
         options: &InspectOptions,
     ) -> Result<ImportedDocument, ImportError>;
+}
+
+/// Sequential access to rows from an already selected table.
+///
+/// Implementations return no more than `limits.max_rows` rows and no more
+/// than `limits.max_bytes` of present cell text in one batch. A single row
+/// that cannot fit the byte limit is an error. Rows remain in source order,
+/// and each row retains its original source coordinate. Every read must be
+/// checked against the exact `SourceRevision` exposed by `metadata`; a change
+/// before or during a read returns `RevisionChanged` rather than mixing data
+/// from two revisions.
+pub trait SelectedSourceReader {
+    fn metadata(&self) -> &SelectedSourceMetadata;
+
+    fn read_next(
+        &mut self,
+        limits: RowReadLimits,
+    ) -> Result<SelectedRowBatch, SelectedSourceReadError>;
 }

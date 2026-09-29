@@ -33,6 +33,8 @@ impl fmt::Display for ColumnMixedReason {
 /// Errors returned during plan execution.
 #[derive(Debug, Clone, Error)]
 pub enum ExecutionError {
+    #[error("selected source read failed: {detail}")]
+    SourceRead { detail: String },
     #[error("table not found: {table_id}")]
     TableNotFound { table_id: String },
 
