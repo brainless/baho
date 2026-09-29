@@ -1,5 +1,9 @@
 [workspace]
-members = ["apps/baho-cli", "apps/baho-gui", "crates/baho-core", "crates/baho-exec", "crates/baho-ingest", "crates/baho-ingest-csv", "crates/baho-llm", "crates/baho-model", "crates/baho-plan", "crates/baho-run"]
+members = ["apps/baho-cli", "apps/baho-gui", "crates/baho-core", "crates/baho-exec", "crates/baho-ingest", "crates/baho-ingest-csv", "crates/baho-model", "crates/baho-plan", "crates/baho-run"]
+# baho-llm uses a local llm-sdk checkout and is not needed by either binary.
+# Re-enable it when the dependency can be resolved on clean CI runners.
+# "crates/baho-llm",
+exclude = ["crates/baho-llm"]
 resolver = "2"
 
 [workspace.package]
