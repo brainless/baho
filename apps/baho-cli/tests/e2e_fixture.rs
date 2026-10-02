@@ -545,6 +545,7 @@ fn row_filter_materializes_all_columns_from_fixture() {
             "body_rows_classified",
             "intent_recognized",
             "plan_validated",
+            "interpretation_selected",
             "compared_columns_parsed",
             "materialization_completed",
             "run_finished",

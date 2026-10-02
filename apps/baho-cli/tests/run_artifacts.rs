@@ -81,6 +81,7 @@ fn run_records_the_request_and_input_identity() {
             "body_rows_classified",
             "intent_recognized",
             "plan_validated",
+            "interpretation_selected",
             "materialization_completed",
             "run_finished",
         ]
@@ -582,6 +583,7 @@ fn row_filter_records_plan_v3_with_all_columns_and_provenance() {
             "body_rows_classified",
             "intent_recognized",
             "plan_validated",
+            "interpretation_selected",
             "compared_columns_parsed",
             "materialization_completed",
             "run_finished",
@@ -768,7 +770,11 @@ fn mixed_compared_column_refusal_writes_parse_diagnostics() {
         .collect();
     assert_eq!(
         &event_names[event_names.len() - 3..],
-        ["plan_validated", "compared_columns_parsed", "run_finished"]
+        [
+            "interpretation_selected",
+            "compared_columns_parsed",
+            "run_finished"
+        ]
     );
     assert!(
         !event_names.contains(&"materialization_completed"),

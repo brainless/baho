@@ -179,6 +179,9 @@ fn finish_result(
     result: &CoreResult,
     recorded: RecordedRun,
 ) -> std::result::Result<RecordedRun, RecordFailure> {
+    if let Some(summary) = result.interpretation_summary() {
+        eprintln!("Interpretation: {summary}");
+    }
     if let Some(baho_core::GroundingResult {
         outcome: GroundingOutcome::NeedsClarification { request },
         ..

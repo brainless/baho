@@ -685,7 +685,13 @@ pub fn recognize_request(
     }
     match committed_row_filter(&words, &phrases, 0, &tokens, &action) {
         CommittedRowFilter::Complete(intent)
-            if words.len() == 1 || intent.ungrounded.is_empty() =>
+            if words.len() == 1
+                || intent.ungrounded.is_empty()
+                || intent
+                    .evidence
+                    .row_filter
+                    .as_ref()
+                    .is_some_and(|filter| !filter.connectors.is_empty()) =>
         {
             Ok(RecognizedRequest::RowFilter(intent))
         }

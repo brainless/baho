@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::grounding::{
-    ClarificationRequest, ClarificationResponse, GroundingOutcome, GroundingResult,
+    ClarificationRequest, ClarificationResponse, GroundingOutcome, GroundingResult, PredicateForm,
     ground_row_filter,
 };
 use baho_exec::error::ExecutionError;
@@ -70,6 +70,104 @@ pub struct CoreResult {
     pub diagnostics: Vec<Diagnostic>,
     pub events: Vec<CoreEvent>,
     pub outcome: CoreOutcome,
+}
+
+impl CoreResult {
+    /// A concise reading of the validated plan, using source column names.
+    pub fn interpretation_summary(&self) -> Option<String> {
+        let plan = self.plan.as_ref()?;
+        let name = |id: &str| {
+            self.intent_evidence
+                .as_ref()
+                .and_then(|evidence| {
+                    evidence
+                        .row_filter
+                        .as_ref()
+                        .and_then(|filter| {
+                            filter
+                                .headers
+                                .iter()
+                                .find(|header| header.column_id == id)
+                                .map(|header| header.display_name.clone())
+                        })
+                        .or_else(|| {
+                            evidence
+                                .matched_column
+                                .as_ref()
+                                .filter(|column| column.column_id == id)
+                                .map(|column| column.display_name.clone())
+                        })
+                })
+                .or_else(|| {
+                    self.grounding
+                        .as_ref()
+                        .and_then(|grounding| match &grounding.outcome {
+                            GroundingOutcome::Grounded { evidence, .. } => evidence
+                                .iter()
+                                .find(|clause| clause.selected.column_id == id)
+                                .map(|clause| clause.selected.display_name.clone()),
+                            _ => None,
+                        })
+                })
+                .unwrap_or_else(|| id.to_owned())
+        };
+        let filter = plan.steps.iter().find_map(|step| match step {
+            PlanStep::Filter { predicate } => Some(predicate),
+            _ => None,
+        });
+        if let Some(predicate) = filter {
+            return Some(format!(
+                "Filter rows where {}",
+                describe_predicate(predicate, &name)
+            ));
+        }
+        let selected = plan.steps.iter().find_map(|step| match step {
+            PlanStep::Select { columns } | PlanStep::Distinct { columns, .. } => Some(columns),
+            _ => None,
+        })?;
+        Some(format!(
+            "Retrieve {}",
+            selected
+                .iter()
+                .map(|id| name(id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
+fn describe_predicate(predicate: &Expression, name: &impl Fn(&str) -> String) -> String {
+    match predicate {
+        Expression::IsNotBlank { column } => format!("{} is not blank", name(column)),
+        Expression::Compare {
+            column,
+            operator,
+            literal,
+        } => {
+            let literal = match literal {
+                Literal::Text(value) | Literal::Deferred(value) => format!("\"{value}\""),
+                Literal::Decimal(value) => value.to_string(),
+            };
+            format!("{} {} {literal}", name(column), operator.as_str())
+        }
+        Expression::And { predicates } => format!(
+            "({})",
+            predicates
+                .iter()
+                .map(|predicate| describe_predicate(predicate, name))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
+        Expression::Or { predicates } => format!(
+            "({})",
+            predicates
+                .iter()
+                .map(|predicate| describe_predicate(predicate, name))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ),
+        Expression::Not { predicate } => format!("not {}", describe_predicate(predicate, name)),
+    }
 }
 
 /// A raw cell in an opened selected table. `Missing` is distinct from an
@@ -952,6 +1050,41 @@ where
         serde_json::json!({ "schema_version": plan.schema_version, "step_count": plan.steps.len() }),
     );
     result.plan = Some(plan.clone());
+    if let Some(summary) = result.interpretation_summary() {
+        let header_bindings = result
+            .intent_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.row_filter.as_ref())
+            .map(|filter| {
+                filter
+                    .headers
+                    .iter()
+                    .map(|header| {
+                        serde_json::json!({
+                            "span": header.span, "column_id": header.column_id,
+                            "rule": "complete_header_first",
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let value_bindings = result.grounding.as_ref().and_then(|grounding| match &grounding.outcome {
+            GroundingOutcome::Grounded { evidence, .. } => Some(evidence.iter().filter(|clause| clause.selected.predicate_form == PredicateForm::EqualsValue).map(|clause| serde_json::json!({
+                "clause_id": clause.clause_id, "column_id": clause.selected.column_id,
+                "rule": "observed_value", "selection": clause.selection,
+            })).collect::<Vec<_>>()),
+            _ => None,
+        }).unwrap_or_default();
+        push_event(
+            &mut result.events,
+            "interpretation_selected",
+            "plan",
+            serde_json::json!({
+                "summary": summary, "header_bindings": header_bindings,
+                "value_bindings": value_bindings, "plan_schema_version": plan.schema_version,
+            }),
+        );
+    }
 
     // Strict typed parsing of every compared column happens before execution
     // so the executor can distinguish numeric, text, mixed, and blank
@@ -1893,6 +2026,7 @@ Total,4 items,approximate,extra,notes,more
                 "body_rows_classified",
                 "intent_recognized",
                 "plan_validated",
+                "interpretation_selected",
                 "materialization_completed",
             ]
         );
@@ -2864,6 +2998,7 @@ ID,Job,Annual Income,Note
                 "body_rows_classified",
                 "intent_recognized",
                 "plan_validated",
+                "interpretation_selected",
                 "compared_columns_parsed",
                 "materialization_completed",
             ]

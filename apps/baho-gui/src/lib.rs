@@ -307,6 +307,7 @@ pub enum SubmissionStatus {
     },
     Success {
         run_id: String,
+        interpretation: String,
     },
     NeedsClarification {
         run_id: String,
@@ -323,7 +324,10 @@ impl SubmissionStatus {
         match self {
             Self::Idle => String::new(),
             Self::Processing { rows } => format!("Processing: {rows} matching rows so far"),
-            Self::Success { run_id } => format!("Run {run_id} materialized"),
+            Self::Success {
+                run_id,
+                interpretation,
+            } => format!("Run {run_id} materialized: {interpretation}"),
             Self::NeedsClarification { run_id, message } => {
                 format!("Run {run_id} needs clarification: {message}")
             }
@@ -569,6 +573,7 @@ impl GuiSession {
             self.worker = None;
             match done {
                 Ok((result, recorded)) if result.outcome == CoreOutcome::Materialized => {
+                    let interpretation = result.interpretation_summary().unwrap_or_default();
                     if let Some(view) = result.output {
                         match MaterializedGridAdapter::from_view(&view) {
                             Ok(adapter) => {
@@ -577,6 +582,7 @@ impl GuiSession {
                                 self.last_successful = Some(view);
                                 self.status = SubmissionStatus::Success {
                                     run_id: recorded.id,
+                                    interpretation,
                                 };
                                 reset_grid_interaction(grid_state, selection);
                             }
@@ -688,6 +694,7 @@ impl GuiSession {
             }
         };
 
+        let interpretation = result.interpretation_summary().unwrap_or_default();
         match (result.outcome, result.output, next_display) {
             (CoreOutcome::Materialized, Some(view), Ok(Some(adapter))) => {
                 self.row_keys = adapter.rows.iter().map(|row| row.key).collect();
@@ -696,6 +703,7 @@ impl GuiSession {
                 reset_grid_interaction(grid_state, selection);
                 self.status = SubmissionStatus::Success {
                     run_id: recorded.id,
+                    interpretation,
                 };
             }
             (CoreOutcome::Materialized, _, Err(error)) => {
@@ -1391,7 +1399,10 @@ mod tests {
         );
         assert!(!runs.join("000002").exists());
         assert_eq!(session.prompt, "  List Name\n");
-        assert_eq!(session.status.message(), "Run 000001 materialized");
+        assert_eq!(
+            session.status.message(),
+            "Run 000001 materialized: Retrieve Name"
+        );
     }
 
     #[test]

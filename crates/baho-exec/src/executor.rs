@@ -1694,7 +1694,7 @@ mod tests {
             source_sheet_index: 0,
             columns: grid_columns(),
             rows: (0..9)
-                .map(|row| vec![text("n"), text("j"), text("500")])
+                .map(|_| vec![text("n"), text("j"), text("500")])
                 .chain(std::iter::once(vec![
                     text("bad"),
                     text("j"),

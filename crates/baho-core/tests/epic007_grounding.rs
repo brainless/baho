@@ -82,19 +82,17 @@ fn unique_value_among_other_values_grounds_to_its_column() {
 }
 
 #[test]
-fn flag_and_nonflag_headers_compile_to_distinct_predicates() {
+fn flag_and_nonflag_headers_both_compile_to_nonblank_predicates() {
     let csv = "ID,Active,Note\n1,True,ready\n2,FALSE,\n3,TRUE,later\n4,,ready\n";
     let flag = run(csv, "List rows where Active");
     assert_eq!(flag.outcome, CoreOutcome::Materialized);
     assert_eq!(
         predicate(&flag),
-        &Expression::Compare {
+        &Expression::IsNotBlank {
             column: "column-1".into(),
-            operator: ComparisonOperator::Equal,
-            literal: Literal::Text("true".into()),
         }
     );
-    assert_eq!(retained_rows(&flag), [1, 3]);
+    assert_eq!(retained_rows(&flag), [1, 2, 3]);
 
     let nonflag = run(csv, "List rows where Note");
     assert_eq!(nonflag.outcome, CoreOutcome::Materialized);
@@ -108,12 +106,19 @@ fn flag_and_nonflag_headers_compile_to_distinct_predicates() {
 }
 
 #[test]
-fn header_and_value_interpretations_require_clarification() {
+fn header_and_value_collision_chooses_header() {
     let result = run(
         "ID,Active,Status\n1,true,active\n2,false,inactive\n3,true,active\n",
         "List rows where active",
     );
-    assert_clarification_without_execution(&result);
+    assert_eq!(result.outcome, CoreOutcome::Materialized);
+    assert_eq!(
+        predicate(&result),
+        &Expression::IsNotBlank {
+            column: "column-1".into(),
+        }
+    );
+    assert_eq!(retained_rows(&result), [1, 2, 3]);
 }
 
 #[test]

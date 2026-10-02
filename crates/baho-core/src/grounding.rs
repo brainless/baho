@@ -251,9 +251,8 @@ pub enum CandidateEvidenceError {
     MissingValueLookup(String),
 }
 
-/// Build interpretations of a bare predicate term. Header interpretations
-/// precede value interpretations, and each group follows source column order.
-/// Candidate IDs refer to interpretations, so one column may appear twice.
+/// Build interpretations of a bare predicate term. Complete header matches
+/// take priority; observed values are considered only when no header matches.
 pub fn bare_term_candidates(
     columns: &[ColumnDefinition],
     matching_header_ids: &[String],
@@ -276,16 +275,15 @@ pub fn bare_term_candidates(
             candidate_id: format!("candidate-{}", candidates.len() + 1),
             column_id: column.id.clone(),
             display_name: column.display_name.clone(),
-            predicate_form: if shape.flag_shaped {
-                PredicateForm::FlagIsTrue
-            } else {
-                PredicateForm::IsNotBlank
-            },
+            predicate_form: PredicateForm::IsNotBlank,
             evidence: InterpretationEvidence {
                 flag_shaped: Some(shape.flag_shaped),
                 ..Default::default()
             },
         });
+    }
+    if !candidates.is_empty() {
+        return Ok(candidates);
     }
     for column in &ordered {
         let found = values
@@ -466,7 +464,8 @@ pub fn ground_row_filter(
         .ungrounded
         .iter()
         .filter_map(|clause| {
-            matches!(clause.kind, UngroundedKind::Bare { .. }).then_some(clause.term.as_str())
+            matches!(&clause.kind, UngroundedKind::Bare { header_ids } if header_ids.is_empty())
+                .then_some(clause.term.as_str())
         })
         .collect::<Vec<_>>();
     let reader = match opened.selected_source_reader() {
@@ -523,30 +522,53 @@ pub fn ground_row_filter(
         let mut column_match_counts = Vec::new();
         let candidates = match &clause.kind {
             UngroundedKind::Bare { header_ids } => {
-                let literal_index = literals
-                    .iter()
-                    .position(|literal| *literal == clause.term)
-                    .expect("bare literal included in scan");
-                let values = ExactValueLookup {
-                    scan: scanned.scan.clone(),
-                    columns: scanned
+                if !header_ids.is_empty() {
+                    match bare_term_candidates(
+                        columns,
+                        header_ids,
+                        &shapes,
+                        &ExactValueLookup {
+                            scan: scanned.scan.clone(),
+                            columns: Vec::new(),
+                        },
+                    ) {
+                        Ok(candidates) => candidates,
+                        Err(error) => {
+                            return refusal(
+                                GroundingRefusalCode::IncompatibleTypes,
+                                error.to_string(),
+                            );
+                        }
+                    }
+                } else {
+                    let literal_index = literals
+                        .iter()
+                        .position(|literal| *literal == clause.term)
+                        .expect("bare literal included in scan");
+                    let values = ExactValueLookup {
+                        scan: scanned.scan.clone(),
+                        columns: scanned
+                            .columns
+                            .iter()
+                            .map(|column| column.matches[literal_index].clone())
+                            .collect(),
+                    };
+                    column_match_counts = values
                         .columns
                         .iter()
-                        .map(|column| column.matches[literal_index].clone())
-                        .collect(),
-                };
-                column_match_counts = values
-                    .columns
-                    .iter()
-                    .map(|column| ColumnMatchCount {
-                        column_id: column.column_id.clone(),
-                        match_count: column.match_count,
-                    })
-                    .collect();
-                match bare_term_candidates(columns, header_ids, &shapes, &values) {
-                    Ok(candidates) => candidates,
-                    Err(error) => {
-                        return refusal(GroundingRefusalCode::IncompatibleTypes, error.to_string());
+                        .map(|column| ColumnMatchCount {
+                            column_id: column.column_id.clone(),
+                            match_count: column.match_count,
+                        })
+                        .collect();
+                    match bare_term_candidates(columns, header_ids, &shapes, &values) {
+                        Ok(candidates) => candidates,
+                        Err(error) => {
+                            return refusal(
+                                GroundingRefusalCode::IncompatibleTypes,
+                                error.to_string(),
+                            );
+                        }
                     }
                 }
             }
@@ -735,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_candidates_put_headers_before_values_in_source_order() {
+    fn bare_candidates_choose_headers_before_values_in_source_order() {
         let columns = vec![column(2, "Active"), column(0, "Active"), column(1, "Flag")];
         let normalization = NormalizationConfig::default();
         let shapes = scan_flag_shapes(
@@ -779,8 +801,6 @@ mod tests {
             vec![
                 ("column-0", PredicateForm::IsNotBlank),
                 ("column-2", PredicateForm::IsNotBlank),
-                ("column-0", PredicateForm::EqualsValue),
-                ("column-2", PredicateForm::EqualsValue),
             ]
         );
         assert_eq!(
@@ -788,14 +808,13 @@ mod tests {
                 .iter()
                 .map(|c| c.candidate_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["candidate-1", "candidate-2", "candidate-3", "candidate-4"]
+            vec!["candidate-1", "candidate-2"]
         );
-        assert_eq!(candidates[2].evidence.match_count, Some(1));
-        assert_eq!(candidates[2].evidence.match_locations.len(), 1);
+        assert!(candidates.iter().all(|c| c.evidence.match_count.is_none()));
     }
 
     #[test]
-    fn flag_header_uses_flag_predicate_and_value_candidate_can_share_column() {
+    fn flag_header_uses_nonblank_predicate_without_value_alternative() {
         let columns = vec![column(1, "Flag")];
         let normalization = NormalizationConfig::default();
         let shapes = scan_flag_shapes(
@@ -827,7 +846,7 @@ mod tests {
                 .iter()
                 .map(|c| c.predicate_form)
                 .collect::<Vec<_>>(),
-            vec![PredicateForm::FlagIsTrue, PredicateForm::EqualsValue]
+            vec![PredicateForm::IsNotBlank]
         );
         assert_eq!(candidates[0].evidence.flag_shaped, Some(true));
     }
