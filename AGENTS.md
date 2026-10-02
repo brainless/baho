@@ -145,6 +145,8 @@ Read the Xiaomi credential from `XIAOMI_API_KEY`; a local `.env` may supply it. 
 
 ## Testing and verification
 
+Keep `[profile.dev] debug = false` in the workspace `Cargo.toml` for routine development builds. If a runtime backtrace needs source locations, a coding agent may temporarily set `debug = "line-tables-only"` while investigating, then restore `debug = false` when finished.
+
 Use the narrowest fast feedback loop first:
 
 1. Run the focused test for the affected behavior.

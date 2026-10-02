@@ -10,3 +10,6 @@ resolver = "2"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
+
+[profile.dev]
+debug = false
