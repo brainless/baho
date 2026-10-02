@@ -6,7 +6,7 @@ use crate::grounding::{
     ground_row_filter,
 };
 use baho_exec::error::ExecutionError;
-use baho_exec::executor::{ExecutionLimits, GridInput, InputRow, execute_plan_stream};
+use baho_exec::executor::{ExecutionLimits, GridInput, InputRow, execute_plan_stream_with_rows};
 use baho_ingest::profile::InputProfile;
 use baho_ingest::{
     DetectedFormat, ImportError, InspectOptions, RowCount, RowReadLimits, SelectedSourceMetadata,
@@ -635,6 +635,18 @@ fn open_table_with_rows(path: &Path, retain_rows: bool) -> Result<OpenedTable, O
 
 /// Run the full pipeline: ingest, detect, select, plan, validate, execute.
 pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
+    run_pipeline_with_rows(path, prompt, &mut |_, _, _| {})
+}
+
+/// Run the pipeline and report materialized rows as execution advances.
+pub fn run_pipeline_with_rows<F>(path: &Path, prompt: &str, on_row: &mut F) -> CoreResult
+where
+    F: FnMut(
+        &baho_model::MaterializedRow,
+        &baho_model::RowProvenance,
+        &[baho_model::ColumnDefinition],
+    ),
+{
     let opened = match open_table_metadata(path) {
         Ok(opened) => opened,
         Err(failure) => {
@@ -654,7 +666,7 @@ pub fn run_pipeline(path: &Path, prompt: &str) -> CoreResult {
             };
         }
     };
-    execute_prompt(&opened, prompt)
+    execute_prompt_with_rows(&opened, prompt, on_row)
 }
 
 /// Reopen the source, rebuild the selected table and candidate set, then
@@ -665,6 +677,23 @@ pub fn resolve_pipeline(
     request: &ClarificationRequest,
     response: &ClarificationResponse,
 ) -> CoreResult {
+    resolve_pipeline_with_rows(path, prompt, request, response, &mut |_, _, _| {})
+}
+
+pub fn resolve_pipeline_with_rows<F>(
+    path: &Path,
+    prompt: &str,
+    request: &ClarificationRequest,
+    response: &ClarificationResponse,
+    on_row: &mut F,
+) -> CoreResult
+where
+    F: FnMut(
+        &baho_model::MaterializedRow,
+        &baho_model::RowProvenance,
+        &[baho_model::ColumnDefinition],
+    ),
+{
     let opened = match open_table_metadata(path) {
         Ok(opened) => opened,
         Err(failure) => {
@@ -684,7 +713,13 @@ pub fn resolve_pipeline(
             };
         }
     };
-    execute_prompt_with_clarification(&opened, prompt, Some(request), Some(response))
+    execute_prompt_with_clarification_and_rows(
+        &opened,
+        prompt,
+        Some(request),
+        Some(response),
+        on_row,
+    )
 }
 
 /// Recognize and execute one prompt against an already opened source table.
@@ -692,7 +727,18 @@ pub fn resolve_pipeline(
 /// The opened table is borrowed so callers can issue independent requests
 /// against the same immutable source snapshot.
 pub fn execute_prompt(opened: &OpenedTable, prompt: &str) -> CoreResult {
-    execute_prompt_with_clarification(opened, prompt, None, None)
+    execute_prompt_with_rows(opened, prompt, &mut |_, _, _| {})
+}
+
+pub fn execute_prompt_with_rows<F>(opened: &OpenedTable, prompt: &str, on_row: &mut F) -> CoreResult
+where
+    F: FnMut(
+        &baho_model::MaterializedRow,
+        &baho_model::RowProvenance,
+        &[baho_model::ColumnDefinition],
+    ),
+{
+    execute_prompt_with_clarification_and_rows(opened, prompt, None, None, on_row)
 }
 
 /// Execute against an opened source after validating a previously presented
@@ -703,6 +749,29 @@ pub fn execute_prompt_with_clarification(
     prior_request: Option<&ClarificationRequest>,
     response: Option<&ClarificationResponse>,
 ) -> CoreResult {
+    execute_prompt_with_clarification_and_rows(
+        opened,
+        prompt,
+        prior_request,
+        response,
+        &mut |_, _, _| {},
+    )
+}
+
+pub fn execute_prompt_with_clarification_and_rows<F>(
+    opened: &OpenedTable,
+    prompt: &str,
+    prior_request: Option<&ClarificationRequest>,
+    response: Option<&ClarificationResponse>,
+    on_row: &mut F,
+) -> CoreResult
+where
+    F: FnMut(
+        &baho_model::MaterializedRow,
+        &baho_model::RowProvenance,
+        &[baho_model::ColumnDefinition],
+    ),
+{
     let mut result = CoreResult {
         input_profile: Some(opened.input_profile.clone()),
         parser_config: Some(opened.parser_config.clone()),
@@ -1054,7 +1123,7 @@ pub fn execute_prompt_with_clarification(
                     }
                 }
             });
-            execute_plan_stream(&plan, &grid, rows, ExecutionLimits::default())
+            execute_plan_stream_with_rows(&plan, &grid, rows, ExecutionLimits::default(), on_row)
         }
         Err(error) => Err(ExecutionError::SourceRead {
             detail: error.to_string(),
@@ -1140,6 +1209,9 @@ fn resolve_row_filter_deferred_literals(
     let RecognizedRequest::RowFilter(intent) = request else {
         return true;
     };
+    if !has_deferred_literal(&intent.predicate) {
+        return true;
+    }
     let records = match selected_region_records(opened) {
         Ok(records) => records,
         Err(error) => {
@@ -1225,6 +1297,17 @@ fn resolve_row_filter_deferred_literals(
             result.outcome = CoreOutcome::Failed;
             false
         }
+    }
+}
+
+fn has_deferred_literal(expression: &Expression) -> bool {
+    match expression {
+        Expression::Compare { literal, .. } => matches!(literal, Literal::Deferred(_)),
+        Expression::IsNotBlank { .. } => false,
+        Expression::And { predicates } | Expression::Or { predicates } => {
+            predicates.iter().any(has_deferred_literal)
+        }
+        Expression::Not { predicate } => has_deferred_literal(predicate),
     }
 }
 
@@ -1348,6 +1431,34 @@ fn selected_region_records(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn text_filter_skips_deferred_numeric_source_scan() {
+        let file = write_temp_csv("Job,Value\nx,1\ny,2\n");
+        let opened = open_table_metadata(file.path()).unwrap();
+        let mut request = crate::intent::recognize_request("Job = x", &opened.columns).unwrap();
+        let mut result = CoreResult {
+            input_profile: None,
+            parser_config: None,
+            candidates: Vec::new(),
+            selected_candidate: None,
+            intent: None,
+            plan: None,
+            intent_evidence: None,
+            grounding: None,
+            output: None,
+            diagnostics: Vec::new(),
+            events: Vec::new(),
+            outcome: CoreOutcome::Recorded,
+        };
+        std::fs::remove_file(file.path()).unwrap();
+        assert!(resolve_row_filter_deferred_literals(
+            &mut result,
+            &mut request,
+            &opened
+        ));
+        assert!(result.diagnostics.is_empty());
+    }
+
     fn stable_events(events: &[super::CoreEvent]) -> serde_json::Value {
         let mut value = serde_json::to_value(events).unwrap();
         for event in value.as_array_mut().unwrap() {

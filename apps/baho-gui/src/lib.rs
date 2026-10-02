@@ -1,4 +1,11 @@
-use std::{ops::Range, path::Path};
+use std::{
+    ops::Range,
+    path::Path,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, TryRecvError},
+    },
+};
 
 use akar_components::{DataGridAlign, DataGridColumn, DataGridState, TextEditState};
 use baho_core::{
@@ -295,6 +302,9 @@ impl DisplayGrid {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmissionStatus {
     Idle,
+    Processing {
+        rows: usize,
+    },
     Success {
         run_id: String,
     },
@@ -312,6 +322,7 @@ impl SubmissionStatus {
     pub fn message(&self) -> String {
         match self {
             Self::Idle => String::new(),
+            Self::Processing { rows } => format!("Processing: {rows} matching rows so far"),
             Self::Success { run_id } => format!("Run {run_id} materialized"),
             Self::NeedsClarification { run_id, message } => {
                 format!("Run {run_id} needs clarification: {message}")
@@ -376,6 +387,17 @@ pub struct GuiSession {
     pub last_successful: Option<MaterializedView>,
     pub status: SubmissionStatus,
     pending_prompt: Option<String>,
+    worker: Option<Receiver<WorkerEvent>>,
+    progress_rows: usize,
+}
+
+enum WorkerEvent {
+    Row(
+        baho_model::MaterializedRow,
+        baho_model::RowProvenance,
+        Arc<Vec<baho_model::ColumnDefinition>>,
+    ),
+    Done(Result<(baho_core::CoreResult, baho_run::RecordedRun), String>),
 }
 
 impl GuiSession {
@@ -396,11 +418,13 @@ impl GuiSession {
             last_successful: None,
             status: SubmissionStatus::Idle,
             pending_prompt: None,
+            worker: None,
+            progress_rows: 0,
         })
     }
 
     pub fn request_submit(&mut self) -> SubmitRequest {
-        if self.pending_prompt.is_some() {
+        if self.pending_prompt.is_some() || self.worker.is_some() {
             return SubmitRequest::AlreadyPending;
         }
         if self.prompt.trim().is_empty() {
@@ -415,7 +439,196 @@ impl GuiSession {
     }
 
     pub fn has_pending_submit(&self) -> bool {
-        self.pending_prompt.is_some()
+        self.pending_prompt.is_some() || self.worker.is_some()
+    }
+
+    pub fn start_pending_async(&mut self, runs_directory: &Path, invocation: Invocation) -> bool {
+        let Some(prompt) = self.pending_prompt.take() else {
+            return false;
+        };
+        let path = self.opened.source_path.clone();
+        let expected_revision = self.opened.source_revision.clone();
+        let identity = self.input_identity.clone();
+        let runs_directory = runs_directory.to_path_buf();
+        let (sender, receiver) = mpsc::sync_channel(1024);
+        self.worker = Some(receiver);
+        self.progress_rows = 0;
+        self.status = SubmissionStatus::Processing { rows: 0 };
+        std::thread::spawn(move || {
+            let work = || -> Result<_, String> {
+                let pending = PendingRun::reserve(&runs_directory, invocation, &prompt)
+                    .map_err(|error| error.to_string())?;
+                let opened = baho_core::open_table_metadata(&path)
+                    .map_err(|error| error.error.to_string())?;
+                if opened.source_revision != expected_revision {
+                    return Err(
+                        "Source changed since opening; reopen it before running a prompt".into(),
+                    );
+                }
+                let mut column_cache = None;
+                let result = baho_core::execute_prompt_with_rows(
+                    &opened,
+                    &prompt,
+                    &mut |row, source, columns| {
+                        let columns = column_cache
+                            .get_or_insert_with(|| Arc::new(columns.to_vec()))
+                            .clone();
+                        let _ = sender.send(WorkerEvent::Row(row.clone(), source.clone(), columns));
+                    },
+                );
+                let recorded = pending
+                    .record_result(identity, &result)
+                    .map_err(|error| error.to_string())?;
+                Ok((result, recorded))
+            };
+            let _ = sender.send(WorkerEvent::Done(work()));
+        });
+        true
+    }
+
+    pub fn poll_progress(
+        &mut self,
+        grid_state: &mut DataGridState,
+        selection: &mut SelectionState,
+    ) -> bool {
+        let Some(receiver) = self.worker.as_ref() else {
+            return false;
+        };
+        let mut events = Vec::new();
+        for _ in 0..1024 {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    let finished = matches!(event, WorkerEvent::Done(_));
+                    events.push(event);
+                    if finished {
+                        break;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    events.push(WorkerEvent::Done(Err(
+                        "processing worker stopped unexpectedly".into(),
+                    )));
+                    break;
+                }
+            }
+        }
+        if events.is_empty() {
+            return false;
+        }
+        let mut done = None;
+        let mut changed = false;
+        for event in events {
+            match event {
+                WorkerEvent::Row(row, source, columns) => {
+                    let adapted = if self.progress_rows == 0 {
+                        MaterializedGridAdapter::from_view(&MaterializedView {
+                            columns: columns.as_ref().clone(),
+                            rows: vec![row],
+                            provenance: vec![source],
+                        })
+                        .map(|adapter| self.display = DisplayGrid::Materialized(adapter))
+                    } else if let DisplayGrid::Materialized(adapter) = &mut self.display {
+                        adapter.append_row(&row, &source)
+                    } else {
+                        Err(AdapterError::MissingProvenance {
+                            row: self.progress_rows,
+                        })
+                    };
+                    match adapted {
+                        Ok(()) => {
+                            if self.progress_rows == 0 {
+                                self.row_keys.clear();
+                            }
+                            if let Some(key) = self.display.rows().last().map(|row| row.key) {
+                                self.row_keys.push(key);
+                            }
+                            self.progress_rows += 1;
+                            changed = true;
+                        }
+                        Err(error) => {
+                            self.status = SubmissionStatus::Failure {
+                                run_id: None,
+                                message: error.to_string(),
+                            }
+                        }
+                    }
+                }
+                WorkerEvent::Done(result) => done = Some(result),
+            }
+        }
+        if changed {
+            self.status = SubmissionStatus::Processing {
+                rows: self.progress_rows,
+            };
+            if self.progress_rows == 1 {
+                reset_grid_interaction(grid_state, selection);
+            }
+        }
+        if let Some(done) = done {
+            self.worker = None;
+            match done {
+                Ok((result, recorded)) if result.outcome == CoreOutcome::Materialized => {
+                    if let Some(view) = result.output {
+                        match MaterializedGridAdapter::from_view(&view) {
+                            Ok(adapter) => {
+                                self.row_keys = adapter.rows.iter().map(|row| row.key).collect();
+                                self.display = DisplayGrid::Materialized(adapter);
+                                self.last_successful = Some(view);
+                                self.status = SubmissionStatus::Success {
+                                    run_id: recorded.id,
+                                };
+                                reset_grid_interaction(grid_state, selection);
+                            }
+                            Err(error) => {
+                                self.status = SubmissionStatus::Failure {
+                                    run_id: Some(recorded.id),
+                                    message: error.to_string(),
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok((result, recorded)) => {
+                    self.status =
+                        if let Some(request) = result.grounding.as_ref().and_then(|grounding| {
+                            match &grounding.outcome {
+                                GroundingOutcome::NeedsClarification { request } => Some(request),
+                                _ => None,
+                            }
+                        }) {
+                            SubmissionStatus::NeedsClarification {
+                                run_id: recorded.id,
+                                message: render_clarification(request),
+                            }
+                        } else {
+                            SubmissionStatus::Failure {
+                                run_id: Some(recorded.id),
+                                message: result
+                                    .diagnostics
+                                    .iter()
+                                    .find(|diagnostic| {
+                                        matches!(diagnostic.severity, baho_model::Severity::Error)
+                                    })
+                                    .map(|diagnostic| diagnostic.message.clone())
+                                    .unwrap_or_else(|| "Request was not materialized".into()),
+                            }
+                        };
+                }
+                Err(message) => {
+                    self.status = SubmissionStatus::Failure {
+                        run_id: None,
+                        message,
+                    }
+                }
+            }
+            if self.progress_rows > 0 && matches!(self.status, SubmissionStatus::Failure { .. }) {
+                if let SubmissionStatus::Failure { message, .. } = &mut self.status {
+                    *message = format!("Partial rows shown; {message}");
+                }
+            }
+        }
+        true
     }
 
     pub fn process_pending(
@@ -576,6 +789,33 @@ pub struct MaterializedGridAdapter {
 }
 
 impl MaterializedGridAdapter {
+    fn append_row(
+        &mut self,
+        row: &baho_model::MaterializedRow,
+        provenance: &baho_model::RowProvenance,
+    ) -> Result<(), AdapterError> {
+        let key = source_key("row", provenance.source_row)?;
+        let cells: Vec<_> = (0..self.columns.len())
+            .map(|index| {
+                MaterializedCell::from_value(row.values.get(index).and_then(Option::as_ref))
+            })
+            .collect();
+        if self.rows.len() < WIDTH_SAMPLE_ROWS {
+            for (column, cell) in self.columns.iter_mut().zip(&cells) {
+                column.descriptor.width = column.descriptor.width.max(
+                    ((cell.text.chars().count() as f32 * 8.0) + COLUMN_HORIZONTAL_PADDING)
+                        .clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH),
+                );
+            }
+        }
+        self.rows.push(GridRow {
+            source_row: provenance.source_row,
+            key,
+        });
+        self.cells.push(cells);
+        Ok(())
+    }
+
     pub fn from_view(view: &MaterializedView) -> Result<Self, AdapterError> {
         let mut columns = Vec::with_capacity(view.columns.len());
         for column in &view.columns {
@@ -1152,6 +1392,69 @@ mod tests {
         assert!(!runs.join("000002").exists());
         assert_eq!(session.prompt, "  List Name\n");
         assert_eq!(session.status.message(), "Run 000001 materialized");
+    }
+
+    #[test]
+    fn async_submission_reports_rows_and_finishes_with_a_recorded_view() {
+        let (workspace, mut session) =
+            session_for("Name,Status\nAda,active\nBob,inactive\nCara,active\n");
+        session.prompt = "Status = active".into();
+        assert_eq!(session.request_submit(), SubmitRequest::Queued);
+        let mut grid_state = DataGridState::new();
+        let mut selection = SelectionState::default();
+        let runs = workspace.path().join(".baho/runs");
+        assert!(session.start_pending_async(&runs, gui_invocation(workspace.path())));
+        assert!(matches!(
+            session.status,
+            SubmissionStatus::Processing { .. }
+        ));
+        for _ in 0..100 {
+            session.poll_progress(&mut grid_state, &mut selection);
+            if !session.has_pending_submit() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            matches!(session.status, SubmissionStatus::Success { .. }),
+            "{:?}",
+            session.status
+        );
+        assert_eq!(session.last_successful.as_ref().unwrap().rows.len(), 2);
+        assert_eq!(session.display.rows().len(), 2);
+        assert!(runs.join("000001/manifest.json").exists());
+    }
+
+    #[test]
+    fn partial_rows_are_visible_while_worker_is_still_active() {
+        let (_workspace, mut session) = session_for("Name\nAda\nBob\n");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        session.worker = Some(receiver);
+        sender
+            .send(WorkerEvent::Row(
+                baho_model::MaterializedRow {
+                    values: vec![Some(Value::Text("Ada".into()))],
+                },
+                baho_model::RowProvenance {
+                    source_row: 1,
+                    source_addresses: vec![baho_model::CellAddress {
+                        sheet_index: 0,
+                        row: 1,
+                        col: 0,
+                    }],
+                },
+                Arc::new(session.opened.columns.clone()),
+            ))
+            .unwrap();
+        let mut grid_state = DataGridState::new();
+        let mut selection = SelectionState::default();
+        assert!(session.poll_progress(&mut grid_state, &mut selection));
+        assert!(session.has_pending_submit());
+        assert!(matches!(
+            session.status,
+            SubmissionStatus::Processing { rows: 1 }
+        ));
+        assert_eq!(session.display.rows().len(), 1);
     }
 
     #[test]

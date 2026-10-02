@@ -21,8 +21,7 @@ const FILLER_TOKENS: &[&str] = &["all", "the", "a", "an", "of", "from", "values"
 
 const AMBIGUITY_MARGIN: f64 = 0.1;
 
-/// First-token aliases that begin an explicit row-filter request. Every other
-/// first token goes straight to Epic 002 retrieval recognition.
+/// First-token aliases that begin an explicit row-filter request.
 const ROW_ACTION_TOKENS: &[&str] = &["list", "show", "filter"];
 
 const ROW_ACTION_KEYWORD_TOKENS: &[&str] = &["rows", "where"];
@@ -671,7 +670,28 @@ pub fn recognize_request(
             }
         }
     }
-    recognize_intent(prompt, columns).map(RecognizedRequest::Retrieval)
+    let tokens = prompt_tokens_of(&words);
+    if let Ok(retrieval) = recognize_intent(prompt, columns) {
+        return Ok(RecognizedRequest::Retrieval(retrieval));
+    }
+    let action = None;
+    let phrases = header_phrases(columns);
+    let complete = enumerate_complete_row_filters(&words, &phrases, 0, &tokens, &action);
+    if complete.len() > 1 {
+        return Err(compact_parse_ambiguous(&words, &complete, None));
+    }
+    if let Some(intent) = complete.into_iter().next() {
+        return Ok(RecognizedRequest::RowFilter(intent));
+    }
+    match committed_row_filter(&words, &phrases, 0, &tokens, &action) {
+        CommittedRowFilter::Complete(intent)
+            if words.len() == 1 || intent.ungrounded.is_empty() =>
+        {
+            Ok(RecognizedRequest::RowFilter(intent))
+        }
+        CommittedRowFilter::Refusal(error) => Err(error),
+        _ => recognize_intent(prompt, columns).map(RecognizedRequest::Retrieval),
+    }
 }
 
 /// Compile a recognized request into a plan.
@@ -3112,6 +3132,19 @@ mod tests {
 
     fn expect_row_filter_ok(request: Result<RecognizedRequest, IntentError>) -> RowFilterIntent {
         expect_row_filter(request).unwrap_or_else(|e| panic!("expected success, got {e:?}"))
+    }
+
+    #[test]
+    fn standalone_predicates_are_row_filters_without_action_evidence() {
+        let cols = predicate_columns();
+        for prompt in ["unemployed", "Job = unemployed", "Job is not blank"] {
+            let intent = expect_row_filter_ok(recognize_request(prompt, &cols));
+            assert!(intent.evidence.action.is_none(), "{prompt}");
+            assert_eq!(
+                intent.evidence.canonical_operation.as_deref(),
+                Some("row_filter")
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use baho_core::{
@@ -63,7 +63,15 @@ pub(crate) fn record(
             };
         }
     };
-    let result = baho_core::run_pipeline(&absolute_input, &prompt);
+    let mut printed = 0;
+    let result = baho_core::run_pipeline_with_rows(&absolute_input, &prompt, &mut |row, _, _| {
+        print_row(row);
+        printed += 1;
+        if printed == 1 || printed % 64 == 0 {
+            let _ = std::io::stdout().flush();
+        }
+    });
+    let _ = std::io::stdout().flush();
     let recorded = pending
         .record_result(identity, &result)
         .map_err(|error| RecordFailure {
@@ -143,12 +151,21 @@ pub(crate) fn resolve(
             };
         }
     };
-    let result = baho_core::resolve_pipeline(
+    let mut printed = 0;
+    let result = baho_core::resolve_pipeline_with_rows(
         &original.input_path,
         &original.prompt,
         &original.request,
         &response,
+        &mut |row, _, _| {
+            print_row(row);
+            printed += 1;
+            if printed == 1 || printed % 64 == 0 {
+                let _ = std::io::stdout().flush();
+            }
+        },
     );
+    let _ = std::io::stdout().flush();
     let recorded = pending
         .record_result(identity, &result)
         .map_err(|error| RecordFailure {
@@ -162,7 +179,6 @@ fn finish_result(
     result: &CoreResult,
     recorded: RecordedRun,
 ) -> std::result::Result<RecordedRun, RecordFailure> {
-    print_materialized(result);
     if let Some(baho_core::GroundingResult {
         outcome: GroundingOutcome::NeedsClarification { request },
         ..
@@ -214,20 +230,13 @@ fn print_clarification(request: &ClarificationRequest, run_id: &str) {
     eprintln!();
 }
 
-fn print_materialized(result: &CoreResult) {
-    if result.outcome != CoreOutcome::Materialized {
-        return;
-    }
-    if let Some(view) = &result.output {
-        for row in &view.rows {
-            for value in &row.values {
-                match value {
-                    Some(Value::Text(value)) => println!("{value}"),
-                    Some(Value::Number(value)) => println!("{value}"),
-                    Some(Value::Boolean(value)) => println!("{value}"),
-                    Some(Value::Blank) | None => println!(),
-                }
-            }
+fn print_row(row: &baho_model::MaterializedRow) {
+    for value in &row.values {
+        match value {
+            Some(Value::Text(value)) => println!("{value}"),
+            Some(Value::Number(value)) => println!("{value}"),
+            Some(Value::Boolean(value)) => println!("{value}"),
+            Some(Value::Blank) | None => println!(),
         }
     }
 }

@@ -670,15 +670,26 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.finish_pending_open();
+        if let Some(state) = self.state.as_mut() {
+            if let Some(session) = state.session.as_mut() {
+                if session.poll_progress(&mut state.grid_state, &mut state.selection) {
+                    state.window.request_redraw();
+                }
+            }
+        }
         let now = Instant::now();
-        let screenshot_deadline = (!self.screenshot_taken && self.pending_open.is_none())
-            .then(|| self.args.screenshot.as_ref())
-            .flatten()
-            .and_then(|_| self.start_time)
-            .map(|start| start + Duration::from_secs_f64(self.args.delay));
-        let script_deadline = self
-            .pending_open
-            .is_none()
+        let processing = self
+            .state
+            .as_ref()
+            .and_then(|state| state.session.as_ref())
+            .is_some_and(GuiSession::has_pending_submit);
+        let screenshot_deadline =
+            (!self.screenshot_taken && self.pending_open.is_none() && !processing)
+                .then(|| self.args.screenshot.as_ref())
+                .flatten()
+                .and_then(|_| self.start_time)
+                .map(|start| start + Duration::from_secs_f64(self.args.delay));
+        let script_deadline = (self.pending_open.is_none() && !processing)
             .then(|| self.script.as_ref())
             .flatten()
             .and_then(ScriptRunner::next_deadline);
@@ -686,10 +697,24 @@ impl ApplicationHandler for App {
             .pending_open
             .as_ref()
             .map(|_| now + Duration::from_millis(30));
-        let deadline = [screenshot_deadline, script_deadline, open_deadline]
-            .into_iter()
-            .flatten()
-            .min();
+        let progress_deadline = self
+            .state
+            .as_ref()
+            .and_then(|state| state.session.as_ref())
+            .and_then(|session| {
+                session
+                    .has_pending_submit()
+                    .then_some(now + Duration::from_millis(30))
+            });
+        let deadline = [
+            screenshot_deadline,
+            script_deadline,
+            open_deadline,
+            progress_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
 
         match deadline {
             Some(deadline) if deadline <= now => {
@@ -799,7 +824,12 @@ impl App {
             event_loop.exit();
             return;
         }
-        let script_capture = if self.pending_open.is_none() {
+        let script_capture = if self.pending_open.is_none()
+            && !state
+                .session
+                .as_ref()
+                .is_some_and(GuiSession::has_pending_submit)
+        {
             self.script.as_mut().and_then(|runner| {
                 runner.advance(&mut state.core.input, &state.layout, Instant::now())
             })
@@ -987,12 +1017,8 @@ impl App {
                 response.visible_rows.clone(),
                 response.visible_columns.clone(),
             ));
-            session.process_pending(
-                &state.runs_directory,
-                state.invocation.clone(),
-                &mut state.grid_state,
-                &mut state.selection,
-            )
+            session.start_pending_async(&state.runs_directory, state.invocation.clone())
+                | session.poll_progress(&mut state.grid_state, &mut state.selection)
         } else {
             akar_paragraph(
                 &mut state.core,
@@ -1020,6 +1046,10 @@ impl App {
             false
         };
         let timed_capture = self.pending_open.is_none()
+            && !state
+                .session
+                .as_ref()
+                .is_some_and(GuiSession::has_pending_submit)
             && !self.screenshot_taken
             && self.args.screenshot.is_some()
             && self

@@ -11,6 +11,6 @@ pub mod validation;
 pub use error::ExecutionError;
 pub use executor::{
     ExecutionLimits, ExecutionResult, GridInput, InputRow, TruthValue, execute_plan,
-    execute_plan_stream,
+    execute_plan_stream, execute_plan_stream_with_rows,
 };
 pub use validation::validate_execution_context;

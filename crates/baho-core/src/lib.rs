@@ -22,6 +22,7 @@ pub use intent::{
 };
 pub use orchestration::{
     CoreEvent, CoreOutcome, CoreResult, OpenTableFailure, OpenedRow, OpenedTable, RawCell,
-    dispatch_format, execute_prompt, execute_prompt_with_clarification, open_table,
-    open_table_metadata, resolve_pipeline, run_pipeline,
+    dispatch_format, execute_prompt, execute_prompt_with_clarification, execute_prompt_with_rows,
+    open_table, open_table_metadata, resolve_pipeline, resolve_pipeline_with_rows, run_pipeline,
+    run_pipeline_with_rows,
 };

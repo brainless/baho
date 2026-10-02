@@ -132,6 +132,21 @@ pub fn execute_plan_stream<I>(
 where
     I: IntoIterator<Item = Result<InputRow, ExecutionError>>,
 {
+    execute_plan_stream_with_rows(plan, grid, rows, limits, &mut |_, _, _| {})
+}
+
+/// Execute a plan while reporting each retained row in source order.
+pub fn execute_plan_stream_with_rows<I, F>(
+    plan: &Plan,
+    grid: &GridInput,
+    rows: I,
+    limits: ExecutionLimits,
+    on_row: &mut F,
+) -> Result<ExecutionResult, ExecutionError>
+where
+    I: IntoIterator<Item = Result<InputRow, ExecutionError>>,
+    F: FnMut(&MaterializedRow, &RowProvenance, &[ColumnDefinition]),
+{
     validate_plan_structure(plan)?;
     if plan.source.table_id != grid.table_id {
         return Err(ExecutionError::TableNotFound {
@@ -310,6 +325,9 @@ where
                 })
                 .collect(),
         });
+        if let (Some(row), Some(source)) = (output.last(), provenance.last()) {
+            on_row(row, source, &columns);
+        }
     }
     let diagnostics = plan
         .steps
@@ -971,6 +989,21 @@ mod tests {
             execute_plan_stream(&plan, &grid, stream(), ExecutionLimits::default()).unwrap();
         assert_eq!(result.view, prior.view);
         assert_eq!(result.diagnostics, prior.diagnostics);
+        let mut emitted = Vec::new();
+        let streamed = execute_plan_stream_with_rows(
+            &plan,
+            &grid,
+            stream(),
+            ExecutionLimits::default(),
+            &mut |row, source, columns| {
+                emitted.push((row.clone(), source.clone(), columns.len()));
+            },
+        )
+        .unwrap();
+        assert_eq!(emitted.len(), streamed.view.rows.len());
+        assert_eq!(emitted[0].1.source_row, 4);
+        assert_eq!(emitted[0].2, streamed.view.columns.len());
+        assert_eq!(emitted[0].0, streamed.view.rows[0]);
         assert!(
             matches!(execute_plan_stream(&plan, &grid, stream(), ExecutionLimits {
             max_output_rows: 0, ..ExecutionLimits::default()
