@@ -3,3 +3,5 @@
 .env.*
 !.env.example
 /target/
+/synthetic/out/
+/tools/synth/target/
