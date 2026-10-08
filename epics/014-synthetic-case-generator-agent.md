@@ -83,7 +83,7 @@ The harness parses this small grammar and rejects other columns, predicates, tab
 
 ## Candidate file (draft, unstable)
 
-JSON Lines with a `schema_version`. Each line has: case ID, opaque dataset ID and hash, feature tag, prompt, SQL, expected `_row` list, result statistics, and generation record ID. It contains no source path or raw source records. The format is a draft. Epic 013's later stages settle the accepted-case format after review. These local-source candidates are never committed verbatim; useful phrasings must be re-expressed and recomputed on a small synthetic fixture.
+Two files joined on `case_id` (schema version 2). `candidates.txt` is for manual review: one block per case with case ID, prompt, and SQL. `metadata.jsonl` has one line per case with the case ID, `schema_version`, opaque dataset ID and hash, feature tag, expected `_row` list, result statistics, and generation record ID. Neither file contains no source path or raw source records. The format is a draft. Epic 013's later stages settle the accepted-case format after review. These local-source candidates are never committed verbatim; useful phrasings must be re-expressed and recomputed on a small synthetic fixture.
 
 ## Scope and ownership
 

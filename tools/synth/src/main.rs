@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 use synth::{
     dataset::LoadedDataset,
-    generator::{Settings, credential, generate, neuralwatt_model},
+    generator::{Settings, credential, env_file_value, generate, neuralwatt_model},
 };
 
 #[tokio::main]
@@ -53,7 +53,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         settings.variation = v;
     }
     settings.validate()?;
-    let key = credential(std::env::var("NEURALWATT_API_KEY").ok())?;
+    // The process environment wins; otherwise fall back to the repository root `.env`,
+    // located from this package's manifest rather than the current directory.
+    let key = credential(std::env::var("NEURALWATT_API_KEY").ok().or_else(|| {
+        let root_env = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env");
+        env_file_value(
+            &std::fs::read_to_string(root_env).ok()?,
+            "NEURALWATT_API_KEY",
+        )
+    }))?;
     let feature = std::fs::read_to_string(feature.ok_or("--feature is required")?)?;
     let dataset = Arc::new(LoadedDataset::load(
         &dataset.ok_or("--dataset is required")?,

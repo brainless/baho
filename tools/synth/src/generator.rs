@@ -41,6 +41,25 @@ pub fn credential(value: Option<String>) -> Result<String, GenerateError> {
         .ok_or_else(|| GenerateError("NEURALWATT_API_KEY is missing or empty".into()))
 }
 
+/// Reads `name` from `.env` contents: `KEY=value`, optional `export `, optional matching quotes.
+/// Nothing is exported to the process environment, and the file is not otherwise interpreted.
+pub fn env_file_value(contents: &str, name: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let value = line
+            .strip_prefix(name)?
+            .trim_start()
+            .strip_prefix('=')?
+            .trim();
+        let unquoted = ["\"", "'"]
+            .iter()
+            .find_map(|q| value.strip_prefix(q)?.strip_suffix(q))
+            .unwrap_or(value);
+        Some(unquoted.to_string())
+    })
+}
+
 pub fn neuralwatt_model(key: String) -> impl Into<DynModel<Completion>> {
     OpenAIConfig::new(key)
         .with_base_url(BASE_URL)
@@ -92,7 +111,10 @@ pub struct Candidate {
     pub dataset_id: String,
     pub dataset_hash: String,
     pub feature_tag: String,
+    // Prompt and SQL live in candidates.txt for manual review; metadata.jsonl joins on case_id.
+    #[serde(skip)]
     pub prompt: String,
+    #[serde(skip)]
     pub sql: String,
     pub expected_rows: Vec<u64>,
     pub statistics: Statistics,
@@ -294,7 +316,7 @@ impl PortableTool for Submit {
         let hash = state.dataset.hash.clone();
         let id = state.id.clone();
         state.candidates.push(Candidate {
-            schema_version: 1,
+            schema_version: 2,
             case_id: case_id.clone(),
             dataset_id: format!("dataset-{}", &hash[..16]),
             dataset_hash: hash,
@@ -555,6 +577,24 @@ mod tests {
         ]
     }
     #[test]
+    fn env_file_values() {
+        let file =
+            "# comment\nOTHER=x\nNEURALWATT_API_KEY_X=no\nexport NEURALWATT_API_KEY = \"abc\"\n";
+        assert_eq!(
+            env_file_value(file, "NEURALWATT_API_KEY").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            env_file_value("NEURALWATT_API_KEY='k'", "NEURALWATT_API_KEY").as_deref(),
+            Some("k")
+        );
+        assert_eq!(
+            env_file_value("NEURALWATT_API_KEYS=k", "NEURALWATT_API_KEY"),
+            None
+        );
+        assert_eq!(env_file_value("OTHER=x", "NEURALWATT_API_KEY"), None);
+    }
+    #[test]
     fn credentials_and_fixed_configuration() {
         assert!(
             credential(None)
@@ -626,12 +666,24 @@ mod tests {
             directory
                 .path()
                 .join(&result.record.id)
-                .join("candidates.jsonl"),
+                .join("metadata.jsonl"),
         )
         .unwrap();
         assert_eq!(bytes.lines().count(), 1);
         let case: Value = serde_json::from_str(bytes.trim()).unwrap();
         assert_eq!(case["expected_rows"], json!([1, 2]));
+        assert_eq!(case["schema_version"], 2);
+        assert!(case.get("prompt").is_none() && case.get("sql").is_none());
+        let readable = fs::read_to_string(
+            directory
+                .path()
+                .join(&result.record.id)
+                .join("candidates.txt"),
+        )
+        .unwrap();
+        assert!(readable.contains(case["case_id"].as_str().unwrap()));
+        assert!(readable.contains(&result.candidates[0].prompt));
+        assert!(readable.contains(&result.candidates[0].sql));
         assert!(result.write(directory.path()).is_err());
     }
     #[tokio::test]
@@ -784,22 +836,39 @@ mod tests {
     }
 }
 impl Generated {
+    /// Human-review view: one block per case, joined to metadata.jsonl by case_id.
+    pub fn candidates_text(&self) -> String {
+        // Continuation lines stay aligned so a multi-line value remains one field.
+        let field = |value: &str| value.trim().replace('\n', "\n        ");
+        let mut text = String::new();
+        for case in &self.candidates {
+            text.push_str(&format!(
+                "case_id: {}\nprompt:  {}\nsql:     {}\n\n",
+                case.case_id,
+                field(&case.prompt),
+                field(&case.sql)
+            ));
+        }
+        text
+    }
     pub fn write(&self, directory: &Path) -> Result<(), GenerateError> {
         fs::create_dir_all(directory)
             .map_err(|_| GenerateError("cannot create output directory".into()))?;
         let run = directory.join(&self.record.id);
         fs::create_dir(&run)
             .map_err(|_| GenerateError("cannot reserve generation directory".into()))?;
-        let mut candidates = OpenOptions::new()
+        let mut metadata = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(run.join("candidates.jsonl"))
-            .map_err(|_| GenerateError("cannot write candidates".into()))?;
+            .open(run.join("metadata.jsonl"))
+            .map_err(|_| GenerateError("cannot write metadata".into()))?;
         for case in &self.candidates {
-            serde_json::to_writer(&mut candidates, case)
+            serde_json::to_writer(&mut metadata, case)
                 .map_err(|_| GenerateError("cannot serialize candidate".into()))?;
-            writeln!(candidates).map_err(|_| GenerateError("cannot write candidate".into()))?;
+            writeln!(metadata).map_err(|_| GenerateError("cannot write metadata".into()))?;
         }
+        fs::write(run.join("candidates.txt"), self.candidates_text())
+            .map_err(|_| GenerateError("cannot write candidates".into()))?;
         fs::write(
             run.join("generation.json"),
             serde_json::to_vec_pretty(&self.record).unwrap(),
