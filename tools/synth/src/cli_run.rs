@@ -657,6 +657,8 @@ pub(crate) mod stub {
         BadVersion,
         /// Writes a plan with an unsupported schema version.
         FutureSchema,
+        /// Passes both probes, then deletes itself so no case can start it.
+        VanishAfterProbe,
     }
 
     const COMMON: &str = r#"#!/bin/sh
@@ -692,6 +694,12 @@ exit 1
             Mode::Noisy => format!(
                 "{COMMON}yes 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' | head -c 2000000\n{REFUSE}"
             ),
+            Mode::VanishAfterProbe => r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "baho 0.1.0"; exit 0; fi
+if [ "$1" = "--help" ]; then printf 'Usage: baho <COMMAND>\n\nCommands:\n  run      Record work\n'; rm -f "$0"; exit 0; fi
+exit 1
+"#
+            .to_owned(),
             Mode::BadVersion => "#!/bin/sh\necho 'something 9'\n".to_owned(),
             Mode::FutureSchema => {
                 format!("{COMMON}{MATERIALIZE}printf '{{\"schema_version\":99}}' > $D/plan.json\n")

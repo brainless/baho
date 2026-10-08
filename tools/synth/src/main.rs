@@ -21,7 +21,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("generate") => {}
         Some("evaluate") => return evaluate_command(args),
         Some("plan-epic") => return plan_epic_command(args).await,
-        _ => return Err("usage: synth plan-epic --evaluation EVALUATION_JSON [--max-turns N] [--per-call-seconds N] [--whole-run-seconds N]\n       synth evaluate --dataset CSV --baho-bin PATH [--generation DIR] [--review FILE] [--output DIR]\n       synth generate --dataset CSV --feature MARKDOWN --count N [--output DIR] [--per-call-seconds N] [--whole-run-seconds N] [--max-turns N] [--variation TEXT]".into()),
+        _ => return Err("usage: synth plan-epic --evaluation EVALUATION_JSON [--context NAME] [--max-turns N] [--per-call-seconds N] [--whole-run-seconds N]\n       synth evaluate --dataset CSV --baho-bin PATH [--generation DIR] [--review FILE] [--output DIR]\n       synth generate --dataset CSV --feature MARKDOWN --count N [--output DIR] [--per-call-seconds N] [--whole-run-seconds N] [--max-turns N] [--variation TEXT]".into()),
     }
     let mut dataset = None;
     let mut feature = None;
@@ -131,13 +131,7 @@ fn evaluate_command(
             outcome.report.limitations.len()
         );
     }
-    if outcome.every_replay_failed_to_spawn() {
-        return Err(
-            "no case could start the baho-cli process; see evidence.spawn_failure \
-                    in the report (the results say nothing about baho)"
-                .into(),
-        );
-    }
+    outcome.require_started_replay()?;
     Ok(())
 }
 
@@ -146,10 +140,12 @@ async fn plan_epic_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut evaluation = None;
     let mut settings = PlanSettings::default();
+    let mut context = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or("option requires a value")?;
         match flag.as_str() {
             "--evaluation" => evaluation = Some(PathBuf::from(value)),
+            "--context" => context = Some(value),
             "--max-turns" => settings.max_turns = value.parse()?,
             "--per-call-seconds" => settings.per_call_seconds = value.parse()?,
             "--whole-run-seconds" => settings.whole_run_seconds = value.parse()?,
@@ -171,6 +167,7 @@ async fn plan_epic_command(
             evaluation,
             repo,
             settings,
+            context,
         },
     )
     .await?;

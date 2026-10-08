@@ -106,6 +106,10 @@ sanitized and bounded (schema version unchanged; older records lack them):
   `other`), optional `http_status`, and `message`, scrubbed of literals, paths,
   and credential-shaped values and capped at 300 bytes. Headers and request
   payloads are never recorded.
+- `calls[]` token usage: `input_tokens`, `output_tokens`, `total_tokens`, and
+  `cached_input_tokens`, taken from the usage Rig 0.43.0 attaches to each finished
+  model turn (`ModelTurnFinished.usage`). Each field is present only when the
+  provider's stream reported it; nothing is estimated, and older records lack them.
 - `rejected_submissions[].reasons`: the `code` and the sanitized `message`
   returned to the agent for each violation. A `forbidden` message names the
   violation kind and 1-based line numbers, never the matched text.
@@ -113,3 +117,17 @@ sanitized and bounded (schema version unchanged; older records lack them):
 `submit_epic` scans prose for profiled values as whole words (plural `s`/`es`
 included); a value that is merely a substring of an ordinary word is accepted.
 Evaluation and tool surfaces keep the strict substring scan.
+
+## Context packs (`plan-epic --context NAME`)
+
+`tools/synth/context/<name>.json` (JSON: no new dependency) lists `entries`, each
+`{path, anchor, lines_before, lines_after}` (anchor is a literal that must match
+exactly one line) or `{path, start_line, end_line}`. The harness resolves them at
+run time through the same reader as `read_file` (allowlist, denylist, symlink
+recheck, redaction, original line numbers) and puts the result at the top of the
+first user message, in manifest order, before the evaluation. An unresolved or
+ambiguous anchor, a disallowed path, or a pack over 64 KiB fails before any model
+call. The plan record gains `context_pack` (name, SHA-256, bytes, resolved line
+ranges; never contents). Citations from the pack count like any other. Default is no
+pack. Re-run `plan-epic` with a pack only after moving earlier drafts of the same
+evaluation aside, or the agent may re-propose them.

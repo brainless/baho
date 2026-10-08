@@ -19,7 +19,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub const PLANNER_PROMPT_VERSION: &str = "epic-planner-v2";
+pub const PLANNER_PROMPT_VERSION: &str = "epic-planner-v4";
 pub const PLANNER_PROMPT: &str = include_str!("../prompts/planner-system.md");
 pub const GOALS: &str = include_str!("../goals/goals.md");
 
@@ -47,7 +47,7 @@ const MAX_WALK_DEPTH: usize = 12;
 const MAX_SEARCH_MATCHES: usize = 40;
 const MAX_SNIPPET_CHARS: usize = 200;
 const MAX_CASES_PER_PAGE: usize = 25;
-const MAX_TARGET_CHARS: usize = 64;
+const MAX_TARGET_CHARS: usize = 96;
 
 #[derive(Clone, Copy)]
 enum Seg {
@@ -568,44 +568,126 @@ impl PortableTool for ReadFile {
     }
     async fn call(&self, args: ReadFileArgs) -> Result<Value, ToolError> {
         let budget = self.0.0.limits.per_call_bytes;
-        self.0.run(Self::NAME, &args.path, |inner| {
-            let (canon, comps) = inner
-                .resolve(&args.path, Kind::File)
-                .map_err(String::from)?;
-            let text = inner.read_text(&canon).map_err(String::from)?;
-            let all: Vec<&str> = text.lines().collect();
-            let start = args.start_line.unwrap_or(1).max(1);
-            if start > all.len().max(1) {
-                return Err("start_line is beyond the end of the file".into());
-            }
-            let wanted_end = args.end_line.unwrap_or(start + DEFAULT_READ_LINES - 1);
-            let end = wanted_end
-                .min(start + MAX_READ_LINES - 1)
-                .min(all.len())
-                .max(start.min(all.len()));
-            let mut lines = Vec::new();
-            let mut used = 0;
-            let mut last = start.saturating_sub(1);
-            for n in start..=end {
-                let line = truncate_chars(&inner.clean(all[n - 1]), MAX_LINE_CHARS);
-                let rendered = format!("{n}: {line}");
-                used += rendered.len() + 4;
-                // Leave headroom for the envelope so the call budget is not tripped by us.
-                if used + 512 > budget {
-                    break;
-                }
-                lines.push(rendered);
-                last = n;
-            }
+        // The requested range, so the transcript shows what was read, not only which file.
+        let target = format!(
+            "{}:{}-{}",
+            args.path,
+            args.start_line.unwrap_or(1),
+            args.end_line.map_or(String::new(), |n| n.to_string())
+        );
+        self.0.run(Self::NAME, &target, |inner| {
+            let r = inner.read_range(
+                &args.path,
+                args.start_line.unwrap_or(1),
+                args.end_line,
+                Some(MAX_READ_LINES),
+                Some(budget),
+            )?;
             Ok(json!({
-                "path": inner.clean(&comps.join("/")),
-                "start_line": start,
-                "end_line": last,
-                "total_lines": all.len(),
-                "truncated": last < wanted_end.min(all.len()),
-                "lines": lines,
+                "path": r.path,
+                "start_line": r.start_line,
+                "end_line": r.end_line,
+                "total_lines": r.total_lines,
+                "truncated": r.truncated,
+                "lines": r.lines,
             }))
         })
+    }
+}
+
+/// A sanitized, line-numbered slice of one allowlisted file.
+pub(crate) struct RangeRead {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub total_lines: usize,
+    pub truncated: bool,
+    /// `"<n>: <text>"`, original line numbers.
+    pub lines: Vec<String>,
+}
+
+impl Inner {
+    /// The one reader behind `read_file` and the context pack: allowlist, denylist, symlink
+    /// recheck, redaction, and original line numbering. `max_lines` and `byte_budget` bound a
+    /// tool call; the context pack passes `None` and enforces its own total cap.
+    fn read_range(
+        &self,
+        path: &str,
+        start_line: usize,
+        end_line: Option<usize>,
+        max_lines: Option<usize>,
+        byte_budget: Option<usize>,
+    ) -> Result<RangeRead, String> {
+        let (canon, comps) = self.resolve(path, Kind::File).map_err(String::from)?;
+        let text = self.read_text(&canon).map_err(String::from)?;
+        let all: Vec<&str> = text.lines().collect();
+        let start = start_line.max(1);
+        if start > all.len().max(1) {
+            return Err("start_line is beyond the end of the file".into());
+        }
+        let wanted_end = end_line.unwrap_or(start + DEFAULT_READ_LINES - 1);
+        let capped = max_lines.map_or(wanted_end, |m| wanted_end.min(start + m - 1));
+        let end = capped.min(all.len()).max(start.min(all.len()));
+        let mut lines = Vec::new();
+        let mut used = 0;
+        let mut last = start.saturating_sub(1);
+        for n in start..=end {
+            let line = truncate_chars(&self.clean(all[n - 1]), MAX_LINE_CHARS);
+            let rendered = format!("{n}: {line}");
+            used += rendered.len() + 4;
+            // Leave headroom for the envelope so the call budget is not tripped by us.
+            if byte_budget.is_some_and(|b| used + 512 > b) {
+                break;
+            }
+            lines.push(rendered);
+            last = n;
+        }
+        Ok(RangeRead {
+            path: self.clean(&comps.join("/")),
+            start_line: start,
+            end_line: last,
+            total_lines: all.len(),
+            truncated: last < wanted_end.min(all.len()),
+            lines,
+        })
+    }
+
+    /// 1-based numbers of lines (in the sanitized view) containing `literal`.
+    fn find_lines(&self, path: &str, literal: &str) -> Result<(Vec<usize>, usize), String> {
+        let (canon, _) = self.resolve(path, Kind::File).map_err(String::from)?;
+        let text = self.read_text(&canon).map_err(String::from)?;
+        let hits = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| self.clean(l).contains(literal))
+            .map(|(i, _)| i + 1)
+            .collect();
+        Ok((hits, text.lines().count()))
+    }
+}
+
+impl Toolbox {
+    pub(crate) fn read_range(
+        &self,
+        path: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> Result<RangeRead, String> {
+        self.0
+            .read_range(path, start_line, Some(end_line), None, None)
+    }
+
+    pub(crate) fn find_lines(
+        &self,
+        path: &str,
+        literal: &str,
+    ) -> Result<(Vec<usize>, usize), String> {
+        self.0.find_lines(path, literal)
+    }
+
+    /// True when `text` carries nothing the redactor would withhold.
+    pub(crate) fn is_clean(&self, text: &str) -> bool {
+        self.0.redactor.scan(text).is_empty()
     }
 }
 
@@ -638,7 +720,11 @@ impl PortableTool for SearchText {
         },"required":["literal"],"additionalProperties":false})
     }
     async fn call(&self, args: SearchTextArgs) -> Result<Value, ToolError> {
-        self.0.run(Self::NAME, &args.literal, |inner| {
+        let target = match args.scope.as_deref().filter(|s| !s.is_empty()) {
+            Some(scope) => format!("{} @ {scope}", args.literal),
+            None => args.literal.clone(),
+        };
+        self.0.run(Self::NAME, &target, |inner| {
             let needle = args.literal.as_str();
             let len = needle.chars().count();
             if !(2..=128).contains(&len) || needle.chars().any(char::is_control) {

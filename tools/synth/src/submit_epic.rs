@@ -51,6 +51,9 @@ pub enum ReasonCode {
     PathMissing,
     PathNotOwned,
     PathAmbiguous,
+    BadCitation,
+    MissingCitation,
+    QuestionFormat,
     Forbidden,
     DatasetCopy,
 }
@@ -360,6 +363,7 @@ fn validate(ctx: &Ctx, slug: &str, md: &str) -> Result<String, Vec<Reason>> {
         "goal coverage",
         "acceptance criteria",
         "fixture",
+        "risks",
         "implementation outline",
         "path inventory",
         "unresolved questions",
@@ -373,6 +377,7 @@ fn validate(ctx: &Ctx, slug: &str, md: &str) -> Result<String, Vec<Reason>> {
     check_evidence(ctx, md, &mut r);
     check_increment(&lines, &hs, &mut r);
     check_paths(ctx, &lines, &hs, &mut r);
+    check_questions(&lines, &hs, &mut r);
 
     if ctx.has_unreviewed && !md.to_lowercase().contains("unreviewed") {
         reject(
@@ -440,12 +445,25 @@ fn check_goals(lines: &[&str], hs: &[Heading], r: &mut Vec<Reason>) {
         };
         let filled =
             |c: Option<&&str>| c.is_some_and(|c| !c.is_empty() && !c.trim_matches('-').is_empty());
-        if !GOALS.contains(&n) || cells.len() < 3 || !filled(cells.get(1)) || !filled(cells.get(2))
+        // The decision must be a verdict; a bare "Decision" says nothing a reviewer can check.
+        let verdict = cells
+            .get(1)
+            .map(|c| c.replace('*', "").trim().to_lowercase());
+        let has_verdict = verdict
+            .as_deref()
+            .is_some_and(|v| v.starts_with("affected") || v.starts_with("not affected"));
+        if !GOALS.contains(&n)
+            || cells.len() < 3
+            || !filled(cells.get(1))
+            || !filled(cells.get(2))
+            || !has_verdict
         {
             reject(
                 r,
                 ReasonCode::BadGoalRow,
-                format!("goal table row for '{n}' needs a decision and a reason, goals 1 to 8"),
+                format!(
+                    "goal table row for '{n}' needs a decision starting with 'affected' or 'not affected', and a reason; goals 1 to 8"
+                ),
             );
         } else {
             seen.insert(n);
@@ -673,6 +691,113 @@ fn check_paths(ctx: &Ctx, lines: &[&str], hs: &[Heading], r: &mut Vec<Reason>) {
                 );
             }
         }
+    }
+    check_citations(ctx, lines, &existing, r);
+}
+
+/// Minimum verified `path:line` citations. A claim about code that cites no line cannot be
+/// checked by a reviewer, and the harness cannot confirm a citation it never sees.
+const MIN_CITATIONS: usize = 3;
+
+/// Parse a backticked `path:N` or `path:N-M` citation.
+fn parse_citation(tok: &str) -> Option<(&str, usize, usize)> {
+    let (path, range) = tok.rsplit_once(':')?;
+    if !looks_like_path(path) {
+        return None;
+    }
+    let (a, b) = match range.split_once('-') {
+        Some((a, b)) => (a, b),
+        None => (range, range),
+    };
+    let (a, b) = (a.parse::<usize>().ok()?, b.parse::<usize>().ok()?);
+    Some((path, a, b))
+}
+
+/// Every `path:line` citation must name an inventoried existing file and a line range inside it.
+fn check_citations(ctx: &Ctx, lines: &[&str], existing: &BTreeSet<String>, r: &mut Vec<Reason>) {
+    let mut valid = 0;
+    for l in lines {
+        for tok in backticked(l) {
+            let Some((path, a, b)) = parse_citation(tok) else {
+                continue;
+            };
+            let total = normalize(path)
+                .ok()
+                .filter(|c| exists_in_repo(&ctx.root, c))
+                .and_then(|_| fs::read_to_string(ctx.root.join(path)).ok())
+                .map(|text| text.lines().count());
+            match total {
+                _ if !existing.contains(path) => reject(
+                    r,
+                    ReasonCode::BadCitation,
+                    format!("citation '{tok}': '{path}' is not under 'Existing evidence files'"),
+                ),
+                Some(n) if a >= 1 && a <= b && b <= n => valid += 1,
+                Some(n) => reject(
+                    r,
+                    ReasonCode::BadCitation,
+                    format!("citation '{tok}': lines must satisfy 1 <= start <= end <= {n}"),
+                ),
+                None => reject(
+                    r,
+                    ReasonCode::BadCitation,
+                    format!("citation '{tok}': file could not be read"),
+                ),
+            }
+        }
+    }
+    if valid < MIN_CITATIONS {
+        reject(
+            r,
+            ReasonCode::MissingCitation,
+            format!(
+                "cite at least {MIN_CITATIONS} verified code locations as `path:line` or \
+                 `path:start-end`; found {valid}. Use search_text/read_file line numbers"
+            ),
+        );
+    }
+}
+
+const MAX_QUESTIONS: usize = 4;
+
+/// Unresolved questions are product decisions for the user, not design work left undone.
+/// Each must carry the agent's recommended default so the reviewer can accept or override it.
+fn check_questions(lines: &[&str], hs: &[Heading], r: &mut Vec<Reason>) {
+    let Some(idx) = hs
+        .iter()
+        .position(|h| h.level >= 2 && h.text.contains("unresolved questions"))
+    else {
+        return;
+    };
+    let (a, b) = section_range(hs, idx, lines.len());
+    let items: Vec<&str> = lines[a..b]
+        .iter()
+        .map(|l| l.trim_start())
+        .filter(|l| {
+            l.starts_with("- ")
+                || l.starts_with("* ")
+                || l.chars().next().is_some_and(|c| c.is_ascii_digit())
+        })
+        .collect();
+    if items.len() > MAX_QUESTIONS {
+        reject(
+            r,
+            ReasonCode::QuestionFormat,
+            format!(
+                "at most {MAX_QUESTIONS} unresolved questions; settle design choices in the \
+                 design and keep only decisions the user must make"
+            ),
+        );
+    }
+    if items
+        .iter()
+        .any(|q| !q.to_lowercase().contains("recommend"))
+    {
+        reject(
+            r,
+            ReasonCode::QuestionFormat,
+            "every unresolved question must state a 'Recommended:' default",
+        );
     }
 }
 
@@ -916,7 +1041,10 @@ mod tests {
         w("epics/001-a.md", "# a\n");
         w("epics/003-b.md", "# b\n");
         w("epics/notes.md", "not numbered\n");
-        w("crates/a/src/lib.rs", "fn x() {}\n");
+        w(
+            "crates/a/src/lib.rs",
+            "fn x() {}\nfn y() {}\nfn z() {}\nfn w() {}\n",
+        );
         w(".env", "K=1\n");
         w(".datasets/d.csv", "x\n");
         let s =
@@ -928,10 +1056,10 @@ mod tests {
         format!(
             "# Parse refusals for polite lead-ins\n\nStatus: Proposed\n\n\
 ## Motivating evidence and user intent\nRun `{EVAL}` from `{GEN}`; case {GEN}-0001 is unreviewed.\n\n\
-## Observed behavior\nRefused.\n\n## Problem and desired behavior\nx\n\n## Out of scope\nx\n\n\
+## Observed behavior\nRefused (`crates/a/src/lib.rs:1`, `crates/a/src/lib.rs:2-3`, `crates/a/src/lib.rs:4`).\n\n## Problem and desired behavior\nx\n\n## Out of scope\nx\n\n\
 ## Architecture and crate ownership\nx\n\n## Design and alternatives\nChosen increment: normalize lead-ins.\n\n\
 ## Goal coverage\n\n| Goal | Decision | Reason |\n|---|---|---|\n{}\n\
-## Acceptance criteria\nx\n\n## Fixture and test strategy\nx\n\n## Implementation outline\nx\n\n\
+## Acceptance criteria\nx\n\n## Fixture and test strategy\nx\n\n## Risks and regressions\nx\n\n## Implementation outline\nx\n\n\
 ## Path inventory\n\nExisting evidence files:\n- `crates/a/src/lib.rs`\n\nProposed new files:\n- `crates/a/tests/lead_in.rs`\n\n\
 ## Unresolved questions\nNone.\n{extra}",
             (1..=8)
@@ -991,6 +1119,49 @@ mod tests {
         assert_eq!(epics_len(&dir), n);
         assert_eq!(s.rejections()[0].codes, vec![ReasonCode::MissingSection]);
         assert!(s.submit("good-slug", &doc("")).is_ok());
+    }
+
+    #[test]
+    fn citations_must_resolve_and_be_numerous_enough() {
+        let (_d, s) = repo();
+        let bad_line = doc("").replace("lib.rs:4`", "lib.rs:99`");
+        assert!(codes(s.submit("good-slug", &bad_line)).contains(&ReasonCode::BadCitation));
+        let few = doc("").replace(", `crates/a/src/lib.rs:2-3`, `crates/a/src/lib.rs:4`", "");
+        assert!(codes(s.submit("good-slug", &few)).contains(&ReasonCode::MissingCitation));
+        let unlisted = doc("").replace("lib.rs:4`", "lib.rs:4`, `epics/001-a.md:1`");
+        assert!(codes(s.submit("good-slug", &unlisted)).contains(&ReasonCode::BadCitation));
+    }
+
+    #[test]
+    fn goal_decision_must_be_a_verdict() {
+        let (_d, s) = repo();
+        let vague = doc("").replace("| 3 | not affected |", "| 3 | Decision |");
+        assert!(codes(s.submit("good-slug", &vague)).contains(&ReasonCode::BadGoalRow));
+        let ok = doc("").replace("| 3 | not affected |", "| 3 | **Affected**: maps words |");
+        assert!(s.submit("good-slug", &ok).is_ok());
+    }
+
+    #[test]
+    fn risks_section_is_required() {
+        let (_d, s) = repo();
+        let bad = doc("").replace("## Risks and regressions", "## Elsewhere");
+        assert!(codes(s.submit("good-slug", &bad)).contains(&ReasonCode::MissingSection));
+    }
+
+    #[test]
+    fn unresolved_questions_are_bounded_and_carry_a_recommendation() {
+        let (_d, s) = repo();
+        let unrecommended = doc("").replace("None.", "1. Should we do X?");
+        assert!(codes(s.submit("good-slug", &unrecommended)).contains(&ReasonCode::QuestionFormat));
+        let many = doc("").replace(
+            "None.",
+            &(1..=5)
+                .map(|i| format!("{i}. Q? Recommended: yes.\n"))
+                .collect::<String>(),
+        );
+        assert!(codes(s.submit("good-slug", &many)).contains(&ReasonCode::QuestionFormat));
+        let ok = doc("").replace("None.", "1. Q? Recommended: yes.");
+        assert!(s.submit("good-slug", &ok).is_ok());
     }
 
     #[test]

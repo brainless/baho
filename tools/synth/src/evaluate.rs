@@ -100,6 +100,18 @@ impl EvaluateOutcome {
         let r = self.report.cases.iter().filter(replayed);
         r.clone().next().is_some() && r.clone().all(|c| spawn(&c))
     }
+
+    /// The command's success gate: a report is written either way, but a run in which no
+    /// case could start the CLI must exit nonzero.
+    pub fn require_started_replay(&self) -> Result<(), &'static str> {
+        if self.every_replay_failed_to_spawn() {
+            return Err(
+                "no case could start the baho-cli process; see evidence.spawn_failure \
+                 in the report (the results say nothing about baho)",
+            );
+        }
+        Ok(())
+    }
 }
 
 pub fn evaluate(options: &EvaluateOptions) -> Result<EvaluateOutcome, EvaluateError> {
@@ -611,10 +623,26 @@ mod tests {
     }
 
     #[test]
+    fn binary_vanishing_after_probe_fails_the_command_but_keeps_the_report() {
+        let f = fixture(Mode::VanishAfterProbe, &two_cases());
+        let out = evaluate(&f.options).unwrap();
+        assert!(out.report_path.exists());
+        assert!(
+            out.report
+                .cases
+                .iter()
+                .all(|c| c.evidence.spawn_failure.as_deref() == Some("spawn_not_found"))
+        );
+        let reason = out.require_started_replay().unwrap_err();
+        assert!(reason.contains("no case could start"));
+    }
+
+    #[test]
     fn healthy_runs_report_no_spawn_failure() {
         let f = fixture(Mode::Materialize, &two_cases());
         let out = evaluate(&f.options).unwrap();
         assert!(!out.every_replay_failed_to_spawn());
+        assert!(out.require_started_replay().is_ok());
         assert!(
             out.report
                 .cases

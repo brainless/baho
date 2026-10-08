@@ -1,6 +1,6 @@
 # Epic 016: Epic Planner Agent (Agent 2)
 
-Status: Proposed
+Status: Completed
 
 Motivating run: `generation-1791425654630970000-3920`, the latest Agent 1 (Synthetic Case Generator) output, plus a manual probe of `baho-cli` against its five candidates on a small synthetic CSV. No `.baho/runs/` record motivates this epic.
 
@@ -196,7 +196,7 @@ Each task is delegated to one subagent in order. A task builds on the previous o
 - **T5 (done): Goals, prompt, and read tools.** Goals file, single-increment system prompt, and the sanitized `read_evaluation`, `list_files`, `read_file`, `search_text` tools as Rig `PortableTool`s with allowlist, denylist, symlink, and budget enforcement.
 - **T6 (done): Epic submission.** `submit_epic` validation (sections, goal table, evidence IDs, path inventory, redaction scan), serialized number allocation, atomic no-overwrite publication, and one-accept-per-run, under tests.
 - **T7 (done): `synth plan-epic` agent.** Rig wiring using Agent 1's client and tier handling, bounds, sidecar check, records and transcript, terminal outcomes, and mock-model tests.
-- **T8 (manual, not delegated): live smoke test.** Live `plan-epic` run and review note. Needs the user's approval to send repository source to the provider.
+- **T8 (done, manual): live smoke test.** Live `plan-epic` run and review note. Needs the user's approval to send repository source to the provider.
 
 ## Unresolved questions
 
@@ -204,3 +204,33 @@ Each task is delegated to one subagent in order. A task builds on the previous o
 - `Show <value>` refuses on the current build although Epic 012 documents it as a filter. Is this a bug to investigate first, or an intended limit? Agent 2 should surface it, but a person decides.
 - Which version-bump policy applies when a rung adds an `Expression` or `PlanStep` kind (`contains`, `sort`, `limit`)? The epic only requires that the agent name the bump and compatibility coverage.
 - Should later rungs make `evaluate` multi-column, and how should the Role-only derived CSV generalize without exposing unrelated columns?
+
+## Review note: live runs (T8)
+
+Recorded 2026-10-08 by a coding agent from the gitignored `plan-*.json` records; the epics those runs produced are not summarized here beyond what is stated.
+
+**Runs.** Five `plan-epic` records exist across three evaluations of two generations. Outcomes: `max_turns` (40 model calls), `provider_error`, `no_epic`, `epic_written` (one rejected submission, code `path_unlisted`, then accepted), and a final `epic_written` with no rejections (16 calls) after the evidence changed. Every recorded call was served at the `flex` tier.
+
+**Tool reliability.** The tools worked end to end: reads, search, rejection feedback, correction, and atomic publication of one epic. Failure modes seen live and since handled in code: tool-call markup written as text (`malformed_tool_call`), prose endings (`no_terminal_action`), and an explicit `finish_no_epic`. The `provider_error` run predates the structured `provider_error` field, so its class was not recorded. The first batch exhausted its turn budget.
+
+**Chosen increment and evidence quality.** The first epic produced (accessory-phrase refusal classification) was a defensible but low-value relabelling, because the evaluated batch contained only refusals and no plan comparison evidence. The agent could not see silent wrong plans: evidence quality, not agent reasoning, was the limit. A second batch from `tools/synth/features/role-equality-near-grammar.md`, reviewed by hand, produced 7 confirmed wrong-plan successes in 10 cases, and the agent then proposed an increment aimed at them (Epic 017).
+
+**Goal coverage.** Both written epics carried a complete goals 1-8 table; this is enforced mechanically, so its presence says nothing about its quality.
+
+**Unsupported or weak claims found in review.** In the second epic, a count was wrong (said four cases needed both rule families; three do) and a risk was missing (word operators becoming literal boundaries). Both were corrected by hand in Epic 017. Mechanical validation cannot catch either; human review remains required.
+
+**Follow-ups.** Provider-error class for the failed run is unknown. Clippy now passes on `tools/synth` and the all-spawn-failed exit path has a test.
+
+**Follow-up review (2026-10-08, prompt `epic-planner-v3`).** The earlier Epic 017 draft was deleted and regenerated. It had a scope contradiction (a "position-aware" operator rule implemented through the global `is_boundary_token`), a goal-2 verdict that contradicted its own risk, and design choices left as open questions. Validation now also requires a Risks and regressions section, at least three `path:line` citations that resolve inside inventoried files, at most four unresolved questions each with a `Recommended:` default, and goal decisions that begin with `Affected` or `Not affected`. The prompt adds a verification and scope-mechanism quality bar. The regenerated draft (32 calls, no rejections, after one `provider_error` transport failure mid-run) cited correct lines and avoided the boundary-token trap. Hand fixes remained for fixture/criteria mismatch and an unlisted risk (other `parse_literal` callers). Mechanical checks still cannot prove that claims about code are true.
+
+**Context pack and token usage (2026-10-08, prompt `epic-planner-v4`).** `plan-epic` records per-call token usage (Rig's `ModelTurnFinished.usage`; the provider reports input, output, total, and cached input tokens) and accepts `--context <name>` to inject a harness-resolved pack (`tools/synth/context/parser-equality.json`, 58,503 bytes) ahead of the evaluation. Same evaluation, one run each, both `epic_written`, zero rejected submissions, all flex tier:
+
+| | no pack (Epic 018) | pack (Epic 019) |
+|---|---|---|
+| model calls | 16 | 10 |
+| tool calls (excl. submit) | 33 | 20 |
+| input tokens (cached) | 555,363 (516,608) | 379,824 (342,016) |
+| output tokens | 29,598 | 26,893 |
+| elapsed (sum of calls) | 998 s | 666 s |
+
+Both chose the same increment (word operators `is`/`equals` plus trailing punctuation and single quotes). A 10-citation spot check of Epic 019 against the tree found no wrong line. Caveat: Epic 019 re-proposes Epic 018 (it names the earlier drafts as duplicates), so a pack run should not follow a run of the same evaluation without pruning the earlier output. One sample each; not statistically meaningful.

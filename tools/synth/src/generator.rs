@@ -546,6 +546,49 @@ pub async fn generate(
     })
 }
 
+impl Generated {
+    /// Human-review view: one block per case, joined to metadata.jsonl by case_id.
+    pub fn candidates_text(&self) -> String {
+        // Continuation lines stay aligned so a multi-line value remains one field.
+        let field = |value: &str| value.trim().replace('\n', "\n        ");
+        let mut text = String::new();
+        for case in &self.candidates {
+            text.push_str(&format!(
+                "case_id: {}\nprompt:  {}\nsql:     {}\n\n",
+                case.case_id,
+                field(&case.prompt),
+                field(&case.sql)
+            ));
+        }
+        text
+    }
+    pub fn write(&self, directory: &Path) -> Result<(), GenerateError> {
+        fs::create_dir_all(directory)
+            .map_err(|_| GenerateError("cannot create output directory".into()))?;
+        let run = directory.join(&self.record.id);
+        fs::create_dir(&run)
+            .map_err(|_| GenerateError("cannot reserve generation directory".into()))?;
+        let mut metadata = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(run.join("metadata.jsonl"))
+            .map_err(|_| GenerateError("cannot write metadata".into()))?;
+        for case in &self.candidates {
+            serde_json::to_writer(&mut metadata, case)
+                .map_err(|_| GenerateError("cannot serialize candidate".into()))?;
+            writeln!(metadata).map_err(|_| GenerateError("cannot write metadata".into()))?;
+        }
+        fs::write(run.join("candidates.txt"), self.candidates_text())
+            .map_err(|_| GenerateError("cannot write candidates".into()))?;
+        fs::write(
+            run.join("generation.json"),
+            serde_json::to_vec_pretty(&self.record).unwrap(),
+        )
+        .map_err(|_| GenerateError("cannot write generation record".into()))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,47 +876,5 @@ mod tests {
             assert!(result.record.calls[1].interrupted);
             assert_eq!(result.record.calls[1].served_tier, "unknown");
         }
-    }
-}
-impl Generated {
-    /// Human-review view: one block per case, joined to metadata.jsonl by case_id.
-    pub fn candidates_text(&self) -> String {
-        // Continuation lines stay aligned so a multi-line value remains one field.
-        let field = |value: &str| value.trim().replace('\n', "\n        ");
-        let mut text = String::new();
-        for case in &self.candidates {
-            text.push_str(&format!(
-                "case_id: {}\nprompt:  {}\nsql:     {}\n\n",
-                case.case_id,
-                field(&case.prompt),
-                field(&case.sql)
-            ));
-        }
-        text
-    }
-    pub fn write(&self, directory: &Path) -> Result<(), GenerateError> {
-        fs::create_dir_all(directory)
-            .map_err(|_| GenerateError("cannot create output directory".into()))?;
-        let run = directory.join(&self.record.id);
-        fs::create_dir(&run)
-            .map_err(|_| GenerateError("cannot reserve generation directory".into()))?;
-        let mut metadata = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(run.join("metadata.jsonl"))
-            .map_err(|_| GenerateError("cannot write metadata".into()))?;
-        for case in &self.candidates {
-            serde_json::to_writer(&mut metadata, case)
-                .map_err(|_| GenerateError("cannot serialize candidate".into()))?;
-            writeln!(metadata).map_err(|_| GenerateError("cannot write metadata".into()))?;
-        }
-        fs::write(run.join("candidates.txt"), self.candidates_text())
-            .map_err(|_| GenerateError("cannot write candidates".into()))?;
-        fs::write(
-            run.join("generation.json"),
-            serde_json::to_vec_pretty(&self.record).unwrap(),
-        )
-        .map_err(|_| GenerateError("cannot write generation record".into()))?;
-        Ok(())
     }
 }

@@ -1,4 +1,5 @@
 pub mod cli_run;
+pub mod context_pack;
 pub mod contracts;
 pub mod dataset;
 pub mod evaluate;

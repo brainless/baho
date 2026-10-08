@@ -49,6 +49,8 @@ pub enum PlanError {
     #[error("planning settings exceed supported bounds")]
     Settings,
     #[error("{0}")]
+    Context(#[from] crate::context_pack::PackError),
+    #[error("{0}")]
     Setup(String),
     #[error("cannot write the plan record: {0}")]
     Record(String),
@@ -103,6 +105,8 @@ pub struct PlanOptions {
     /// Repository root: source of the read tools and owner of `epics/`.
     pub repo: PathBuf,
     pub settings: PlanSettings,
+    /// Name of a context pack under `tools/synth/context/`; `None` injects nothing.
+    pub context: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -113,6 +117,16 @@ pub struct CallRecord {
     pub served_tier: String,
     pub standard_tier: bool,
     pub interrupted: bool,
+    /// Provider-reported token usage for this call; absent when the stream reported none
+    /// (and in older records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -152,6 +166,9 @@ pub struct PlanRecord {
     /// `no_terminal_action`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_text_excerpt: Option<String>,
+    /// Present only when a context pack was injected: name, hash, resolved ranges, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_pack: Option<crate::context_pack::PackRecord>,
     pub calls: Vec<CallRecord>,
     pub tool_events: Vec<ToolEvent>,
     pub tool_transcript: Vec<ToolTranscript>,
@@ -272,6 +289,10 @@ impl AgentHook for Transcript {
             standard_tier: matches!(tier.as_str(), "standard" | "default"),
             served_tier: tier,
             interrupted: false,
+            input_tokens: event.usage.input_tokens,
+            output_tokens: event.usage.output_tokens,
+            total_tokens: event.usage.total_tokens,
+            cached_input_tokens: event.usage.cached_input_tokens,
         });
         ModelTurnAction::Continue
     }
@@ -347,9 +368,11 @@ fn epic_titles(repo: &Path, redactor: &Redactor) -> Vec<String> {
         .collect()
 }
 
-fn task_prompt(report: &EvaluationReport, titles: &[String]) -> String {
+fn task_prompt(report: &EvaluationReport, titles: &[String], pack: Option<&str>) -> String {
+    // The pack comes first and is identical across runs of one goal: a stable prefix.
+    let pack = pack.map_or(String::new(), |p| format!("{p}\n---\n\n"));
     format!(
-        "Plan one epic from evaluation {} (generation {}), {} cases.\n\n\
+        "{pack}Plan one epic from evaluation {} (generation {}), {} cases.\n\n\
          High-level goals:\n{GOALS}\n\nExisting epics (read them with read_file):\n{}\n\n\
          Start with read_evaluation. Finish only by calling submit_epic (one epic) or \
          finish_no_epic (brief reason the evidence is insufficient). Never write tool calls \
@@ -400,7 +423,18 @@ pub async fn plan_epic(
         std::process::id()
     );
     let finisher = FinishNoEpic::new(redactor.clone());
-    let prompt = task_prompt(&report, &epic_titles(&options.repo, &redactor));
+    let pack = options
+        .context
+        .as_deref()
+        .map(|name| {
+            crate::context_pack::load(&options.repo.join("tools/synth/context"), name, &toolbox)
+        })
+        .transpose()?;
+    let prompt = task_prompt(
+        &report,
+        &epic_titles(&options.repo, &redactor),
+        pack.as_ref().map(|p| p.text.as_str()),
+    );
     let recorder = Arc::new(Mutex::new(Recorder::default()));
     let agent = AgentBuilder::new(model)
         .preamble(PLANNER_PROMPT)
@@ -480,6 +514,10 @@ pub async fn plan_epic(
             served_tier: "unknown".into(),
             standard_tier: false,
             interrupted: true,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cached_input_tokens: None,
         });
     }
     let record = PlanRecord {
@@ -504,6 +542,7 @@ pub async fn plan_epic(
         explanation: finisher.explanation().filter(|_| outcome == "no_epic"),
         final_text_excerpt: matches!(outcome, "malformed_tool_call" | "no_terminal_action")
             .then(|| bounded_text(&redactor, &final_text, MAX_EXCERPT_BYTES)),
+        context_pack: pack.map(|p| p.record),
         calls: rec.calls.clone(),
         tool_events: rec.events.clone(),
         tool_transcript: toolbox.transcript(),
@@ -591,7 +630,7 @@ mod tests {
             fs::write(p, body).unwrap();
         };
         w("epics/001-a.md", "# Epic 001: About Senior Analyst\n");
-        w("crates/a/src/lib.rs", "fn x() {}\n");
+        w("crates/a/src/lib.rs", "fn x() {}\nfn y() {}\nfn z() {}\n");
         w(".env", "NEURALWATT_API_KEY=leak\n");
         let eval_dir = dir.path().join("synthetic/out/evaluation-x");
         fs::create_dir_all(&eval_dir).unwrap();
@@ -608,6 +647,7 @@ mod tests {
                 evaluation,
                 repo: repo.clone(),
                 settings: PlanSettings::default(),
+                context: None,
             },
             repo,
             eval_dir,
@@ -632,10 +672,10 @@ mod tests {
         format!(
             "# Parse refusals for polite lead-ins\n\nStatus: Proposed\n\n\
 ## Motivating evidence and user intent\nRun `{EVAL}` from `{GEN}`; case {GEN}-0001 is unreviewed.\n\n\
-## Observed behavior\nRefused.\n\n## Problem and desired behavior\nx\n\n## Out of scope\nx\n\n\
+## Observed behavior\nRefused (`crates/a/src/lib.rs:1`, `crates/a/src/lib.rs:2`, `crates/a/src/lib.rs:3`).\n\n## Problem and desired behavior\nx\n\n## Out of scope\nx\n\n\
 ## Architecture and crate ownership\nx\n\n## Design and alternatives\nChosen increment: normalize lead-ins.\n\n\
 ## Goal coverage\n\n| Goal | Decision | Reason |\n|---|---|---|\n{}\n\
-## Acceptance criteria\nx\n\n## Fixture and test strategy\nx\n\n## Implementation outline\nx\n\n\
+## Acceptance criteria\nx\n\n## Fixture and test strategy\nx\n\n## Risks and regressions\nx\n\n## Implementation outline\nx\n\n\
 ## Path inventory\n\nExisting evidence files:\n- `crates/a/src/lib.rs`\n\nProposed new files:\n- `crates/a/tests/lead_in.rs`\n\n\
 ## Unresolved questions\nNone.\n",
             (1..=8)
@@ -686,6 +726,213 @@ mod tests {
         let saved = fs::read_to_string(&result.record_path).unwrap();
         for private in [SECRET, "leak", "NEURALWATT_API_KEY=", "fn x()"] {
             assert!(!saved.contains(private), "{private}");
+        }
+    }
+
+    #[tokio::test]
+    async fn per_call_token_usage_is_recorded_when_reported() {
+        let f = fixture(true);
+        let usage = Usage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            total_tokens: Some(120),
+            cached_input_tokens: Some(40),
+            ..Usage::default()
+        };
+        let reported = vec![
+            MockStreamEvent::tool_call("call", "read_evaluation", json!({})),
+            MockStreamEvent::FinalResponse(mock_final(usage)),
+        ];
+        let model = MockCompletionModel::from_stream_turns([reported, submit(&doc())]);
+        let result = plan_epic(model, &f.options).await.unwrap();
+        let calls = &result.record.calls;
+        assert_eq!(calls[0].input_tokens, Some(100));
+        assert_eq!(calls[0].output_tokens, Some(20));
+        assert_eq!(calls[0].total_tokens, Some(120));
+        assert_eq!(calls[0].cached_input_tokens, Some(40));
+        // A call without reported usage records nothing rather than zeros.
+        assert_eq!(calls[1].input_tokens, None);
+        let saved: Value = serde_json::from_slice(&fs::read(&result.record_path).unwrap()).unwrap();
+        assert_eq!(saved["calls"][0]["input_tokens"], 100);
+        assert!(saved["calls"][1].get("input_tokens").is_none());
+    }
+
+    mod pack {
+        use super::*;
+        use crate::context_pack::{self, MAX_PACK_BYTES, PackError};
+
+        fn toolbox(f: &Fixture) -> Toolbox {
+            let redactor = Redactor::new([SECRET]).unwrap();
+            Toolbox::new(&f.repo, &report(), redactor, ToolLimits::default()).unwrap()
+        }
+
+        fn manifest(f: &Fixture, name: &str, entries: Value) {
+            let dir = f.repo.join("tools/synth/context");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join(format!("{name}.json")),
+                json!({ "entries": entries }).to_string(),
+            )
+            .unwrap();
+        }
+
+        fn load(f: &Fixture, name: &str) -> Result<context_pack::ContextPack, PackError> {
+            context_pack::load(&f.repo.join("tools/synth/context"), name, &toolbox(f))
+        }
+
+        #[test]
+        fn anchors_and_ranges_resolve_to_numbered_lines() {
+            let f = fixture(true);
+            manifest(
+                &f,
+                "p",
+                json!([
+                    {"path":"crates/a/src/lib.rs","anchor":"fn y","lines_before":1,"lines_after":5},
+                    {"path":"crates/a/src/lib.rs","start_line":3,"end_line":3}
+                ]),
+            );
+            let pack = load(&f, "p").unwrap();
+            let r = &pack.record;
+            let ranges: Vec<_> = r
+                .entries
+                .iter()
+                .map(|e| (e.path.as_str(), e.start_line, e.end_line))
+                .collect();
+            // The anchor range is clamped to the file's three lines.
+            assert_eq!(
+                ranges,
+                [("crates/a/src/lib.rs", 1, 3), ("crates/a/src/lib.rs", 3, 3)]
+            );
+            assert!(
+                pack.text
+                    .contains("### crates/a/src/lib.rs:1-3\n1: fn x() {}\n2: fn y() {}")
+            );
+            assert_eq!(r.bytes, pack.text.len());
+            assert_eq!(r.hash.len(), 64);
+            // Same tree, same pack: a stable prefix.
+            assert_eq!(load(&f, "p").unwrap().record.hash, r.hash);
+        }
+
+        #[test]
+        fn unresolved_ambiguous_and_malformed_entries_fail_loudly() {
+            let f = fixture(true);
+            for (entry, needle) in [
+                (
+                    json!({"path":"crates/a/src/lib.rs","anchor":"fn nope"}),
+                    "does not resolve",
+                ),
+                (
+                    json!({"path":"crates/a/src/lib.rs","anchor":"fn "}),
+                    "ambiguous",
+                ),
+                (json!({"path":"crates/a/src/lib.rs"}), "either an anchor"),
+                (
+                    json!({"path":"crates/a/src/lib.rs","start_line":9,"end_line":9}),
+                    "beyond",
+                ),
+            ] {
+                manifest(&f, "p", json!([entry]));
+                let error = load(&f, "p").err().unwrap().to_string();
+                assert!(error.contains(needle), "{error}");
+            }
+            assert!(matches!(load(&f, "absent"), Err(PackError::Missing(_))));
+            assert_eq!(load(&f, "../p").err(), Some(PackError::Name));
+        }
+
+        #[test]
+        fn allowlist_and_denylist_apply_to_pack_paths() {
+            let f = fixture(true);
+            fs::create_dir_all(f.repo.join("synthetic/out")).unwrap();
+            fs::write(f.repo.join("synthetic/out/x.txt"), "x\n").unwrap();
+            for path in [
+                ".env",
+                "synthetic/out/x.txt",
+                "../outside",
+                "/etc/passwd",
+                "Cargo.lock",
+            ] {
+                manifest(&f, "p", json!([{"path":path,"start_line":1,"end_line":1}]));
+                let error = load(&f, "p").err().unwrap().to_string();
+                assert!(
+                    error.contains("path not allowed") || error.contains("not found"),
+                    "{path}: {error}"
+                );
+                assert!(!error.contains("leak"));
+            }
+        }
+
+        #[test]
+        fn oversized_pack_is_rejected() {
+            let f = fixture(true);
+            let body: String = (0..1500).map(|i| format!("// {i:0>60}\n")).collect();
+            fs::write(f.repo.join("crates/a/src/big.rs"), body).unwrap();
+            manifest(
+                &f,
+                "p",
+                json!([{"path":"crates/a/src/big.rs","start_line":1,"end_line":1500}]),
+            );
+            match load(&f, "p") {
+                Err(PackError::TooLarge { bytes }) => assert!(bytes > MAX_PACK_BYTES),
+                other => panic!("{:?}", other.err()),
+            }
+        }
+
+        #[test]
+        fn pack_content_is_redacted() {
+            let f = fixture(true);
+            fs::write(
+                f.repo.join("crates/a/src/s.rs"),
+                format!("// the {SECRET} role\nfn s() {{}}\n"),
+            )
+            .unwrap();
+            manifest(
+                &f,
+                "p",
+                json!([{"path":"crates/a/src/s.rs","start_line":1,"end_line":2}]),
+            );
+            let pack = load(&f, "p").unwrap();
+            assert!(!pack.text.contains(SECRET));
+            assert!(pack.text.contains("2: fn s() {}"));
+        }
+
+        #[tokio::test]
+        async fn pack_leads_the_first_message_and_is_recorded() {
+            let f = fixture(true);
+            manifest(
+                &f,
+                "p",
+                json!([{"path":"crates/a/src/lib.rs","anchor":"fn y","lines_before":1,"lines_after":1}]),
+            );
+            let mut options = PlanOptions {
+                evaluation: f.options.evaluation.clone(),
+                repo: f.repo.clone(),
+                settings: PlanSettings::default(),
+                context: Some("p".into()),
+            };
+            let model = MockCompletionModel::from_stream_turns([submit(&doc())]);
+            let capture = model.clone();
+            let result = plan_epic(model, &options).await.unwrap();
+            let requests = format!("{:?}", capture.requests());
+            let pack_at = requests.find("Context pack").expect("pack present");
+            let task_at = requests.find("Plan one epic").expect("task present");
+            assert!(pack_at < task_at);
+            assert!(requests.contains("2: fn y() {}"));
+            let recorded = result.record.context_pack.as_ref().unwrap();
+            assert_eq!(recorded.name, "p");
+            assert_eq!(recorded.entries[0].start_line, 1);
+            let saved = fs::read_to_string(&result.record_path).unwrap();
+            assert!(saved.contains("\"context_pack\""));
+            assert!(!saved.contains("fn y()"));
+
+            // A bad pack fails before the model is called at all.
+            options.context = Some("absent".into());
+            let model = MockCompletionModel::from_stream_turns([submit(&doc())]);
+            let capture = model.clone();
+            assert!(matches!(
+                plan_epic(model, &options).await,
+                Err(PlanError::Context(_))
+            ));
+            assert!(capture.requests().is_empty());
         }
     }
 

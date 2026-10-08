@@ -90,7 +90,7 @@ fn parse_csv(bytes: &[u8]) -> Result<(Vec<(i64, String)>, DatasetProfile), Datas
     if bytes.is_empty() || bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
         return Err(DatasetError::Layout("empty or BOM-prefixed input".into()));
     }
-    if bytes.iter().any(|byte| *byte == 0) {
+    if bytes.contains(&0) {
         return Err(DatasetError::Layout("NUL byte".into()));
     }
     let physical_lines = bytes.split(|byte| *byte == b'\n').collect::<Vec<_>>();
