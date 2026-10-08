@@ -5,3 +5,6 @@
 /target/
 /synthetic/out/
 /tools/synth/target/
+
+# synth evaluate: private mapping from source literals to stand-ins
+redaction-sidecar.json

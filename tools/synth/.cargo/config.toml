@@ -1,0 +1,7 @@
+# The inherited Cranelift backend cannot link AWS LC's native TLS symbols on
+# arm64. Keep this override local to the excluded developer tool.
+[profile.dev]
+codegen-backend = "llvm"
+
+[profile.test]
+codegen-backend = "llvm"

@@ -56,3 +56,60 @@ cargo test --manifest-path tools/synth/Cargo.toml \
 
 Alternatively, run `cargo fmt --check`, `cargo check`, and `cargo test` from
 `tools/synth` without backend overrides.
+
+## Evaluating a generation (`synth evaluate`)
+
+```text
+synth evaluate --dataset CSV --baho-bin PATH [--generation DIR] [--review FILE] [--output DIR]
+```
+
+`--baho-bin` is the `baho-cli` package's binary, normally `target/debug/baho`
+after `cargo build -p baho-cli`. Relative paths are accepted and canonicalized
+once at probe time. A case whose process cannot be started records
+`evidence.spawn_failure` (`spawn_not_found`, `spawn_permission_denied`, or
+`spawn_failed`) and a report note; if no case could start, the command exits
+nonzero after writing the report.
+
+Without `--generation` the numerically greatest `generation-*` under `--output`
+(default `synthetic/out`) is used. Each run creates `evaluation-*` under the
+output root with:
+
+- `evaluation.json`: the sanitized report; the only file a model may see. Its
+  SHA-256 is the evaluation hash.
+- `redaction-sidecar.json`: the private (owner-only, gitignored) mapping from
+  profiled `Role` values to stand-ins, bound to the evaluation hash. Never
+  expose it through agent tools.
+- `input.csv` and `.baho/runs/`: the Role-only derived CSV and raw `baho-cli`
+  artifacts. These hold source values and stay private.
+
+Free-text fields (prompts, review rationale, diagnostic messages, refusal
+reasons, plan columns and literals, notes, version strings) pass through
+`sanitize_checked`; the serialized report is also scanned for absolute paths.
+Case IDs, hashes, enum values, and diagnostic codes are tool vocabulary. Keep a
+custom `--output` outside Git.
+
+## Planner records (`synth plan-epic`)
+
+`plan-<id>.json` is written beside `evaluation.json`. Optional fields, all
+sanitized and bounded (schema version unchanged; older records lack them):
+
+- Outcomes: `epic_written`, `no_epic` (only from an explicit `finish_no_epic`
+  call; its sanitized explanation, at most 1000 bytes, is `explanation`),
+  `malformed_tool_call` (the stream ended with tool-call markup written as
+  text), `no_terminal_action` (plain text ended the stream with neither
+  `submit_epic` nor `finish_no_epic`), `max_turns`, `timeout`,
+  `provider_error`. There is no automatic re-prompt after a malformed call.
+- `final_text_excerpt` (only for `malformed_tool_call` and
+  `no_terminal_action`): sanitized final text capped at 300 bytes.
+- `provider_error` (only for outcome `provider_error`): `class`
+  (`http_status`, `transport`, `decode`, `request`, `timeout`, `tool`,
+  `other`), optional `http_status`, and `message`, scrubbed of literals, paths,
+  and credential-shaped values and capped at 300 bytes. Headers and request
+  payloads are never recorded.
+- `rejected_submissions[].reasons`: the `code` and the sanitized `message`
+  returned to the agent for each violation. A `forbidden` message names the
+  violation kind and 1-based line numbers, never the matched text.
+
+`submit_epic` scans prose for profiled values as whole words (plural `s`/`es`
+included); a value that is merely a substring of an ordinary word is accepted.
+Evaluation and tool surfaces keep the strict substring scan.
