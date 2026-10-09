@@ -21,7 +21,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("generate") => {}
         Some("evaluate") => return evaluate_command(args),
         Some("plan-epic") => return plan_epic_command(args).await,
-        _ => return Err("usage: synth plan-epic --evaluation EVALUATION_JSON [--context NAME] [--max-turns N] [--per-call-seconds N] [--whole-run-seconds N]\n       synth evaluate --dataset CSV --baho-bin PATH [--generation DIR] [--review FILE] [--output DIR]\n       synth generate --dataset CSV --feature MARKDOWN --count N [--output DIR] [--per-call-seconds N] [--whole-run-seconds N] [--max-turns N] [--variation TEXT]".into()),
+        Some("repair") => return repair_command(args),
+        _ => return Err("usage: synth plan-epic --evaluation EVALUATION_JSON [--context NAME] [--proposal PROPOSAL_JSON] [--reasoning-effort low|medium|high] [--max-turns N] [--max-tool-calls N] [--stage-max-turns N] [--stage-max-tool-calls N] [--per-call-seconds N] [--whole-run-seconds N]\n       synth evaluate --dataset CSV --baho-bin PATH [--generation DIR] [--review FILE] [--output DIR]\n       synth generate --dataset CSV --feature MARKDOWN --count N [--output DIR] [--per-call-seconds N] [--whole-run-seconds N] [--max-turns N] [--variation TEXT]".into()),
     }
     let mut dataset = None;
     let mut feature = None;
@@ -72,7 +73,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let dataset = Arc::new(LoadedDataset::load(
         &dataset.ok_or("--dataset is required")?,
     )?);
-    let result = generate(neuralwatt_model(key), dataset, &feature, settings).await?;
+    let result = generate(
+        neuralwatt_model(key, synth::generator::MODEL),
+        dataset,
+        &feature,
+        settings,
+    )
+    .await?;
     result.write(&output)?;
     println!(
         "{}: {} accepted ({})",
@@ -86,6 +93,53 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    Ok(())
+}
+
+fn repair_command(
+    mut args: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut evaluation = None;
+    let mut case_id = None;
+    let mut baseline_revision = None;
+    let mut dataset = None;
+    let mut review = None;
+    let mut output = PathBuf::from("synthetic/out/repair");
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or("option requires a value")?;
+        match flag.as_str() {
+            "--evaluation" => evaluation = Some(PathBuf::from(value)),
+            "--case" => case_id = Some(value),
+            "--baseline" => baseline_revision = Some(value),
+            "--dataset" => dataset = Some(PathBuf::from(value)),
+            "--review" => review = Some(PathBuf::from(value)),
+            "--output" => output = PathBuf::from(value),
+            _ => return Err("unknown repair option".into()),
+        }
+    }
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let options = synth::repair_entry::RepairOptions {
+        repo: repo.clone(),
+        evaluation: evaluation.ok_or("--evaluation is required")?,
+        case_id: case_id.ok_or("--case is required")?,
+        baseline_revision: baseline_revision.ok_or("--baseline is required")?,
+        dataset: dataset.ok_or("--dataset is required")?,
+        review: review.ok_or("--review is required")?,
+        output,
+        settings: synth::repair_entry::RepairOptions::default_settings(),
+    };
+    // Intake runs before credential loading, so invalid or unreviewed cases
+    // cannot trigger a provider call.
+    synth::repair_entry::prepare(&options)?;
+    let key = resolve_credential(
+        std::env::var("NEURALWATT_API_KEY").ok(),
+        std::fs::read_to_string(repo.join(".env")).ok().as_deref(),
+    )?;
+    let (outcome, path) = synth::repair_entry::repair(
+        neuralwatt_model(key, synth::planner::MODEL).into(),
+        &options,
+    )?;
+    println!("{:?}: {}", outcome, path.display());
     Ok(())
 }
 
@@ -141,12 +195,28 @@ async fn plan_epic_command(
     let mut evaluation = None;
     let mut settings = PlanSettings::default();
     let mut context = None;
+    let mut proposal = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or("option requires a value")?;
         match flag.as_str() {
             "--evaluation" => evaluation = Some(PathBuf::from(value)),
             "--context" => context = Some(value),
+            "--proposal" => proposal = Some(PathBuf::from(value)),
+            "--reasoning-effort" => settings.reasoning_effort = value.parse()?,
             "--max-turns" => settings.max_turns = value.parse()?,
+            "--max-tool-calls" => settings.limits.max_calls = value.parse()?,
+            "--stage-max-turns" => {
+                let cap = value.parse()?;
+                settings.stage_budgets.investigation.max_turns = cap;
+                settings.stage_budgets.draft.max_turns = cap;
+                settings.stage_budgets.review.max_turns = cap;
+            }
+            "--stage-max-tool-calls" => {
+                let cap = value.parse()?;
+                settings.stage_budgets.investigation.max_tool_calls = cap;
+                settings.stage_budgets.draft.max_tool_calls = cap;
+                settings.stage_budgets.review.max_tool_calls = cap;
+            }
             "--per-call-seconds" => settings.per_call_seconds = value.parse()?,
             "--whole-run-seconds" => settings.whole_run_seconds = value.parse()?,
             _ => return Err("unknown option".into()),
@@ -162,12 +232,13 @@ async fn plan_epic_command(
         std::fs::read_to_string(repo.join(".env")).ok().as_deref(),
     )?;
     let result = plan_epic(
-        neuralwatt_model(key),
+        neuralwatt_model(key, synth::planner::MODEL),
         &PlanOptions {
             evaluation,
             repo,
             settings,
             context,
+            proposal,
         },
     )
     .await?;
@@ -187,12 +258,15 @@ async fn plan_epic_command(
         };
         println!("{label}: {excerpt}");
     }
+    if let Some(path) = &r.proposal_path {
+        println!("proposal: {path}");
+    }
     println!("record: {}", result.record_path.display());
     for call in &r.calls {
-        if call.standard_tier || call.served_tier == "unknown" {
+        if !matches!(call.served_tier.as_str(), "standard" | "default") {
             eprintln!(
-                "turn {}: served tier {} (requested flex)",
-                call.turn, call.served_tier
+                "{} turn {}: served tier {} (requested {})",
+                call.stage, call.turn, call.served_tier, call.requested_tier
             );
         }
     }

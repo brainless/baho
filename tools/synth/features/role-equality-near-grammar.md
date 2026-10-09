@@ -9,19 +9,25 @@ edges of a small closed grammar, so stay close to terse, form-like phrasing that
 spreadsheet user would type. Do not write polite lead-ins, first-person
 statements, or trailing requests such as "please".
 
-Every request must begin with the column name or with one of the words `show`,
-`list`, or `filter`, followed by an optional `rows where`, then `Role`, one
-comparison, and the value. Use these comparison forms, spread across the batch:
-the symbol `=`, the word `is`, and the word `equals`.
+Build controlled contrasts in submission order. Choose one ASCII profiled value
+and one opening, `Show rows where Role`, and keep both identical throughout the
+first group. The first three cases must differ only in the comparison:
 
-Vary exactly one of the following per case, keeping everything else minimal:
+1. `Show rows where Role = VALUE`
+2. `Show rows where Role is VALUE`
+3. `Show rows where Role equals VALUE`
 
-- the opening form (`Role = X`, `Show rows where Role = X`, `List rows where
-  Role is X`, `Filter rows where Role equals X`);
-- the value's quoting: none, double quotes, or single quotes;
-- trailing punctuation after the value: none, a period, a question mark, or an
-  exclamation mark;
-- the letter case of the value or of the word `Role`.
+All three use the exact same SQL. For count 1 or 2, submit that prefix of the
+triplet. Complete the triplet before adding another probe. Do not rotate values
+or openings to make the batch look varied.
+
+Then keep the first case as the baseline and change just one factor per case:
+double quotes around VALUE, single quotes around VALUE, trailing period,
+trailing question mark, trailing exclamation mark, or letter case. In particular,
+never combine single quotes with punctuation, or a word operator with changed
+quoting. For larger batches, repeat a complete operator triplet with a second
+profiled value or a different opening, changing only that factor from the first
+group. The purpose is to attribute a mismatch to one grammar decision.
 
 Baho compares text case insensitively by lowercasing both operands. These cases
 use ASCII values, for which DuckDB's `lower` agrees. Do not trim whitespace,
@@ -46,10 +52,12 @@ generated case only if they appear in the supplied profile.
 
 | Prompt | SQL |
 | --- | --- |
-| Role = Analyst | `SELECT _row FROM data WHERE lower("Role") = lower('Analyst') ORDER BY _row` |
+| Show rows where Role = Analyst | `SELECT _row FROM data WHERE lower("Role") = lower('Analyst') ORDER BY _row` |
 | Show rows where Role is Analyst | `SELECT _row FROM data WHERE lower("Role") = lower('Analyst') ORDER BY _row` |
-| List rows where Role equals "Coordinator" | `SELECT _row FROM data WHERE lower("Role") = lower('Coordinator') ORDER BY _row` |
-| Filter rows where Role = 'Analyst'. | `SELECT _row FROM data WHERE lower("Role") = lower('Analyst') ORDER BY _row` |
+| Show rows where Role equals Analyst | `SELECT _row FROM data WHERE lower("Role") = lower('Analyst') ORDER BY _row` |
+| Show rows where Role = "Analyst" | `SELECT _row FROM data WHERE lower("Role") = lower('Analyst') ORDER BY _row` |
+| Show rows where Role = 'Analyst' | `SELECT _row FROM data WHERE lower("Role") = lower('Analyst') ORDER BY _row` |
+| Show rows where Role = Analyst. | `SELECT _row FROM data WHERE lower("Role") = lower('Analyst') ORDER BY _row` |
 
 Keep each request to this one row filter. Exclude totals, counts, aggregation,
 selected-column projections, distinct values, sorting, limits, additional columns

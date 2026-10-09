@@ -10,3 +10,4 @@
 redaction-sidecar.json
 
 .datasets/
+.old/

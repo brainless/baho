@@ -8,15 +8,17 @@
 
 use crate::{
     contracts::EvaluationReport,
+    draft_review::{DraftProposal, Review, ReviewVerdict, SubmitDraft, SubmitReview, draft_hash},
     evaluate::SIDECAR_FILE,
-    generator::{MODEL, PROVIDER, served_tier},
+    generator::{PROVIDER, served_tier},
+    investigation::{Investigation, SubmitInvestigation},
     planner_tools::{
         FinishNoEpic, GOALS, ListFiles, MAX_EXCERPT_BYTES, PLANNER_PROMPT, PLANNER_PROMPT_VERSION,
         ReadEvaluation, ReadFile, SearchText, ToolLimits, ToolTranscript, Toolbox, bounded_text,
         goals_hash, looks_like_tool_call_markup, planner_prompt_hash,
     },
     redaction::{RedactionError, Redactor, load_sidecar},
-    submit_epic::{EpicSubmitter, RejectionRecord, SubmitEpic},
+    submit_epic::{EpicSubmitter, ProposalEvidence, RejectionRecord},
 };
 use futures::StreamExt;
 use rig::agent::{
@@ -35,7 +37,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const RECORD_SCHEMA_VERSION: u32 = 1;
+pub const MODEL: &str = "glm-5.3-flex";
+pub const RECORD_SCHEMA_VERSION: u32 = 3;
+const INVESTIGATION_PROMPT: &str = include_str!("../prompts/planner-investigation.md");
+const REVIEW_PROMPT: &str = include_str!("../prompts/planner-review.md");
 const MAX_TITLES: usize = 200;
 const MAX_TITLE_CHARS: usize = 120;
 const MAX_TOOL_EVENTS: usize = 2000;
@@ -66,8 +71,93 @@ pub fn resolve_credential(
     )
 }
 
+/// Requested provider reasoning level; recorded so fixed-evaluation comparisons are reproducible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    #[default]
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            _ => Err("reasoning effort must be low, medium, or high"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct StageBudget {
+    pub max_turns: usize,
+    pub max_tool_calls: usize,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct StageBudgets {
+    pub investigation: StageBudget,
+    pub draft: StageBudget,
+    pub review: StageBudget,
+}
+
+impl Default for StageBudgets {
+    fn default() -> Self {
+        Self {
+            investigation: StageBudget {
+                max_turns: 40,
+                max_tool_calls: 60,
+            },
+            draft: StageBudget {
+                max_turns: 25,
+                max_tool_calls: 40,
+            },
+            review: StageBudget {
+                max_turns: 20,
+                max_tool_calls: 30,
+            },
+        }
+    }
+}
+
+impl StageBudgets {
+    fn for_stage(self, stage: &str) -> StageBudget {
+        match stage {
+            "investigate" => self.investigation,
+            "draft" | "revise" => self.draft,
+            "review" | "final_review" => self.review,
+            _ => unreachable!("stage runner only executes known stages"),
+        }
+    }
+
+    fn valid(self) -> bool {
+        [self.investigation, self.draft, self.review]
+            .into_iter()
+            .all(|budget| {
+                (1..=200).contains(&budget.max_turns) && (1..=1000).contains(&budget.max_tool_calls)
+            })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct PlanSettings {
+    pub stage_budgets: StageBudgets,
+    pub reasoning_effort: ReasoningEffort,
     pub max_turns: usize,
     pub per_call_seconds: u64,
     pub whole_run_seconds: u64,
@@ -77,20 +167,26 @@ pub struct PlanSettings {
 impl Default for PlanSettings {
     fn default() -> Self {
         Self {
-            max_turns: 40,
+            stage_budgets: StageBudgets::default(),
+            reasoning_effort: ReasoningEffort::High,
+            max_turns: 120,
             per_call_seconds: 900,
             whole_run_seconds: 3600,
-            limits: ToolLimits::default(),
+            limits: ToolLimits {
+                max_calls: 180,
+                ..ToolLimits::default()
+            },
         }
     }
 }
 
 impl PlanSettings {
     pub fn validate(&self) -> Result<(), PlanError> {
-        if (1..=200).contains(&self.max_turns)
+        if self.stage_budgets.valid()
+            && (1..=200).contains(&self.max_turns)
             && (1..=7200).contains(&self.per_call_seconds)
             && (1..=86400).contains(&self.whole_run_seconds)
-            && self.limits.max_calls >= 1
+            && (1..=1000).contains(&self.limits.max_calls)
         {
             Ok(())
         } else {
@@ -107,10 +203,13 @@ pub struct PlanOptions {
     pub settings: PlanSettings,
     /// Name of a context pack under `tools/synth/context/`; `None` injects nothing.
     pub context: Option<String>,
+    /// Resume writing from a previously saved, validated investigative proposal.
+    pub proposal: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CallRecord {
+    pub stage: String,
     pub turn: usize,
     pub elapsed_ms: u128,
     pub requested_tier: &'static str,
@@ -131,6 +230,7 @@ pub struct CallRecord {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ToolEvent {
+    pub stage: String,
     pub turn: usize,
     pub tool: String,
     pub event: &'static str,
@@ -154,10 +254,15 @@ pub struct PlanRecord {
     pub repo_revision: String,
     pub repo_dirty: bool,
     pub settings: PlanSettings,
+    pub stages: Vec<StageRecord>,
+    pub investigation: Option<Investigation>,
+    pub proposal_path: Option<String>,
+    pub resumed_from_proposal: bool,
+    pub reviews: Vec<Review>,
     /// `epic_written`, `no_epic` (deliberate `finish_no_epic` call), `malformed_tool_call`
     /// (the stream ended with tool-call markup written as text), `no_terminal_action` (plain
     /// text ended the stream without `submit_epic` or `finish_no_epic`), `max_turns`,
-    /// `timeout`, or `provider_error`.
+    /// `timeout`, `provider_error`, `review_failed`, `draft_scope_mismatch`, or `publication_failed`.
     pub outcome: String,
     pub epic_path: Option<String>,
     /// Bounded and sanitized; only present for `no_epic`, from `finish_no_epic`.
@@ -177,6 +282,18 @@ pub struct PlanRecord {
     /// Present only for `provider_error`: a classified, sanitized, bounded cause.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_error: Option<ProviderErrorSummary>,
+}
+
+/// One bounded phase, with its independent history and prompt provenance.
+#[derive(Clone, Debug, Serialize)]
+pub struct StageRecord {
+    pub stage: String,
+    pub outcome: String,
+    pub prompt_hash: String,
+    pub first_turn: usize,
+    pub last_turn: usize,
+    pub draft_hash: Option<String>,
+    pub terminal_rejections: Vec<String>,
 }
 
 /// Why a provider call failed, without headers, request payloads, or credentials.
@@ -249,6 +366,13 @@ struct Recorder {
     calls: Vec<CallRecord>,
     events: Vec<ToolEvent>,
     active_call: Option<(usize, Instant)>,
+    stage: String,
+    tool_calls: usize,
+    max_tool_calls: usize,
+    tool_budget_exhausted: bool,
+    stage_tool_calls: usize,
+    stage_max_tool_calls: usize,
+    stage_tool_budget_exhausted: bool,
 }
 
 #[derive(Clone)]
@@ -256,8 +380,15 @@ struct Transcript(Arc<Mutex<Recorder>>);
 
 fn known_tool(name: &str) -> &str {
     match name {
-        "read_evaluation" | "list_files" | "read_file" | "search_text" | "submit_epic"
-        | "finish_no_epic" => name,
+        "read_evaluation"
+        | "list_files"
+        | "read_file"
+        | "search_text"
+        | "submit_epic"
+        | "finish_no_epic"
+        | "submit_investigation"
+        | "submit_draft"
+        | "submit_review" => name,
         _ => "unknown",
     }
 }
@@ -266,9 +397,11 @@ impl AgentHook for Transcript {
     async fn on_completion_call(
         &self,
         _: &HookContext,
-        event: CompletionCallEvent<'_>,
+        _: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
-        self.0.lock().unwrap().active_call = Some((event.turn, Instant::now()));
+        let mut rec = self.0.lock().unwrap();
+        let turn = rec.calls.len() + 1;
+        rec.active_call = Some((turn, Instant::now()));
         CompletionCallAction::Continue
     }
     async fn on_model_turn_finished(
@@ -277,13 +410,17 @@ impl AgentHook for Transcript {
         event: ModelTurnFinished<'_>,
     ) -> ModelTurnAction {
         let mut rec = self.0.lock().unwrap();
-        let elapsed_ms = rec
+        let (turn, elapsed_ms) = rec
             .active_call
             .take()
-            .map_or(0, |(_, start)| start.elapsed().as_millis());
+            .map_or((rec.calls.len() + 1, 0), |(turn, start)| {
+                (turn, start.elapsed().as_millis())
+            });
+        let stage = rec.stage.clone();
         let tier = served_tier(event.raw);
         rec.calls.push(CallRecord {
-            turn: event.turn,
+            stage,
+            turn,
             elapsed_ms,
             requested_tier: "flex",
             standard_tier: matches!(tier.as_str(), "standard" | "default"),
@@ -299,9 +436,40 @@ impl AgentHook for Transcript {
     async fn on_dispatch(&self, _: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
         if let Some(tool) = event.tool_name() {
             let mut rec = self.0.lock().unwrap();
+            let global_exhausted = rec.tool_calls >= rec.max_tool_calls;
+            let stage_exhausted = rec.stage_tool_calls >= rec.stage_max_tool_calls;
+            if global_exhausted || stage_exhausted {
+                rec.tool_budget_exhausted = global_exhausted;
+                rec.stage_tool_budget_exhausted = stage_exhausted;
+                if rec.events.len() < MAX_TOOL_EVENTS {
+                    let stage = rec.stage.clone();
+                    let turn = rec.calls.len();
+                    rec.events.push(ToolEvent {
+                        stage,
+                        turn,
+                        tool: known_tool(tool).into(),
+                        event: "budget_denied",
+                        succeeded: Some(false),
+                        argument_bytes: event.tool_args().map_or(0, str::len),
+                    });
+                }
+                return DispatchAction::Deny(rig::error::ErrorReport::new(
+                    rig::error::ErrorKind::Cancelled,
+                    if global_exhausted {
+                        "shared tool-call budget exhausted"
+                    } else {
+                        "stage tool-call budget exhausted"
+                    },
+                ));
+            }
+            rec.tool_calls += 1;
+            rec.stage_tool_calls += 1;
             if rec.events.len() < MAX_TOOL_EVENTS {
+                let stage = rec.stage.clone();
+                let turn = rec.calls.len();
                 rec.events.push(ToolEvent {
-                    turn: event.turn,
+                    stage,
+                    turn,
                     tool: known_tool(tool).into(),
                     event: "dispatch",
                     succeeded: None,
@@ -317,8 +485,11 @@ impl AgentHook for Transcript {
             let succeeded =
                 event.outcome.is_ok() && event.tool_result().is_some_and(|r| !r.is_error());
             if rec.events.len() < MAX_TOOL_EVENTS {
+                let stage = rec.stage.clone();
+                let turn = rec.calls.len();
                 rec.events.push(ToolEvent {
-                    turn: event.turn,
+                    stage,
+                    turn,
                     tool: known_tool(tool).into(),
                     event: "outcome",
                     succeeded: Some(succeeded),
@@ -374,14 +545,227 @@ fn task_prompt(report: &EvaluationReport, titles: &[String], pack: Option<&str>)
     format!(
         "{pack}Plan one epic from evaluation {} (generation {}), {} cases.\n\n\
          High-level goals:\n{GOALS}\n\nExisting epics (read them with read_file):\n{}\n\n\
-         Start with read_evaluation. Finish only by calling submit_epic (one epic) or \
-         finish_no_epic (brief reason the evidence is insufficient). Never write tool calls \
-         as text.",
+         The investigator starts with read_evaluation. The writer uses its proposal and \
+         checks specific gaps; the reviewer independently verifies the draft. Use only the terminal tool provided for the current stage. \
+         Never write tool calls as text.",
         report.evaluation_id,
         report.generation_id,
         report.cases.len(),
         titles.join("\n")
     )
+}
+
+#[derive(Clone)]
+enum StageTerminal {
+    Investigation(SubmitInvestigation),
+    Draft(SubmitDraft),
+    Review(SubmitReview),
+}
+
+impl StageTerminal {
+    fn completed(&self) -> bool {
+        match self {
+            Self::Investigation(tool) => tool.accepted().is_some(),
+            Self::Draft(tool) => tool.accepted().is_some(),
+            Self::Review(tool) => tool.accepted().is_some(),
+        }
+    }
+    fn rejections(&self) -> Vec<String> {
+        match self {
+            Self::Investigation(tool) => tool
+                .rejections()
+                .into_iter()
+                .map(|r| r.join("; "))
+                .collect(),
+            Self::Draft(tool) => tool.rejections(),
+            Self::Review(tool) => tool.rejections(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct StageExecution {
+    outcome: &'static str,
+    final_text: String,
+    provider_error: Option<ProviderErrorSummary>,
+}
+
+struct StageRunner<'a> {
+    model: &'a DynModel<Completion>,
+    toolbox: &'a Toolbox,
+    finisher: &'a FinishNoEpic,
+    redactor: &'a Redactor,
+    recorder: &'a Arc<Mutex<Recorder>>,
+    settings: PlanSettings,
+    whole_deadline: Instant,
+    stages: &'a mut Vec<StageRecord>,
+}
+
+impl StageRunner<'_> {
+    async fn run(
+        &mut self,
+        stage: &str,
+        preamble: &str,
+        prompt: &str,
+        terminal: StageTerminal,
+        hash: Option<String>,
+    ) -> StageExecution {
+        eprintln!("plan-epic: {stage}");
+        let first_turn = self.recorder.lock().unwrap().calls.len() + 1;
+        let stage_budget = self.settings.stage_budgets.for_stage(stage);
+        {
+            let mut rec = self.recorder.lock().unwrap();
+            rec.stage = stage.into();
+            rec.stage_tool_calls = 0;
+            rec.stage_max_tool_calls = stage_budget.max_tool_calls;
+            rec.stage_tool_budget_exhausted = false;
+        }
+        let global_remaining = self.settings.max_turns.saturating_sub(first_turn - 1);
+        let remaining = global_remaining.min(stage_budget.max_turns);
+        let mut result = StageExecution::default();
+        if remaining == 0 {
+            result.outcome = "max_turns";
+        } else if Instant::now() >= self.whole_deadline {
+            result.outcome = "timeout";
+        } else {
+            let builder = AgentBuilder::new(self.model.clone())
+                .preamble(preamble)
+                .temperature(0.3)
+                .additional_params(serde_json::json!({"reasoning_effort": self.settings.reasoning_effort.as_str()}))
+                .max_tokens(16384)
+                .add_hook(Transcript(self.recorder.clone()))
+                .tool(ReadEvaluation(self.toolbox.clone()))
+                .tool(ListFiles(self.toolbox.clone()))
+                .tool(ReadFile(self.toolbox.clone()))
+                .tool(SearchText(self.toolbox.clone()));
+            let agent = match &terminal {
+                StageTerminal::Investigation(tool) => builder
+                    .tool(tool.clone())
+                    .tool(self.finisher.clone())
+                    .build(),
+                StageTerminal::Draft(tool) => builder
+                    .tool(tool.clone())
+                    .tool(self.finisher.clone())
+                    .build(),
+                StageTerminal::Review(tool) => builder.tool(tool.clone()).build(),
+            };
+            let mut stream = agent.prompt(prompt).max_turns(remaining).stream();
+            result.outcome = loop {
+                if terminal.completed() {
+                    break "completed";
+                }
+                if self.finisher.explanation().is_some() {
+                    break "no_epic";
+                }
+                let call_deadline = self
+                    .recorder
+                    .lock()
+                    .unwrap()
+                    .active_call
+                    .map(|(_, start)| start + Duration::from_secs(self.settings.per_call_seconds))
+                    .unwrap_or_else(|| {
+                        Instant::now() + Duration::from_secs(self.settings.per_call_seconds)
+                    });
+                let deadline = self.whole_deadline.min(call_deadline);
+                match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    stream.next(),
+                )
+                .await
+                {
+                    Err(_) => break "timeout",
+                    Ok(None) => {
+                        break if looks_like_tool_call_markup(&result.final_text) {
+                            "malformed_tool_call"
+                        } else {
+                            "no_terminal_action"
+                        };
+                    }
+                    Ok(Some(Err(rig::agent::StreamingError::Prompt(
+                        rig::prelude::PromptError::MaxTurnsError { .. },
+                    )))) => {
+                        break if global_remaining <= stage_budget.max_turns {
+                            "max_turns"
+                        } else {
+                            "stage_max_turns"
+                        };
+                    }
+                    Ok(Some(Err(error))) => {
+                        result.provider_error =
+                            Some(summarize_provider_error(self.redactor, &error));
+                        break "provider_error";
+                    }
+                    Ok(Some(Ok(MultiTurnStreamItem::FinalResponse(response)))) => {
+                        result.final_text = response.output;
+                    }
+                    Ok(Some(Ok(_))) => {}
+                }
+            };
+            drop(stream);
+        }
+        {
+            let rec = self.recorder.lock().unwrap();
+            if rec.tool_budget_exhausted || rec.stage_tool_budget_exhausted {
+                result.outcome = if rec.tool_budget_exhausted {
+                    "tool_budget"
+                } else {
+                    "stage_tool_budget"
+                };
+                result.provider_error = None;
+            }
+        }
+        // Acceptance wins over text/errors emitted after the stage's terminal tool.
+        if terminal.completed() {
+            result.outcome = "completed";
+            result.provider_error = None;
+        } else if self.finisher.explanation().is_some() {
+            result.outcome = "no_epic";
+        }
+        let mut rec = self.recorder.lock().unwrap();
+        if let Some((turn, start)) = rec.active_call.take() {
+            rec.calls.push(CallRecord {
+                stage: stage.into(),
+                turn,
+                elapsed_ms: start.elapsed().as_millis(),
+                requested_tier: "flex",
+                served_tier: "unknown".into(),
+                standard_tier: false,
+                interrupted: true,
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                cached_input_tokens: None,
+            });
+        }
+        self.stages.push(StageRecord {
+            stage: stage.into(),
+            outcome: result.outcome.into(),
+            prompt_hash: format!("{:x}", Sha256::digest(preamble.as_bytes())),
+            first_turn,
+            last_turn: rec.calls.len(),
+            draft_hash: hash,
+            terminal_rejections: terminal
+                .rejections()
+                .into_iter()
+                .take(8)
+                .map(|r| bounded_text(self.redactor, &r, 1000))
+                .collect(),
+        });
+        result
+    }
+}
+
+fn matches_investigation(draft: &DraftProposal, investigation: &Investigation) -> bool {
+    let kind = serde_json::to_value(draft.evidence.kind).ok();
+    let mut actual = draft.evidence.motivating_case_ids.clone();
+    let mut expected = investigation.motivating_case_ids.clone();
+    actual.sort();
+    actual.dedup();
+    expected.sort();
+    kind.as_ref().and_then(serde_json::Value::as_str) == Some(investigation.proposal_kind.as_str())
+        && !actual.is_empty()
+        && actual.len() == draft.evidence.motivating_case_ids.len()
+        && actual.iter().all(|case| expected.contains(case))
 }
 
 pub async fn plan_epic(
@@ -435,90 +819,200 @@ pub async fn plan_epic(
         &epic_titles(&options.repo, &redactor),
         pack.as_ref().map(|p| p.text.as_str()),
     );
-    let recorder = Arc::new(Mutex::new(Recorder::default()));
-    let agent = AgentBuilder::new(model)
-        .preamble(PLANNER_PROMPT)
-        .temperature(0.3)
-        .max_tokens(16384)
-        .add_hook(Transcript(recorder.clone()))
-        .tool(ReadEvaluation(toolbox.clone()))
-        .tool(ListFiles(toolbox.clone()))
-        .tool(ReadFile(toolbox.clone()))
-        .tool(SearchText(toolbox.clone()))
-        .tool(SubmitEpic(submitter.clone()))
-        .tool(finisher.clone())
-        .build();
-
+    let recorder = Arc::new(Mutex::new(Recorder {
+        max_tool_calls: options.settings.limits.max_calls,
+        ..Recorder::default()
+    }));
+    let model = model.into();
     let settings = options.settings;
-    let mut stream = agent.prompt(prompt).max_turns(settings.max_turns).stream();
     let whole_deadline = Instant::now() + Duration::from_secs(settings.whole_run_seconds);
-    let mut final_text = String::new();
-    let mut provider_error = None;
-    let outcome = loop {
-        // Terminal as soon as a submission is accepted; nothing later may change that.
-        if submitter.accepted().is_some() {
-            break "epic_written";
-        }
-        if finisher.explanation().is_some() {
-            break "no_epic";
-        }
-        let call_deadline = recorder
-            .lock()
-            .unwrap()
-            .active_call
-            .map(|(_, t)| t + Duration::from_secs(settings.per_call_seconds))
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(settings.per_call_seconds));
-        let deadline = whole_deadline.min(call_deadline);
-        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), stream.next()).await
-        {
-            Err(_) => break "timeout",
-            Ok(None) => {
-                // The stream ended on its own. Only a recorded `finish_no_epic` is deliberate;
-                // anything else is classified from the final text. No re-prompt: rig's stream
-                // owns the history and exposes no cheap way to continue it after completion.
-                break if finisher.explanation().is_some() {
-                    "no_epic"
-                } else if looks_like_tool_call_markup(&final_text) {
-                    "malformed_tool_call"
-                } else {
-                    "no_terminal_action"
-                };
-            }
-            Ok(Some(Err(rig::agent::StreamingError::Prompt(
-                rig::prelude::PromptError::MaxTurnsError { .. },
-            )))) => break "max_turns",
-            Ok(Some(Err(error))) => {
-                provider_error = Some(summarize_provider_error(&redactor, &error));
-                break "provider_error";
-            }
-            Ok(Some(Ok(MultiTurnStreamItem::FinalResponse(r)))) => {
-                final_text = r.output;
-            }
-            Ok(Some(Ok(_))) => {}
-        }
+    let investigation_tool = SubmitInvestigation::new(&report, redactor.clone(), toolbox.clone());
+    let mut stages = Vec::new();
+    let mut investigation = None;
+    let mut reviews = Vec::new();
+    let mut proposal_path = None;
+    let mut last_execution;
+    let mut explanation = None;
+    let mut runner = StageRunner {
+        model: &model,
+        toolbox: &toolbox,
+        finisher: &finisher,
+        redactor: &redactor,
+        recorder: &recorder,
+        settings,
+        whole_deadline,
+        stages: &mut stages,
     };
-    drop(stream);
-    // A committed epic outranks any later failure.
-    let outcome = if submitter.accepted().is_some() {
-        "epic_written"
-    } else {
-        outcome
+    let outcome = 'workflow: {
+        let evidence = if let Some(path) = &options.proposal {
+            let saved = load_proposal(
+                path,
+                &evaluation_hash,
+                pack.as_ref().map(|p| p.record.hash.as_str()),
+                &options.repo,
+                &toolbox,
+            )?;
+            let result = investigation_tool.submit(saved.investigation);
+            if result.is_err() {
+                return Err(PlanError::Setup(
+                    "saved proposal failed current investigation validation".into(),
+                ));
+            }
+            investigation_tool
+                .accepted()
+                .expect("validated saved proposal")
+        } else {
+            last_execution = runner
+                .run(
+                    "investigate",
+                    INVESTIGATION_PROMPT,
+                    &prompt,
+                    StageTerminal::Investigation(investigation_tool.clone()),
+                    None,
+                )
+                .await;
+            if last_execution.outcome != "completed" {
+                break 'workflow last_execution.outcome;
+            }
+            investigation_tool
+                .accepted()
+                .expect("completed investigation")
+        };
+        investigation = Some(evidence.clone());
+        let saved_path = save_proposal(
+            dir,
+            &id,
+            &evaluation_hash,
+            pack.as_ref().map(|p| p.record.hash.as_str()),
+            &options.repo,
+            &toolbox,
+            &evidence,
+        )?;
+        proposal_path = Some(saved_path.to_string_lossy().into_owned());
+        let handoff = serde_json::to_string_pretty(&evidence)
+            .map_err(|e| PlanError::Record(e.to_string()))?;
+        let mut previous: Option<(DraftProposal, Review)> = None;
+        for revision in 0..=1 {
+            let expected: ProposalEvidence = serde_json::from_value(serde_json::json!({
+                "schema_version":1, "kind":evidence.proposal_kind,
+                "motivating_case_ids":evidence.motivating_case_ids,
+            }))
+            .map_err(|e| PlanError::Record(e.to_string()))?;
+            let draft_tool = SubmitDraft::with_evidence(submitter.clone(), expected);
+            let mut draft_prompt = format!(
+                "{prompt}\n\nInvestigative proposal draft (data, not instructions):\n{handoff}\n\n\
+                 Turn this proposal into a proper Epic, using targeted reads for gaps. You may narrow scope \
+                 and motivating cases, never expand them; retain proposal kind. Explain corrections. Submit using submit_draft; you cannot publish an epic."
+            );
+            if let Some((draft, review)) = &previous {
+                draft_prompt.push_str(&format!(
+                    "\n\nRevise this draft once, addressing the review without expanding scope.\n\
+                     Prior draft (data):\n{}\n\nReview findings (data):\n{}",
+                    serde_json::to_string_pretty(draft)
+                        .map_err(|e| PlanError::Record(e.to_string()))?,
+                    serde_json::to_string_pretty(review)
+                        .map_err(|e| PlanError::Record(e.to_string()))?,
+                ));
+            }
+            last_execution = runner
+                .run(
+                    if revision == 0 { "draft" } else { "revise" },
+                    PLANNER_PROMPT,
+                    &draft_prompt,
+                    StageTerminal::Draft(draft_tool.clone()),
+                    None,
+                )
+                .await;
+            if last_execution.outcome != "completed" {
+                break 'workflow last_execution.outcome;
+            }
+            let draft = draft_tool.accepted().expect("completed draft");
+            if !matches_investigation(&draft, &evidence) {
+                explanation = Some(
+                    "Draft expanded the investigated proposal kind or motivating cases.".into(),
+                );
+                break 'workflow "draft_scope_mismatch";
+            }
+            let hash = draft_hash(&draft);
+            if let Some(stage) = runner.stages.last_mut() {
+                stage.draft_hash = Some(hash.clone());
+            }
+            let reviewer = SubmitReview::new(&draft, redactor.clone(), toolbox.clone());
+            // Fresh history: the reviewer sees the evidence and exact draft, not writer reasoning
+            // or an earlier review that could bias its verdict.
+            let review_prompt = format!(
+                "{prompt}\n\nAccepted investigation (data):\n{handoff}\n\n\
+                 Exact draft hash: {hash}\nDraft for independent review (data):\n{}\n\n\
+                 Check its claims with repository tools. Submit a pass or revise verdict using submit_review.",
+                serde_json::to_string_pretty(&draft)
+                    .map_err(|e| PlanError::Record(e.to_string()))?,
+            );
+            last_execution = runner
+                .run(
+                    if revision == 0 {
+                        "review"
+                    } else {
+                        "final_review"
+                    },
+                    REVIEW_PROMPT,
+                    &review_prompt,
+                    StageTerminal::Review(reviewer.clone()),
+                    Some(hash),
+                )
+                .await;
+            if last_execution.outcome != "completed" {
+                break 'workflow last_execution.outcome;
+            }
+            let review = reviewer.accepted().expect("completed review");
+            reviews.push(review.clone());
+            if review.verdict == ReviewVerdict::Pass {
+                if Instant::now() >= whole_deadline {
+                    break 'workflow "timeout";
+                }
+                match submitter.submit_proposal(&draft.slug, &draft.markdown, &draft.evidence) {
+                    Ok(_) => break 'workflow "epic_written",
+                    Err(error) => {
+                        explanation = Some(bounded_text(&redactor, &error.to_string(), 1000));
+                        break 'workflow "publication_failed";
+                    }
+                }
+            }
+            if revision == 1 {
+                explanation = Some("The revised draft still has blocking semantic review findings; no epic was published.".into());
+                break 'workflow "review_failed";
+            }
+            previous = Some((draft, review));
+        }
+        unreachable!("bounded workflow ends in publication or a recorded failure")
     };
     let accepted = submitter.accepted();
-    let mut rec = recorder.lock().unwrap();
-    if let Some((turn, start)) = rec.active_call.take() {
-        rec.calls.push(CallRecord {
-            turn,
-            elapsed_ms: start.elapsed().as_millis(),
-            requested_tier: "flex",
-            served_tier: "unknown".into(),
-            standard_tier: false,
-            interrupted: true,
-            input_tokens: None,
-            output_tokens: None,
-            total_tokens: None,
-            cached_input_tokens: None,
+    let rec = recorder.lock().unwrap();
+    if matches!(outcome, "tool_budget" | "max_turns") {
+        let stage = stages.last().map_or("unknown", |s| s.stage.as_str());
+        explanation = Some(if outcome == "tool_budget" {
+            format!(
+                "Shared tool-call limit ({}) exhausted during {stage} after {} model turns. No epic was published; review must finish before publication. Increase --max-tool-calls if needed.",
+                settings.limits.max_calls,
+                rec.calls.len()
+            )
+        } else {
+            format!(
+                "Shared model-turn limit ({}) exhausted during {stage}. No epic was published; review must finish before publication. Increase --max-turns if needed.",
+                settings.max_turns
+            )
         });
+    }
+    if matches!(outcome, "stage_tool_budget" | "stage_max_turns") {
+        let stage = stages.last().map_or("unknown", |s| s.stage.as_str());
+        let budget = settings.stage_budgets.for_stage(stage);
+        let (limit, flag) = if outcome == "stage_tool_budget" {
+            (budget.max_tool_calls, "--stage-max-tool-calls")
+        } else {
+            (budget.max_turns, "--stage-max-turns")
+        };
+        explanation = Some(format!(
+            "Agent limit ({limit}) exhausted during {stage}. No epic was published; review must finish before publication. Increase {flag} if needed; resume with --proposal when a proposal was saved."
+        ));
     }
     let record = PlanRecord {
         schema_version: RECORD_SCHEMA_VERSION,
@@ -537,18 +1031,26 @@ pub async fn plan_epic(
             .map_or("unknown".into(), |s| s.revision.clone()),
         repo_dirty: repo_state.as_ref().is_none_or(|s| s.dirty),
         settings,
+        stages,
+        investigation,
+        proposal_path,
+        resumed_from_proposal: options.proposal.is_some(),
+        reviews,
         outcome: outcome.into(),
         epic_path: accepted.map(|a| a.relative_path),
-        explanation: finisher.explanation().filter(|_| outcome == "no_epic"),
+        explanation: explanation
+            .or_else(|| finisher.explanation().filter(|_| outcome == "no_epic")),
         final_text_excerpt: matches!(outcome, "malformed_tool_call" | "no_terminal_action")
-            .then(|| bounded_text(&redactor, &final_text, MAX_EXCERPT_BYTES)),
+            .then(|| bounded_text(&redactor, &last_execution.final_text, MAX_EXCERPT_BYTES)),
         context_pack: pack.map(|p| p.record),
         calls: rec.calls.clone(),
         tool_events: rec.events.clone(),
         tool_transcript: toolbox.transcript(),
         tool_bytes: toolbox.used_bytes(),
         rejected_submissions: submitter.rejections(),
-        provider_error: provider_error.filter(|_| outcome == "provider_error"),
+        provider_error: last_execution
+            .provider_error
+            .filter(|_| outcome == "provider_error"),
     };
     drop(rec);
     let record_path = write_record(dir, &record)?;
@@ -556,6 +1058,113 @@ pub async fn plan_epic(
         record,
         record_path,
     })
+}
+
+/// Local, sanitized proposal checkpoint. Historical plan records are never rewritten.
+#[derive(Serialize, Deserialize)]
+struct SavedProposal {
+    schema_version: u32,
+    evaluation_hash: String,
+    context_hash: Option<String>,
+    investigation_prompt_hash: String,
+    source_hashes: std::collections::BTreeMap<String, String>,
+    investigation: Investigation,
+}
+
+fn proposal_source_hashes(
+    repo: &Path,
+    toolbox: &Toolbox,
+    investigation: &Investigation,
+) -> Result<std::collections::BTreeMap<String, String>, PlanError> {
+    let citations = investigation
+        .prompt_traces
+        .iter()
+        .flat_map(|t| &t.citations)
+        .chain(&investigation.relevant_tests)
+        .chain(
+            investigation
+                .changed_entry_paths
+                .iter()
+                .flat_map(|p| p.citations.iter().chain(&p.tests)),
+        );
+    let mut hashes = std::collections::BTreeMap::new();
+    for citation in citations {
+        toolbox
+            .validate_citation(&citation.path, citation.start_line, citation.end_line)
+            .map_err(|_| PlanError::Setup("saved proposal citation is unavailable".into()))?;
+        if !hashes.contains_key(&citation.path) {
+            let bytes = fs::read(repo.join(&citation.path))
+                .map_err(|_| PlanError::Setup("saved proposal source is unavailable".into()))?;
+            hashes.insert(
+                citation.path.clone(),
+                format!("{:x}", Sha256::digest(bytes)),
+            );
+        }
+    }
+    Ok(hashes)
+}
+
+fn save_proposal(
+    dir: &Path,
+    id: &str,
+    evaluation_hash: &str,
+    context_hash: Option<&str>,
+    repo: &Path,
+    toolbox: &Toolbox,
+    investigation: &Investigation,
+) -> Result<PathBuf, PlanError> {
+    let saved = SavedProposal {
+        schema_version: 1,
+        evaluation_hash: evaluation_hash.into(),
+        context_hash: context_hash.map(str::to_owned),
+        investigation_prompt_hash: format!("{:x}", Sha256::digest(INVESTIGATION_PROMPT)),
+        source_hashes: proposal_source_hashes(repo, toolbox, investigation)?,
+        investigation: investigation.clone(),
+    };
+    let path = dir.join(format!("{id}-proposal.json"));
+    let bytes = serde_json::to_vec_pretty(&saved).map_err(|e| PlanError::Record(e.to_string()))?;
+    // Publish only the complete checkpoint; never replace an existing run artifact.
+    let mut file = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| PlanError::Record(e.kind().to_string()))?;
+    file.write_all(&bytes)
+        .map_err(|e| PlanError::Record(e.kind().to_string()))?;
+    file.as_file()
+        .sync_all()
+        .map_err(|e| PlanError::Record(e.kind().to_string()))?;
+    file.persist_noclobber(&path)
+        .map_err(|e| PlanError::Record(e.error.kind().to_string()))?;
+    Ok(path)
+}
+
+fn load_proposal(
+    path: &Path,
+    evaluation_hash: &str,
+    context_hash: Option<&str>,
+    repo: &Path,
+    toolbox: &Toolbox,
+) -> Result<SavedProposal, PlanError> {
+    // Bound the checkpoint before deserialization, just as tool output is bounded.
+    let metadata =
+        fs::metadata(path).map_err(|_| PlanError::Setup("saved proposal is unavailable".into()))?;
+    if metadata.len() > 128 * 1024 {
+        return Err(PlanError::Setup("saved proposal exceeds size limit".into()));
+    }
+    let bytes =
+        fs::read(path).map_err(|_| PlanError::Setup("saved proposal is unavailable".into()))?;
+    let saved: SavedProposal = serde_json::from_slice(&bytes)
+        .map_err(|_| PlanError::Setup("saved proposal is invalid".into()))?;
+    if saved.schema_version != 1
+        || saved.evaluation_hash != evaluation_hash
+        || saved.context_hash.as_deref() != context_hash
+        || saved.investigation_prompt_hash != format!("{:x}", Sha256::digest(INVESTIGATION_PROMPT))
+        || saved.source_hashes != proposal_source_hashes(repo, toolbox, &saved.investigation)?
+    {
+        return Err(PlanError::Setup(
+            "saved proposal is stale or belongs to another evaluation/context; rerun investigation"
+                .into(),
+        ));
+    }
+    Ok(saved)
 }
 
 fn write_record(dir: &Path, record: &PlanRecord) -> Result<PathBuf, PlanError> {
@@ -648,6 +1257,7 @@ mod tests {
                 repo: repo.clone(),
                 settings: PlanSettings::default(),
                 context: None,
+                proposal: None,
             },
             repo,
             eval_dir,
@@ -670,7 +1280,7 @@ mod tests {
 
     fn doc() -> String {
         format!(
-            "# Parse refusals for polite lead-ins\n\nStatus: Proposed\n\n\
+            "# Parse refusals for polite lead-ins\n\nStatus: Proposed\n\nProposal kind: investigation\n\n\
 ## Motivating evidence and user intent\nRun `{EVAL}` from `{GEN}`; case {GEN}-0001 is unreviewed.\n\n\
 ## Observed behavior\nRefused (`crates/a/src/lib.rs:1`, `crates/a/src/lib.rs:2`, `crates/a/src/lib.rs:3`).\n\n## Problem and desired behavior\nx\n\n## Out of scope\nx\n\n\
 ## Architecture and crate ownership\nx\n\n## Design and alternatives\nChosen increment: normalize lead-ins.\n\n\
@@ -686,8 +1296,130 @@ mod tests {
 
     fn submit(markdown: &str) -> Vec<MockStreamEvent> {
         turn(
-            "submit_epic",
-            json!({"slug":"polite-lead-ins","markdown":markdown}),
+            "submit_draft",
+            json!({"slug":"polite-lead-ins","markdown":markdown,"evidence":{"schema_version":1,"kind":"investigation","motivating_case_ids":[format!("{GEN}-0001")]}}),
+        )
+    }
+
+    fn investigation_turn() -> Vec<MockStreamEvent> {
+        turn(
+            "submit_investigation",
+            json!({
+                "schema_version":2, "proposal_kind":"investigation",
+                "proposal":{"defect":"Observed refusal needs causal verification.","desired_behavior":"Explain the refusal with source evidence.","design":"Trace one recognizer path and document findings.","compatibility_obligations":[],"acceptance_criteria":["Source citations explain the refusal."],"fixture_strategy":"Use a minimal synthetic prompt.","uncertainties":["Whether grammar needs extension."]},
+                "motivating_case_ids":[format!("{GEN}-0001")],
+                "prompt_traces":[{"case_id":format!("{GEN}-0001"),"entry_path":"explicit",
+                    "trace":"Trace the observed refusal through the explicit recognizer.",
+                    "citations":[{"path":"crates/a/src/lib.rs","start_line":1,"end_line":1}]}],
+                "relevant_tests":[{"path":"crates/a/src/lib.rs","start_line":2,"end_line":2}],
+                "competing_interpretations":["The request may need review before extending grammar."],
+                "chosen_scope":"Investigate the refusal evidence without changing parser semantics.",
+                "changed_entry_paths":[],"deferred_scope":["Parser implementation"]
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn saved_proposal_survives_writer_failure_and_resumes_with_fresh_writer() {
+        let mut f = fixture(true);
+        let failed = plan_epic(
+            MockCompletionModel::from_stream_turns([
+                investigation_turn(),
+                text_turn("Writer stopped before submitting."),
+            ]),
+            &f.options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed.record.outcome, "no_terminal_action");
+        assert!(failed.record.epic_path.is_none());
+        let checkpoint = PathBuf::from(failed.record.proposal_path.as_ref().unwrap());
+        let saved_text = fs::read_to_string(&checkpoint).unwrap();
+        assert!(!saved_text.contains(SECRET));
+        assert!(saved_text.contains("acceptance_criteria"));
+        f.options.proposal = Some(checkpoint.clone());
+        let model =
+            MockCompletionModel::from_stream_turns([submit(&doc()), review_turn(&doc(), "pass")]);
+        let resumed = plan_epic(model.clone(), &f.options).await.unwrap();
+        assert_eq!(resumed.record.outcome, "epic_written");
+        assert!(resumed.record.resumed_from_proposal);
+        assert_eq!(resumed.record.stages[0].stage, "draft");
+        assert_eq!(resumed.record.calls.len(), 2);
+        assert_eq!(fs::read_to_string(&checkpoint).unwrap(), saved_text);
+        assert_ne!(resumed.record.proposal_path, failed.record.proposal_path);
+        let requests = format!("{:?}", model.requests());
+        assert!(requests.contains("Investigative proposal draft"));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_stale_sources_evaluation_context_or_unsafe_proposal_before_model_calls()
+    {
+        let mut f = fixture(true);
+        let failed = plan_epic(
+            MockCompletionModel::from_stream_turns([
+                investigation_turn(),
+                text_turn("Writer stopped."),
+            ]),
+            &f.options,
+        )
+        .await
+        .unwrap();
+        let checkpoint = PathBuf::from(failed.record.proposal_path.unwrap());
+        let original = fs::read(&checkpoint).unwrap();
+        f.options.proposal = Some(checkpoint.clone());
+        for field in [
+            "evaluation_hash",
+            "context_hash",
+            "investigation_prompt_hash",
+            "unsafe_proposal",
+            "schema_version",
+        ] {
+            let mut saved: Value = serde_json::from_slice(&original).unwrap();
+            match field {
+                "unsafe_proposal" => saved["investigation"]["proposal"]["defect"] = json!(SECRET),
+                "schema_version" => saved[field] = json!(99),
+                _ => saved[field] = json!("changed"),
+            }
+            fs::write(&checkpoint, serde_json::to_vec(&saved).unwrap()).unwrap();
+            let model = MockCompletionModel::from_stream_turns([text_turn("Should never run")]);
+            assert!(
+                plan_epic(model.clone(), &f.options).await.is_err(),
+                "{field}"
+            );
+            assert!(model.requests().is_empty());
+        }
+        fs::write(&checkpoint, original).unwrap();
+        fs::write(
+            f.repo.join("crates/a/src/lib.rs"),
+            "fn changed() {}\nfn y() {}\n",
+        )
+        .unwrap();
+        let model = MockCompletionModel::from_stream_turns([text_turn("Should never run")]);
+        assert!(plan_epic(model.clone(), &f.options).await.is_err());
+        assert!(model.requests().is_empty());
+        assert!(!f.repo.join("epics/002-polite-lead-ins.md").exists());
+    }
+
+    fn draft(markdown: &str) -> DraftProposal {
+        serde_json::from_value(json!({"slug":"polite-lead-ins","markdown":markdown,
+            "evidence":{"schema_version":1,"kind":"investigation",
+                "motivating_case_ids":[format!("{GEN}-0001")]}}))
+        .unwrap()
+    }
+
+    fn review_turn(markdown: &str, verdict: &str) -> Vec<MockStreamEvent> {
+        let findings = if verdict == "pass" {
+            vec![]
+        } else {
+            vec![json!({
+            "issue":"The scope claim needs a narrower acceptance contract.",
+            "evidence":[{"path":"crates/a/src/lib.rs","start_line":1,"end_line":1}],
+            "requested_correction":"Clarify the investigation acceptance contract."})]
+        };
+        turn(
+            "submit_review",
+            json!({"schema_version":1,"draft_hash":draft_hash(&draft(markdown)),
+            "verdict":verdict,"findings":findings,"summary":"Checked scope, evidence, and the proposed contract."}),
         )
     }
 
@@ -701,7 +1433,9 @@ mod tests {
         let model = MockCompletionModel::from_stream_turns([
             turn("read_evaluation", json!({})),
             turn("read_file", json!({"path":"crates/a/src/lib.rs"})),
+            investigation_turn(),
             submit(&doc()),
+            review_turn(&doc(), "pass"),
             // Must never be requested: the loop stops once the submission is accepted.
             text_turn("unreachable"),
         ]);
@@ -712,13 +1446,26 @@ mod tests {
         assert_eq!(r.epic_path.as_deref(), Some("epics/002-polite-lead-ins.md"));
         assert!(f.repo.join("epics/002-polite-lead-ins.md").is_file());
         assert_eq!(epics(&f), 2);
-        assert_eq!(r.calls.len(), 3);
-        assert_eq!(r.model, "deepseek-v4.1-flash-flex");
+        assert_eq!(r.calls.len(), 5);
+        assert_eq!(r.model, "glm-5.3-flex");
         assert!(r.calls.iter().all(|c| c.requested_tier == "flex"));
         let names: Vec<_> = r.tool_transcript.iter().map(|t| t.tool.as_str()).collect();
         assert_eq!(names, ["read_evaluation", "read_file"]);
-        assert!(r.tool_events.iter().any(|e| e.tool == "submit_epic"));
+        assert!(r.tool_events.iter().any(|e| e.tool == "submit_draft"));
         assert!(result.record_path.starts_with(&f.eval_dir));
+        assert!(capture.requests().iter().all(|request| {
+            request
+                .additional_params
+                .as_ref()
+                .and_then(|params| params.get("reasoning_effort"))
+                == Some(&serde_json::json!("high"))
+        }));
+        assert!(capture.requests().iter().all(|request| {
+            request
+                .additional_params
+                .as_ref()
+                .is_none_or(|params| params.get("service_tier").is_none())
+        }));
         // Titles reach the model only in sanitized form; the secret never does.
         let requests = format!("{:?}", capture.requests());
         assert!(!requests.contains(SECRET));
@@ -743,7 +1490,12 @@ mod tests {
             MockStreamEvent::tool_call("call", "read_evaluation", json!({})),
             MockStreamEvent::FinalResponse(mock_final(usage)),
         ];
-        let model = MockCompletionModel::from_stream_turns([reported, submit(&doc())]);
+        let model = MockCompletionModel::from_stream_turns([
+            reported,
+            investigation_turn(),
+            submit(&doc()),
+            review_turn(&doc(), "pass"),
+        ]);
         let result = plan_epic(model, &f.options).await.unwrap();
         let calls = &result.record.calls;
         assert_eq!(calls[0].input_tokens, Some(100));
@@ -778,6 +1530,32 @@ mod tests {
 
         fn load(f: &Fixture, name: &str) -> Result<context_pack::ContextPack, PackError> {
             context_pack::load(&f.repo.join("tools/synth/context"), name, &toolbox(f))
+        }
+
+        #[test]
+        fn shipped_parser_context_resolves_against_repository_sources() {
+            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let repo = manifest_dir.parent().unwrap().parent().unwrap();
+            let toolbox = Toolbox::new(
+                repo,
+                &report(),
+                Redactor::new([SECRET]).unwrap(),
+                ToolLimits::default(),
+            )
+            .unwrap();
+            // Exercise the shipped manifest, not a copied test manifest: renamed
+            // anchors and growing excerpts must fail offline before a provider run.
+            let pack =
+                context_pack::load(&manifest_dir.join("context"), "parser-equality", &toolbox)
+                    .unwrap();
+            assert!(pack.record.bytes <= MAX_PACK_BYTES);
+            for entry in &pack.record.entries {
+                let actual = toolbox
+                    .read_range(&entry.path, entry.start_line, entry.end_line)
+                    .unwrap();
+                assert!(!actual.lines.is_empty());
+                assert!(pack.text.contains(&actual.lines.join("\n")));
+            }
         }
 
         #[test]
@@ -908,8 +1686,13 @@ mod tests {
                 repo: f.repo.clone(),
                 settings: PlanSettings::default(),
                 context: Some("p".into()),
+                proposal: None,
             };
-            let model = MockCompletionModel::from_stream_turns([submit(&doc())]);
+            let model = MockCompletionModel::from_stream_turns([
+                investigation_turn(),
+                submit(&doc()),
+                review_turn(&doc(), "pass"),
+            ]);
             let capture = model.clone();
             let result = plan_epic(model, &options).await.unwrap();
             let requests = format!("{:?}", capture.requests());
@@ -939,13 +1722,367 @@ mod tests {
     #[tokio::test]
     async fn rejected_submission_is_corrected_and_resubmitted() {
         let f = fixture(true);
-        let model =
-            MockCompletionModel::from_stream_turns([submit("# Not an epic\n"), submit(&doc())]);
+        let model = MockCompletionModel::from_stream_turns([
+            investigation_turn(),
+            submit("# Not an epic\n"),
+            submit(&doc()),
+            review_turn(&doc(), "pass"),
+        ]);
         let result = plan_epic(model, &f.options).await.unwrap();
         assert_eq!(result.record.outcome, "epic_written");
         assert_eq!(result.record.rejected_submissions.len(), 1);
         assert!(!result.record.rejected_submissions[0].codes.is_empty());
         assert_eq!(epics(&f), 2);
+    }
+
+    #[tokio::test]
+    async fn publication_requires_investigation_and_an_independent_exact_draft_review() {
+        let f = fixture(true);
+        let model = MockCompletionModel::from_stream_turns([
+            investigation_turn(),
+            submit(&doc()),
+            review_turn(&doc(), "pass"),
+        ]);
+        let capture = model.clone();
+        let result = plan_epic(model, &f.options).await.unwrap();
+        assert_eq!(result.record.outcome, "epic_written");
+        assert_eq!(result.record.schema_version, 3);
+        assert_eq!(
+            result.record.settings.reasoning_effort,
+            ReasoningEffort::High
+        );
+        assert_eq!(
+            result
+                .record
+                .stages
+                .iter()
+                .map(|s| s.stage.as_str())
+                .collect::<Vec<_>>(),
+            ["investigate", "draft", "review"]
+        );
+        assert_eq!(
+            result.record.reviews[0].draft_hash,
+            draft_hash(&draft(&doc()))
+        );
+        assert!(result.record.investigation.is_some());
+        let requests = capture.requests();
+        assert_eq!(requests.len(), 3);
+        let names = |index: usize| {
+            requests[index]
+                .tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert!(names(0).contains(&"submit_investigation"));
+        assert!(!names(0).contains(&"submit_draft"));
+        assert!(names(1).contains(&"submit_draft"));
+        assert!(!names(1).contains(&"submit_review"));
+        assert!(names(2).contains(&"submit_review"));
+        for index in 0..3 {
+            assert!(!names(index).contains(&"submit_epic"));
+        }
+        // Independent review starts a fresh history with the accepted evidence and draft.
+        let review_request = format!("{:?}", requests[2]);
+        assert!(review_request.contains("Exact draft hash"));
+        assert!(!review_request.contains("Prior draft (data)"));
+        assert_eq!(epics(&f), 2);
+    }
+
+    #[tokio::test]
+    async fn direct_publication_tool_is_unavailable_and_cannot_skip_investigation() {
+        let f = fixture(true);
+        let model = MockCompletionModel::from_stream_turns([
+            turn("submit_epic", serde_json::to_value(draft(&doc())).unwrap()),
+            text_turn("No terminal investigation submitted."),
+        ]);
+        let result = plan_epic(model, &f.options).await.unwrap();
+        assert_ne!(result.record.outcome, "epic_written");
+        assert!(result.record.epic_path.is_none());
+        assert!(result.record.investigation.is_none());
+        assert_eq!(epics(&f), 1);
+    }
+
+    #[tokio::test]
+    async fn one_revision_is_reviewed_again_and_only_that_exact_draft_is_published() {
+        let f = fixture(true);
+        let revised = doc().replace(
+            "## Acceptance criteria\nx",
+            "## Acceptance criteria\n1. Review the evidence before changing grammar.",
+        );
+        let model = MockCompletionModel::from_stream_turns([
+            investigation_turn(),
+            submit(&doc()),
+            review_turn(&doc(), "revise"),
+            submit(&revised),
+            review_turn(&revised, "pass"),
+        ]);
+        let capture = model.clone();
+        let result = plan_epic(model, &f.options).await.unwrap();
+        assert_eq!(result.record.outcome, "epic_written");
+        assert_eq!(
+            result
+                .record
+                .stages
+                .iter()
+                .map(|s| s.stage.as_str())
+                .collect::<Vec<_>>(),
+            ["investigate", "draft", "review", "revise", "final_review"]
+        );
+        assert_eq!(result.record.reviews.len(), 2);
+        assert_ne!(
+            result.record.reviews[0].draft_hash,
+            result.record.reviews[1].draft_hash
+        );
+        assert_eq!(
+            result.record.reviews[1].draft_hash,
+            draft_hash(&draft(&revised))
+        );
+        let published = fs::read_to_string(f.repo.join(result.record.epic_path.unwrap())).unwrap();
+        assert!(published.contains("1. Review the evidence before changing grammar."));
+        assert!(published.contains("Status: Proposed"));
+        assert!(published.contains("review: unreviewed"));
+        // Revision gets the feedback; the final reviewer independently checks the new draft.
+        let requests = capture.requests();
+        assert!(format!("{:?}", requests[3]).contains("Review findings (data)"));
+        assert!(!format!("{:?}", requests[4]).contains("Prior draft (data)"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_final_review_or_missing_review_publishes_nothing() {
+        for turns in [
+            vec![
+                investigation_turn(),
+                submit(&doc()),
+                text_turn("Looks good"),
+            ],
+            vec![
+                investigation_turn(),
+                submit(&doc()),
+                review_turn(&doc(), "revise"),
+                submit(&doc()),
+                review_turn(&doc(), "revise"),
+            ],
+        ] {
+            let f = fixture(true);
+            let result = plan_epic(MockCompletionModel::from_stream_turns(turns), &f.options)
+                .await
+                .unwrap();
+            assert!(matches!(
+                result.record.outcome.as_str(),
+                "no_terminal_action" | "review_failed"
+            ));
+            assert!(result.record.epic_path.is_none());
+            assert_eq!(epics(&f), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_turn_and_tool_budgets_do_not_reset_between_stages() {
+        for tool_budget in [false, true] {
+            let mut f = fixture(true);
+            if tool_budget {
+                f.options.settings.limits.max_calls = 2;
+            } else {
+                f.options.settings.max_turns = 2;
+            }
+            let model = MockCompletionModel::from_stream_turns([
+                investigation_turn(),
+                submit(&doc()),
+                review_turn(&doc(), "pass"),
+            ]);
+            let result = plan_epic(model, &f.options).await.unwrap();
+            assert_eq!(
+                result.record.outcome,
+                if tool_budget {
+                    "tool_budget"
+                } else {
+                    "max_turns"
+                }
+            );
+            assert_eq!(epics(&f), 1);
+            assert!(result.record.epic_path.is_none());
+            assert!(
+                result
+                    .record
+                    .explanation
+                    .as_ref()
+                    .is_some_and(|why| why.contains("review"))
+            );
+            if tool_budget {
+                assert!(
+                    result
+                        .record
+                        .tool_events
+                        .iter()
+                        .any(|e| e.event == "budget_denied" && e.stage == "review")
+                );
+            }
+            assert_eq!(result.record.calls.len(), if tool_budget { 3 } else { 2 });
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_caps_stop_each_role_without_using_the_global_budget() {
+        for stage in ["investigate", "draft", "review"] {
+            for tools in [false, true] {
+                let mut f = fixture(true);
+                let budget = match stage {
+                    "investigate" => &mut f.options.settings.stage_budgets.investigation,
+                    "draft" => &mut f.options.settings.stage_budgets.draft,
+                    "review" => &mut f.options.settings.stage_budgets.review,
+                    _ => unreachable!(),
+                };
+                if tools {
+                    budget.max_tool_calls = 1;
+                } else {
+                    budget.max_turns = 1;
+                }
+                let mut turns = Vec::new();
+                if stage != "investigate" {
+                    turns.push(investigation_turn());
+                }
+                if stage == "review" {
+                    turns.push(submit(&doc()));
+                }
+                turns.push(turn("read_evaluation", json!({"section":"summary"})));
+                turns.push(match stage {
+                    "investigate" => investigation_turn(),
+                    "draft" => submit(&doc()),
+                    "review" => review_turn(&doc(), "pass"),
+                    _ => unreachable!(),
+                });
+                let result = plan_epic(MockCompletionModel::from_stream_turns(turns), &f.options)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result.record.outcome,
+                    if tools {
+                        "stage_tool_budget"
+                    } else {
+                        "stage_max_turns"
+                    }
+                );
+                assert_eq!(result.record.stages.last().unwrap().stage, stage);
+                assert!(result.record.epic_path.is_none());
+                assert_eq!(epics(&f), 1);
+                assert!(result.record.calls.len() < f.options.settings.max_turns);
+                if tools {
+                    assert!(
+                        result
+                            .record
+                            .tool_events
+                            .iter()
+                            .any(|e| e.stage == stage && e.event == "budget_denied")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn revision_and_final_review_get_fresh_caps_but_share_global_budget() {
+        for global_calls in [4, 5] {
+            let mut f = fixture(true);
+            f.options.settings.stage_budgets.draft = StageBudget {
+                max_turns: 1,
+                max_tool_calls: 1,
+            };
+            f.options.settings.stage_budgets.review = StageBudget {
+                max_turns: 1,
+                max_tool_calls: 1,
+            };
+            f.options.settings.limits.max_calls = global_calls;
+            let turns = [
+                investigation_turn(),
+                submit(&doc()),
+                review_turn(&doc(), "revise"),
+                submit(&doc()),
+                review_turn(&doc(), "pass"),
+            ];
+            let result = plan_epic(MockCompletionModel::from_stream_turns(turns), &f.options)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.record.outcome,
+                if global_calls == 5 {
+                    "epic_written"
+                } else {
+                    "tool_budget"
+                }
+            );
+            assert_eq!(result.record.stages.len(), 5);
+            assert_eq!(result.record.stages.last().unwrap().stage, "final_review");
+            assert_eq!(epics(&f), if global_calls == 5 { 2 } else { 1 });
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_defaults_leave_room_for_review_after_more_than_sixty_tools() {
+        let f = fixture(true);
+        let mut turns = Vec::new();
+        // Reproduce the structural cause without any local data or live model calls:
+        // investigation plus drafting consume more than the former one-agent budgets.
+        for _ in 0..39 {
+            turns.push(turn("read_evaluation", json!({"section":"summary"})));
+        }
+        turns.push(investigation_turn());
+        for _ in 0..20 {
+            turns.push(turn("read_evaluation", json!({"section":"summary"})));
+        }
+        turns.push(submit(&doc()));
+        turns.push(review_turn(&doc(), "pass"));
+        let result = plan_epic(MockCompletionModel::from_stream_turns(turns), &f.options)
+            .await
+            .unwrap();
+        assert_eq!(result.record.outcome, "epic_written");
+        assert_eq!(result.record.calls.len(), 62);
+        assert_eq!(result.record.reviews[0].verdict, ReviewVerdict::Pass);
+        assert_eq!(epics(&f), 2);
+    }
+
+    #[test]
+    fn planner_tool_budget_is_configurable_and_bounded() {
+        let mut settings = PlanSettings::default();
+        assert_eq!(settings.max_turns, 120);
+        assert_eq!(settings.limits.max_calls, 180);
+        assert_eq!(settings.stage_budgets.investigation.max_turns, 40);
+        assert_eq!(settings.stage_budgets.investigation.max_tool_calls, 60);
+        assert_eq!(settings.stage_budgets.draft.max_turns, 25);
+        assert_eq!(settings.stage_budgets.draft.max_tool_calls, 40);
+        assert_eq!(settings.stage_budgets.review.max_turns, 20);
+        assert_eq!(settings.stage_budgets.review.max_tool_calls, 30);
+        for invalid in [0, 1001] {
+            settings.limits.max_calls = invalid;
+            assert!(settings.validate().is_err());
+        }
+        settings.limits.max_calls = 1000;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn reasoning_override_and_historical_record_are_preserved() {
+        let mut f = fixture(true);
+        f.options.settings.reasoning_effort = "low".parse().unwrap();
+        assert!("maximum".parse::<ReasoningEffort>().is_err());
+        let historical = f.eval_dir.join("plan-historical.json");
+        let old = "{\"schema_version\":1,\"outcome\":\"no_epic\"}";
+        fs::write(&historical, old).unwrap();
+        let model = MockCompletionModel::from_stream_turns([
+            investigation_turn(),
+            submit(&doc()),
+            review_turn(&doc(), "pass"),
+        ]);
+        let capture = model.clone();
+        let result = plan_epic(model, &f.options).await.unwrap();
+        assert_eq!(result.record.schema_version, 3);
+        assert_eq!(fs::read_to_string(historical).unwrap(), old);
+        assert!(
+            capture
+                .requests()
+                .iter()
+                .all(|r| r.additional_params.as_ref().unwrap()["reasoning_effort"] == "low")
+        );
     }
 
     #[tokio::test]
@@ -1017,7 +2154,9 @@ mod tests {
     async fn accepted_submission_wins_over_leaked_markup_text() {
         let f = fixture(true);
         let model = MockCompletionModel::from_stream_turns([
+            investigation_turn(),
             submit(&doc()),
+            review_turn(&doc(), "pass"),
             text_turn("<tool_call> never reached"),
         ]);
         let result = plan_epic(model, &f.options).await.unwrap();
@@ -1215,7 +2354,7 @@ mod tests {
         let f = fixture(true);
         let model = MockCompletionModel::from_stream_turns([text_turn("nothing to propose")]);
         let result = plan_epic(model, &f.options).await.unwrap();
-        // The mock reports no tier: it must show as unknown rather than being assumed flex.
+        // The mock reports no tier: it must show as unknown rather than being assumed standard.
         assert_eq!(result.record.calls.len(), 1);
         assert_eq!(result.record.calls[0].served_tier, "unknown");
         assert_eq!(result.record.calls[0].requested_tier, "flex");

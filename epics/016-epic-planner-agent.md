@@ -234,3 +234,121 @@ Recorded 2026-10-08 by a coding agent from the gitignored `plan-*.json` records;
 | elapsed (sum of calls) | 998 s | 666 s |
 
 Both chose the same increment (word operators `is`/`equals` plus trailing punctuation and single quotes). A 10-citation spot check of Epic 019 against the tree found no wrong line. Caveat: Epic 019 re-proposes Epic 018 (it names the earlier drafts as duplicates), so a pack run should not follow a run of the same evaluation without pruning the earlier output. One sample each; not statistically meaningful.
+
+
+## Approved follow-up: investigate before drafting (2026-10-09)
+
+Status: Implemented; offline verified, manual quality comparison pending.
+
+The user approved a workflow experiment after reviewing Epic 017. The draft had
+accessible but unexamined compatibility evidence, and the planner requested low
+reasoning effort. Two different models had shown shallow investigation. These
+observations motivate changing the process while keeping the current fixed
+`glm-5.3-flex` model and Flex provider route; they do not establish which factor
+caused the weak plan.
+
+The smallest increment is a staged planner in `tools/synth`: structured
+investigation, drafting, and independent semantic review. The investigation traces
+motivating prompts, cites relevant callers and tests, compares interpretations,
+and justifies a narrow scope. All stages retain the existing sanitized read-only
+allowlist. No minimum read count or broader repository access is introduced.
+Review checks unsupported claims, unnecessary scope, compatibility, and consistency
+between the proposed design and its acceptance matrix. One revision is allowed,
+then a fresh final review. Only the exact passing draft is published; unresolved
+findings produce `review_failed` and no epic. Publication remains Proposed and
+human-unreviewed.
+
+High reasoning effort becomes the default, with `--reasoning-effort
+low|medium|high` allowing controlled comparisons. Model histories are fresh at
+stage boundaries. Turn, tool, and whole-run budgets remain shared across the run.
+Version-2 records retain stage artifacts, outcomes, reasoning effort, and prompt
+hashes; historical version-1 JSON records are retained without migration.
+
+Acceptance criteria:
+
+- Offline mock tests prove investigation precedes drafting, independent review
+  precedes publication, and an unsuccessful final review or stage failure writes
+  no epic.
+- Revision is bounded to one attempt, the exact reviewed draft is published, and
+  budget exhaustion cannot be bypassed by entering a new stage.
+- Existing evidence, redaction, path, atomic-publication, and human-review
+  contracts remain enforced.
+- Records distinguish stage failures and review findings without exposing private
+  source values or provider payloads.
+- A person reruns the same evaluation and reviews the new proposal after removing
+  the previous generated epic. Compare material planning errors, scope additions,
+  human edits needed for approval, cost, and elapsed time while holding the model,
+  evaluation, code, and context fixed except for the intended experiment.
+
+Mock tests measure gating and reproducibility of the workflow, not prose quality.
+The manual rerun is separate from implementation verification; no live provider
+call or claim of improved epic quality is required to finish this tooling change.
+
+Verification: all 143 synth library tests, binary/doc tests, synth compile check,
+formatting, Clippy with warnings denied, and binary build passed. Workspace
+formatting, compile check, and tests passed. No live provider call was made; the
+installed nightly emitted its existing LLVM debug-stripping warning during builds.
+
+
+**Budget calibration after the first staged rerun.** The user-run record
+`plan-1791514926340583000-9731` ended with `tool_budget`: investigation used
+24 turns and 41 tool calls, drafting used 10 turns and 18 calls, and review used
+one turn and one allowed call before the 61st tool call was denied. Only 98,705
+of 393,216 allowed tool bytes had been consumed. The inherited 60-call limit
+starved review; this unfinished review is not evidence that the model failed
+semantic review.
+
+Planner defaults are therefore 120 total turns and 180 total tool calls, with
+`--max-turns` accepting 1–200 and `--max-tool-calls` accepting 1–1000. These are
+planner-only defaults; all stages still share one budget and existing byte
+limits remain enforced. The command explains the stopped stage and budget
+reason. A budget-exhausted run publishes nothing because independent review
+has not passed. No automatic live rerun is introduced.
+
+The investigation also grouped word equality, single quotes, and punctuation
+into its chosen scope. Investigation guidance now reinforces selecting one
+mechanism and deferring independent syntax changes. A subsequent manually
+reviewed draft is needed to judge whether that guidance improves scope.
+
+
+**Investigator proposal handoff and resumable writing (2026-10-09).** The
+investigator now submits schema version 2 with a concrete proposal: defect,
+desired behavior, design, compatibility obligations, acceptance criteria, fixture
+strategy, and uncertainties, alongside the prompt traces and cited code/tests.
+The writer edits that proposal into the required epic structure, using targeted
+extra reads where necessary. It may select a smaller coherent scope and a
+nonempty subset of motivating cases; it cannot expand scope or change proposal
+kind. Independent reviewer histories remain fresh and use current repository
+tools. Historical investigation and plan JSON are left as written; new planner
+records use schema version 3.
+
+Per-stage caps supplement the shared 120-turn/180-tool-call defaults:
+investigation gets 40 turns/60 calls, drafting and revision each get 25 turns/40
+calls, and review and final review each get 20 turns/30 calls. Every invocation
+also consumes the shared global budget and deadline. This prevents broad
+investigation from taking the whole run allocation. `--stage-max-turns N` and
+`--stage-max-tool-calls N` override the corresponding cap for all roles while
+global caps still apply. `stage_max_turns` and `stage_tool_budget` distinguish
+stage exhaustion; the CLI explains the controls and saved-proposal retry.
+
+A validated investigation is saved before writing as
+`plan-<id>-proposal.json` beside its evaluation. This sanitized local checkpoint
+contains the proposal and provenance hashes, without raw source contents. Its
+envelope schema version is 1, separate from investigator schema version 2 and
+plan-record schema version 3. The CLI displays the checkpoint path. To retry
+writing or review, repeat the original command with `--proposal <displayed-path>`
+added, retaining evaluation and context arguments. The investigator model stage
+is skipped after current typed validation and checks of evaluation, context,
+investigator-prompt, and full cited-file hashes. Stale checkpoints require a new
+investigation. These checks cover the identified inputs and cited files, not
+every repository change. Retries use fresh writer/reviewer histories and new run
+budgets; they do not adopt an earlier draft or review verdict. Publication still
+requires a passing independent review of the exact submitted draft.
+
+Offline acceptance coverage must verify checkpoint persistence before writing,
+resume without investigator calls, stale-input/cited-file rejection, scope
+narrowing without evidence expansion, stage caps under global budgets, and no
+publication from unfinished or rejected review. This workflow and its checkpoints
+remain an experiment whose prose quality requires the next manual rerun.
+
+Verification for the proposal-handoff change: all 152 synth library tests and binary/doc tests passed, including failed-writer checkpoint recovery, stale/unsafe checkpoint rejection before model calls, writer scope narrowing, and per-stage/global budget enforcement. Synth formatting, compile check, Clippy with warnings denied, and binary build passed. Workspace formatting, compile check, and tests passed. No live provider call was made; epic quality awaits the user's rerun. Checkpoints publish atomically without replacing existing artifacts.

@@ -60,11 +60,11 @@ pub fn env_file_value(contents: &str, name: &str) -> Option<String> {
     })
 }
 
-pub fn neuralwatt_model(key: String) -> impl Into<DynModel<Completion>> {
+pub fn neuralwatt_model(key: String, model: &str) -> impl Into<DynModel<Completion>> {
     OpenAIConfig::new(key)
         .with_base_url(BASE_URL)
         .client()
-        .chat(MODEL)
+        .chat(model)
 }
 
 #[derive(Clone, Debug, Serialize)]

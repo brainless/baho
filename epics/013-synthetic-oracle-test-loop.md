@@ -8,6 +8,11 @@ User intent: Grow the coverage of Baho's parser/planner (`baho-core::intent`, gr
 
 This epic gives high-level guidance only. Implementation detail lives in per-stage epics: Epic 014 covers the first stage, and later stages are planned after Epic 014's results are reviewed.
 
+Proposed follow-up: [Epic 018](018-executable-agent-repair-loop.md) combines a
+bounded slice of investigation, regression emission, implementation, and review
+into one executable repair attempt. It is an alternative next increment, pending
+review; it does not mark stages 2–5 or Epic 015 as implemented.
+
 ## Observed behavior and problem
 
 Epics 007 and 012 extended the planner with a hand-written test per rule (`crates/baho-core/tests/epic007_grounding.rs`, `epic012_header_first.rs`). Each test pairs a tiny synthetic CSV with a prompt and asserts a plan shape and the retained source rows. This works, but:

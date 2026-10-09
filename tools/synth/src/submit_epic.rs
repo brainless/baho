@@ -1,11 +1,11 @@
 //! `submit_epic`: the only write path of the epic planner (Epic 016, T6).
 //!
-//! The agent supplies a slug and Markdown. The harness validates the whole submission,
+//! The agent supplies a slug, Markdown, and versioned proposal evidence. The harness validates the whole submission,
 //! chooses the file name, allocates the number under a repository-scoped lock, and publishes
 //! the complete file with no-overwrite semantics. Rejected submissions write nothing.
 
 use crate::{
-    contracts::{EvaluationReport, ReviewStatus},
+    contracts::{EvaluationReport, EvidenceEligibility, ReviewStatus},
     planner_tools::{ToolError, allowed_file, is_denied, normalize},
     redaction::{Redactor, ViolationKind},
 };
@@ -13,7 +13,7 @@ use rig::tool::{PortableTool, ToolExecutionError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
@@ -32,6 +32,8 @@ const LOCK_WAIT: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasonCode {
+    EvidenceEligibility,
+    SubmissionVersion,
     BadSlug,
     Empty,
     Oversized,
@@ -122,6 +124,7 @@ struct Ctx {
     evaluation_id: String,
     generation_id: String,
     case_ids: BTreeSet<String>,
+    eligibility: BTreeMap<String, EvidenceEligibility>,
     has_unreviewed: bool,
     has_ambiguous: bool,
     state: Mutex<State>,
@@ -141,6 +144,11 @@ impl EpicSubmitter {
             evaluation_id: report.evaluation_id.clone(),
             generation_id: report.generation_id.clone(),
             case_ids: report.cases.iter().map(|c| c.case_id.clone()).collect(),
+            eligibility: report
+                .cases
+                .iter()
+                .map(|c| (c.case_id.clone(), report.evidence_eligibility(c)))
+                .collect(),
             has_unreviewed: any(ReviewStatus::Unreviewed),
             has_ambiguous: any(ReviewStatus::Ambiguous),
             state: Mutex::new(State::default()),
@@ -155,42 +163,86 @@ impl EpicSubmitter {
         self.0.state.lock().unwrap().rejections.clone()
     }
 
-    pub fn submit(&self, slug: &str, markdown: &str) -> Result<Accepted, SubmitError> {
+    #[cfg(test)]
+    fn submit(&self, slug: &str, markdown: &str) -> Result<Accepted, SubmitError> {
+        self.submit_proposal(
+            slug,
+            markdown,
+            &ProposalEvidence {
+                schema_version: SUBMISSION_SCHEMA_VERSION,
+                kind: ProposalKind::Investigation,
+                motivating_case_ids: vec![format!("{}-0001", self.0.generation_id)],
+            },
+        )
+    }
+
+    /// Validate a draft with the publication contract and shared attempt budget, without writing.
+    pub fn validate_proposal(
+        &self,
+        slug: &str,
+        markdown: &str,
+        evidence: &ProposalEvidence,
+    ) -> Result<(), SubmitError> {
+        let ctx = &*self.0;
+        let mut state = ctx.state.lock().unwrap();
+        // Keep one attempt available for publishing a reviewed draft.
+        if state.accepted.is_none() && state.attempts >= MAX_SUBMISSIONS - 1 {
+            return Err(SubmitError::AttemptsExhausted);
+        }
+        validate_attempt(ctx, &mut state, slug, markdown, evidence)?;
+        Ok(())
+    }
+
+    pub fn submit_proposal(
+        &self,
+        slug: &str,
+        markdown: &str,
+        evidence: &ProposalEvidence,
+    ) -> Result<Accepted, SubmitError> {
         let ctx = &*self.0;
         // Held for the whole call: in-process submissions are serialized, and a second
         // acceptance is impossible.
         let mut state = ctx.state.lock().unwrap();
-        if state.accepted.is_some() {
-            return Err(SubmitError::AlreadyAccepted);
-        }
-        if state.attempts >= MAX_SUBMISSIONS {
-            return Err(SubmitError::AttemptsExhausted);
-        }
-        state.attempts += 1;
-        let title = match validate(ctx, slug, markdown) {
-            Ok(t) => t,
-            Err(mut reasons) => {
-                reasons.sort_by_key(|r| r.code);
-                for r in &mut reasons {
-                    r.detail = ctx.redactor.sanitize_prose(&r.detail);
-                }
-                state.rejections.push(RejectionRecord {
-                    codes: reasons.iter().map(|r| r.code).collect(),
-                    reasons: reasons
-                        .iter()
-                        .map(|r| RecordedReason {
-                            code: r.code,
-                            message: recorded_message(&ctx.redactor, &r.detail),
-                        })
-                        .collect(),
-                });
-                return Err(SubmitError::Rejected(reasons));
-            }
-        };
-        let accepted = publish(ctx, slug, &title, markdown).map_err(SubmitError::Publish)?;
+        let title = validate_attempt(ctx, &mut state, slug, markdown, evidence)?;
+        let accepted =
+            publish(ctx, slug, &title, markdown, evidence).map_err(SubmitError::Publish)?;
         state.accepted = Some(accepted.clone());
         Ok(accepted)
     }
+}
+
+/// Share rejection records and attempt accounting between drafts and publication.
+fn validate_attempt(
+    ctx: &Ctx,
+    state: &mut State,
+    slug: &str,
+    markdown: &str,
+    evidence: &ProposalEvidence,
+) -> Result<String, SubmitError> {
+    if state.accepted.is_some() {
+        return Err(SubmitError::AlreadyAccepted);
+    }
+    if state.attempts >= MAX_SUBMISSIONS {
+        return Err(SubmitError::AttemptsExhausted);
+    }
+    state.attempts += 1;
+    validate(ctx, slug, markdown, evidence).map_err(|mut reasons| {
+        reasons.sort_by_key(|r| r.code);
+        for reason in &mut reasons {
+            reason.detail = ctx.redactor.sanitize_prose(&reason.detail);
+        }
+        state.rejections.push(RejectionRecord {
+            codes: reasons.iter().map(|r| r.code).collect(),
+            reasons: reasons
+                .iter()
+                .map(|r| RecordedReason {
+                    code: r.code,
+                    message: recorded_message(&ctx.redactor, &r.detail),
+                })
+                .collect(),
+        });
+        SubmitError::Rejected(reasons)
+    })
 }
 
 /// Details are already sanitized; a message that still scans dirty is withheld, and the rest
@@ -303,7 +355,12 @@ pub fn valid_slug(slug: &str) -> bool {
 }
 
 /// Returns the title text (without `#`) when the submission is acceptable.
-fn validate(ctx: &Ctx, slug: &str, md: &str) -> Result<String, Vec<Reason>> {
+fn validate(
+    ctx: &Ctx,
+    slug: &str,
+    md: &str,
+    evidence: &ProposalEvidence,
+) -> Result<String, Vec<Reason>> {
     use ReasonCode::*;
     let mut r = Vec::new();
     if !valid_slug(slug) {
@@ -373,6 +430,7 @@ fn validate(ctx: &Ctx, slug: &str, md: &str) -> Result<String, Vec<Reason>> {
         }
     }
 
+    check_eligibility(ctx, md, evidence, &mut r);
     check_goals(&lines, &hs, &mut r);
     check_evidence(ctx, md, &mut r);
     check_increment(&lines, &hs, &mut r);
@@ -417,6 +475,66 @@ fn validate(ctx: &Ctx, slug: &str, md: &str) -> Result<String, Vec<Reason>> {
         }
     }
     if r.is_empty() { Ok(title) } else { Err(r) }
+}
+
+fn check_eligibility(ctx: &Ctx, md: &str, evidence: &ProposalEvidence, reasons: &mut Vec<Reason>) {
+    if evidence.schema_version != SUBMISSION_SCHEMA_VERSION {
+        reject(
+            reasons,
+            ReasonCode::SubmissionVersion,
+            "unsupported proposal evidence schema version; expected 1",
+        );
+    }
+    let ids: BTreeSet<_> = evidence.motivating_case_ids.iter().collect();
+    if ids.is_empty() || ids.len() != evidence.motivating_case_ids.len() || ids.len() > 100 {
+        reject(
+            reasons,
+            ReasonCode::EvidenceEligibility,
+            "name 1 to 100 unique motivating case IDs",
+        );
+    }
+    let citations = id_tokens(md);
+    for id in ids {
+        match ctx.eligibility.get(id) {
+            None => reject(
+                reasons,
+                ReasonCode::UnknownEvidenceId,
+                format!("unknown motivating case ID '{id}'"),
+            ),
+            Some(EvidenceEligibility::Observation)
+                if evidence.kind == ProposalKind::Implementation =>
+            {
+                reject(
+                    reasons,
+                    ReasonCode::EvidenceEligibility,
+                    format!(
+                        "case '{id}' is observation-only; use investigation or finish_no_epic until human review and supporting evidence establish a wrong plan or refusal"
+                    ),
+                );
+            }
+            _ => {}
+        }
+        if !citations.contains(id) {
+            reject(
+                reasons,
+                ReasonCode::MissingEvidenceId,
+                format!("motivating case '{id}' must be cited in the Markdown"),
+            );
+        }
+    }
+    let expected = format!("Proposal kind: {}", evidence.kind.as_str());
+    let declarations: Vec<_> = md
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("Proposal kind:"))
+        .collect();
+    if declarations != [expected.as_str()] {
+        reject(
+            reasons,
+            ReasonCode::EvidenceEligibility,
+            format!("declare '{expected}' to match the structured proposal kind"),
+        );
+    }
 }
 
 fn check_goals(lines: &[&str], hs: &[Heading], r: &mut Vec<Reason>) {
@@ -886,7 +1004,13 @@ fn next_number(epics: &Path) -> Result<u32, String> {
         .ok_or_else(|| "epic numbers exhausted".into())
 }
 
-fn render_document(ctx: &Ctx, number: u32, title: &str, md: &str) -> String {
+fn render_document(
+    ctx: &Ctx,
+    number: u32,
+    title: &str,
+    md: &str,
+    evidence: &ProposalEvidence,
+) -> String {
     let mut out = String::with_capacity(md.len() + 256);
     let mut header_done = false;
     let mut title_done = false;
@@ -903,13 +1027,25 @@ fn render_document(ctx: &Ctx, number: u32, title: &str, md: &str) -> String {
                 "\n<!-- Generated by Agent 2 (epic planner); evaluation: {}; review: unreviewed -->\n",
                 ctx.evaluation_id
             ));
+            out.push_str(&format!(
+                "<!-- Proposal evidence schema: {}; kind: {}; motivating cases: {} -->\n",
+                evidence.schema_version,
+                evidence.kind.as_str(),
+                evidence.motivating_case_ids.join(", ")
+            ));
             header_done = true;
         }
     }
     out
 }
 
-fn publish(ctx: &Ctx, slug: &str, title: &str, md: &str) -> Result<Accepted, String> {
+fn publish(
+    ctx: &Ctx,
+    slug: &str,
+    title: &str,
+    md: &str,
+    evidence: &ProposalEvidence,
+) -> Result<Accepted, String> {
     let epics = ctx.root.join("epics");
     fs::create_dir_all(&epics).map_err(|e| format!("epics directory: {e}"))?;
     let _lock = acquire_lock(&ctx.root)?;
@@ -917,7 +1053,7 @@ fn publish(ctx: &Ctx, slug: &str, title: &str, md: &str) -> Result<Accepted, Str
     for _ in 0..16 {
         let number = next_number(&epics)?;
         let name = format!("{number:03}-{slug}.md");
-        let text = render_document(ctx, number, title, md);
+        let text = render_document(ctx, number, title, md, evidence);
         let tmp = epics.join(format!(".{name}.{}.tmp", std::process::id()));
         {
             let mut f = fs::OpenOptions::new()
@@ -954,11 +1090,38 @@ fn publish(ctx: &Ctx, slug: &str, title: &str, md: &str) -> Result<Accepted, Str
 #[derive(Clone)]
 pub struct SubmitEpic(pub EpicSubmitter);
 
+pub const SUBMISSION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalKind {
+    Implementation,
+    Investigation,
+}
+
+impl ProposalKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Implementation => "implementation",
+            Self::Investigation => "investigation",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposalEvidence {
+    pub schema_version: u32,
+    pub kind: ProposalKind,
+    pub motivating_case_ids: Vec<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitEpicArgs {
     pub slug: String,
     pub markdown: String,
+    pub evidence: ProposalEvidence,
 }
 
 impl PortableTool for SubmitEpic {
@@ -970,7 +1133,7 @@ impl PortableTool for SubmitEpic {
         ToolExecutionError::other(error.to_string()).with_code("harness_rejection")
     }
     fn description(&self) -> String {
-        "Submit the one proposed epic: a slug ([a-z0-9-]{3,48}) and the Markdown body. The \
+        "Submit one proposed epic: slug, Markdown, and versioned evidence (kind and motivating case IDs). The \
          harness validates it, assigns the number and file name, and writes it. Rejections list \
          reasons so you can fix and resubmit; stop after an accepted submission."
             .into()
@@ -978,11 +1141,19 @@ impl PortableTool for SubmitEpic {
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{
             "slug":{"type":"string","pattern":"^[a-z0-9-]{3,48}$"},
-            "markdown":{"type":"string","maxLength":MAX_EPIC_BYTES}
-        },"required":["slug","markdown"],"additionalProperties":false})
+            "markdown":{"type":"string","maxLength":MAX_EPIC_BYTES},
+            "evidence":{"type":"object","properties":{
+                "schema_version":{"type":"integer","enum":[SUBMISSION_SCHEMA_VERSION]},
+                "kind":{"type":"string","enum":["implementation","investigation"]},
+                "motivating_case_ids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":100,"uniqueItems":true}
+            },"required":["schema_version","kind","motivating_case_ids"],"additionalProperties":false}
+        },"required":["slug","markdown","evidence"],"additionalProperties":false})
     }
     async fn call(&self, args: SubmitEpicArgs) -> Result<Value, ToolError> {
-        match self.0.submit(&args.slug, &args.markdown) {
+        match self
+            .0
+            .submit_proposal(&args.slug, &args.markdown, &args.evidence)
+        {
             Ok(a) => Ok(json!({"accepted": true, "path": a.relative_path, "number": a.number})),
             Err(e) => Err(ToolError(e.to_string())),
         }
@@ -1054,7 +1225,7 @@ mod tests {
 
     fn doc(extra: &str) -> String {
         format!(
-            "# Parse refusals for polite lead-ins\n\nStatus: Proposed\n\n\
+            "# Parse refusals for polite lead-ins\n\nStatus: Proposed\n\nProposal kind: investigation\n\n\
 ## Motivating evidence and user intent\nRun `{EVAL}` from `{GEN}`; case {GEN}-0001 is unreviewed.\n\n\
 ## Observed behavior\nRefused (`crates/a/src/lib.rs:1`, `crates/a/src/lib.rs:2-3`, `crates/a/src/lib.rs:4`).\n\n## Problem and desired behavior\nx\n\n## Out of scope\nx\n\n\
 ## Architecture and crate ownership\nx\n\n## Design and alternatives\nChosen increment: normalize lead-ins.\n\n\
@@ -1077,6 +1248,194 @@ mod tests {
 
     fn epics_len(dir: &TempDir) -> usize {
         fs::read_dir(dir.path().join("epics")).unwrap().count()
+    }
+
+    fn proposal(kind: ProposalKind) -> ProposalEvidence {
+        ProposalEvidence {
+            schema_version: 1,
+            kind,
+            motivating_case_ids: vec![format!("{GEN}-0001")],
+        }
+    }
+
+    #[test]
+    fn implementation_gate_requires_review_and_supporting_evidence() {
+        for review in [
+            ReviewStatus::Unreviewed,
+            ReviewStatus::Ambiguous,
+            ReviewStatus::Rejected,
+            ReviewStatus::Confirmed,
+        ] {
+            let (dir, _) = repo();
+            let mut report = report();
+            let case = &mut report.cases[1];
+            case.review = review;
+            case.observed = ObservedResult::RowsMatch;
+            case.plan_comparison = PlanComparison::Different;
+            case.evidence.plan = Some(PlanEvidence {
+                column: "Role".into(),
+                operator: PlanOperator::Equal,
+                literal: PlanLiteral::Text("is Analyst".into()),
+                text_match_policy: TextMatchPolicy::UnicodeLowercase,
+            });
+            let s =
+                EpicSubmitter::new(dir.path(), &report, Redactor::new([] as [&str; 0]).unwrap())
+                    .unwrap();
+            let md = doc("").replace(
+                "Proposal kind: investigation",
+                "Proposal kind: implementation",
+            );
+            let result = s.submit_proposal(
+                "word-operators",
+                &md,
+                &proposal(ProposalKind::Implementation),
+            );
+            if review == ReviewStatus::Confirmed {
+                let a = result.unwrap();
+                let published = fs::read_to_string(dir.path().join(a.relative_path)).unwrap();
+                assert!(published.contains("Proposal evidence schema: 1; kind: implementation"));
+            } else {
+                assert!(codes(result).contains(&ReasonCode::EvidenceEligibility));
+                assert_eq!(epics_len(&dir), 3);
+                assert!(
+                    s.submit_proposal(
+                        "investigate-operators",
+                        &doc("Ambiguous cases are observations."),
+                        &proposal(ProposalKind::Investigation)
+                    )
+                    .is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eligibility_frozen_cases_cover_missing_evidence_and_mapping_limits() {
+        let mut report = report();
+        report.cases[1].review = ReviewStatus::Confirmed;
+        assert_eq!(
+            report.evidence_eligibility(&report.cases[1]),
+            EvidenceEligibility::Observation
+        );
+        report.cases[1].evidence.refusal_reason = Some("unsupported syntax".into());
+        assert_eq!(
+            report.evidence_eligibility(&report.cases[1]),
+            EvidenceEligibility::ConfirmedRefusal
+        );
+        report.cases[1].observed = ObservedResult::Clarification;
+        assert_eq!(
+            report.evidence_eligibility(&report.cases[1]),
+            EvidenceEligibility::Observation
+        );
+        report.cases[1].observed = ObservedResult::Refused;
+        report.cases[1].evidence.spawn_failure = Some("spawn_failed".into());
+        assert_eq!(
+            report.evidence_eligibility(&report.cases[1]),
+            EvidenceEligibility::Observation
+        );
+        report.cases[1].evidence.spawn_failure = None;
+        report.cases[1].evidence.oracle_code = Some("oracle_mismatch".into());
+        assert_eq!(
+            report.evidence_eligibility(&report.cases[1]),
+            EvidenceEligibility::Observation
+        );
+        report.cases[1].evidence.oracle_code = None;
+        report.cases[1].prompt = "Role is Analyst".into();
+        report
+            .limitations
+            .push(crate::redaction::MappingLimitation {
+                stand_in: "Unrelated".into(),
+                kind: crate::redaction::LimitationKind::Punctuation,
+            });
+        assert_eq!(
+            report.evidence_eligibility(&report.cases[1]),
+            EvidenceEligibility::ConfirmedRefusal
+        );
+        report.limitations[0].stand_in = "Analyst".into();
+        assert_eq!(
+            report.evidence_eligibility(&report.cases[1]),
+            EvidenceEligibility::Observation
+        );
+        report.limitations.clear();
+        report.cases[1].observed = ObservedResult::WrongRows;
+        report.cases[1].plan_comparison = PlanComparison::Different;
+        assert_eq!(
+            report.evidence_eligibility(&report.cases[1]),
+            EvidenceEligibility::Observation
+        );
+        report.cases[1].plan_comparison = PlanComparison::Equivalent;
+        assert_eq!(
+            report.evidence_eligibility(&report.cases[1]),
+            EvidenceEligibility::Observation
+        );
+    }
+
+    #[test]
+    fn supporting_observations_are_allowed_but_cannot_be_promoted_to_motivators() {
+        let (dir, _) = repo();
+        let mut report = report();
+        report.cases[1].review = ReviewStatus::Confirmed;
+        report.cases[1].evidence.refusal_reason = Some("unsupported syntax".into());
+        let s = EpicSubmitter::new(dir.path(), &report, Redactor::new([] as [&str; 0]).unwrap())
+            .unwrap();
+        let md = doc(&format!(
+            "Case {GEN}-0002 is an unreviewed supporting observation."
+        ))
+        .replace(
+            "Proposal kind: investigation",
+            "Proposal kind: implementation",
+        );
+        let mut evidence = proposal(ProposalKind::Implementation);
+        evidence.motivating_case_ids.push(format!("{GEN}-0002"));
+        assert!(
+            codes(s.submit_proposal("extend-coverage", &md, &evidence))
+                .contains(&ReasonCode::EvidenceEligibility)
+        );
+        evidence.motivating_case_ids.pop();
+        assert!(s.submit_proposal("extend-coverage", &md, &evidence).is_ok());
+    }
+
+    #[test]
+    fn structured_evidence_version_ids_and_kind_are_checked() {
+        let (_dir, s) = repo();
+        let mut evidence = proposal(ProposalKind::Investigation);
+        evidence.schema_version = 2;
+        assert!(
+            codes(s.submit_proposal("good-slug", &doc(""), &evidence))
+                .contains(&ReasonCode::SubmissionVersion)
+        );
+        evidence.schema_version = 1;
+        evidence.motivating_case_ids.clear();
+        assert!(
+            codes(s.submit_proposal("good-slug", &doc(""), &evidence))
+                .contains(&ReasonCode::EvidenceEligibility)
+        );
+        evidence.motivating_case_ids = vec![format!("{GEN}-9999")];
+        assert!(
+            codes(s.submit_proposal("good-slug", &doc(""), &evidence))
+                .contains(&ReasonCode::UnknownEvidenceId)
+        );
+        evidence = proposal(ProposalKind::Investigation);
+        evidence
+            .motivating_case_ids
+            .push(evidence.motivating_case_ids[0].clone());
+        assert!(
+            codes(s.submit_proposal("good-slug", &doc(""), &evidence))
+                .contains(&ReasonCode::EvidenceEligibility)
+        );
+        evidence = proposal(ProposalKind::Investigation);
+        let md = doc("").replace(
+            "Proposal kind: investigation",
+            "Proposal kind: implementation",
+        );
+        assert!(
+            codes(s.submit_proposal("good-slug", &md, &evidence))
+                .contains(&ReasonCode::EvidenceEligibility)
+        );
+        assert!(
+            serde_json::from_value::<SubmitEpicArgs>(json!({"slug":"old-call","markdown":doc("")}))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1218,7 +1577,7 @@ mod tests {
         let no_case = doc("").replace(&format!("{GEN}-0001"), "a case");
         assert_eq!(
             codes(s.submit("good-slug", &no_case)),
-            vec![ReasonCode::MissingEvidenceId]
+            vec![ReasonCode::MissingEvidenceId, ReasonCode::MissingEvidenceId]
         );
         let no_eval = doc("").replace(EVAL, "the evaluation");
         assert_eq!(
@@ -1525,6 +1884,7 @@ mod tests {
             .call(SubmitEpicArgs {
                 slug: "x".into(),
                 markdown: doc(""),
+                evidence: proposal(ProposalKind::Investigation),
             })
             .await
             .unwrap_err();
@@ -1533,6 +1893,7 @@ mod tests {
             .call(SubmitEpicArgs {
                 slug: "fine-slug".into(),
                 markdown: doc(""),
+                evidence: proposal(ProposalKind::Investigation),
             })
             .await
             .unwrap();
@@ -1541,9 +1902,158 @@ mod tests {
             .call(SubmitEpicArgs {
                 slug: "fine-slug".into(),
                 markdown: doc(""),
+                evidence: proposal(ProposalKind::Investigation),
             })
             .await
             .unwrap_err();
         assert!(again.to_string().contains("already accepted"));
+    }
+    #[tokio::test]
+    async fn draft_validation_has_no_publication_or_allocation() {
+        use crate::draft_review::{DraftProposal, SubmitDraft};
+        let (dir, submitter) = repo();
+        let n = epics_len(&dir);
+        let tool = SubmitDraft::new(submitter.clone());
+        let draft = DraftProposal {
+            slug: "draft-only".into(),
+            markdown: doc(""),
+            evidence: proposal(ProposalKind::Investigation),
+        };
+        let mut bad = draft.clone();
+        bad.markdown = "invalid".into();
+        assert!(tool.call(bad).await.is_err());
+        assert_eq!(submitter.rejections().len(), 1);
+        assert!(tool.call(draft.clone()).await.is_ok());
+        assert_eq!(tool.accepted(), Some(draft.clone()));
+        assert!(tool.call(draft).await.is_err());
+        assert_eq!(epics_len(&dir), n);
+        assert!(!dir.path().join(".baho").exists());
+        assert!(submitter.accepted().is_none());
+    }
+
+    #[tokio::test]
+    async fn semantic_review_is_safe_hash_bound_and_checks_citations() {
+        use crate::{
+            draft_review::*,
+            planner_tools::{ToolLimits, Toolbox},
+        };
+        let (dir, _) = repo();
+        let redactor = Redactor::new(["Senior Analyst"]).unwrap();
+        let toolbox = Toolbox::new(
+            dir.path(),
+            &report(),
+            redactor.clone(),
+            ToolLimits::default(),
+        )
+        .unwrap();
+        let draft = DraftProposal {
+            slug: "draft-only".into(),
+            markdown: doc(""),
+            evidence: proposal(ProposalKind::Investigation),
+        };
+        let tool = SubmitReview::new(&draft, redactor.clone(), toolbox.clone());
+        let pass = Review {
+            schema_version: 1,
+            draft_hash: draft_hash(&draft),
+            verdict: ReviewVerdict::Pass,
+            findings: vec![],
+            summary: "No blocking plan issues found.".into(),
+        };
+        let mut bad = pass.clone();
+        bad.draft_hash = "00".repeat(32);
+        assert!(tool.call(bad).await.is_err());
+        let mut bad = pass.clone();
+        bad.summary = "Senior Analyst".into();
+        let error = tool.call(bad).await.unwrap_err().to_string();
+        assert!(!error.contains("Senior Analyst"));
+        let mut bad = pass.clone();
+        bad.verdict = ReviewVerdict::Revise;
+        assert!(tool.call(bad).await.is_err());
+        let finding = ReviewFinding {
+            issue: "Fixture does not distinguish the binding rules.".into(),
+            evidence: vec![ReviewCitation {
+                path: "crates/a/src/lib.rs".into(),
+                start_line: 1,
+                end_line: 2,
+            }],
+            requested_correction: "Add a distinguishing synthetic fixture.".into(),
+        };
+        let mut bad = pass.clone();
+        bad.findings.push(finding.clone());
+        assert!(tool.call(bad).await.is_err());
+        let mut revise = pass.clone();
+        revise.verdict = ReviewVerdict::Revise;
+        revise.findings.push(finding);
+        let mut bad = revise.clone();
+        bad.findings[0].evidence[0].end_line = 99;
+        assert!(tool.call(bad).await.is_err());
+        let mut bad = revise.clone();
+        bad.findings[0].evidence[0].path = ".env".into();
+        assert!(tool.call(bad).await.is_err());
+        assert!(tool.call(revise.clone()).await.is_ok());
+        assert_eq!(tool.accepted(), Some(revise));
+        assert_eq!(tool.rejections().len(), 6);
+        assert!(
+            tool.rejections()
+                .iter()
+                .all(|r| !r.contains("Senior Analyst") && r.chars().count() <= 400)
+        );
+        assert!(tool.call(pass.clone()).await.is_err());
+        let fresh = SubmitReview::new(&draft, redactor, toolbox);
+        assert!(fresh.call(pass).await.is_ok());
+        assert!(!dir.path().join(".baho").exists());
+        let mut changed = draft.clone();
+        changed.markdown.push('\n');
+        assert_ne!(draft_hash(&draft), draft_hash(&changed));
+    }
+    #[test]
+    fn last_draft_attempt_reserves_publication() {
+        let (dir, submitter) = repo();
+        let evidence = proposal(ProposalKind::Investigation);
+        for _ in 0..MAX_SUBMISSIONS - 2 {
+            assert!(submitter.validate_proposal("bad", "", &evidence).is_err());
+        }
+        assert!(
+            submitter
+                .validate_proposal("last-draft", &doc(""), &evidence)
+                .is_ok()
+        );
+        assert!(matches!(
+            submitter.validate_proposal("extra-draft", &doc(""), &evidence),
+            Err(SubmitError::AttemptsExhausted)
+        ));
+        assert!(!dir.path().join(".baho").exists());
+        assert!(
+            submitter
+                .submit_proposal("last-draft", &doc(""), &evidence)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_scope_drift_is_rejected_before_acceptance_and_can_be_corrected() {
+        use crate::draft_review::{DraftProposal, SubmitDraft};
+        let (_dir, submitter) = repo();
+        let expected = proposal(ProposalKind::Investigation);
+        let tool = SubmitDraft::with_evidence(submitter, expected.clone());
+        let draft = DraftProposal {
+            slug: "bound-draft".into(),
+            markdown: doc(""),
+            evidence: expected,
+        };
+        let mut bad = draft.clone();
+        bad.evidence.kind = ProposalKind::Implementation;
+        assert!(tool.call(bad).await.is_err());
+        let mut bad = draft.clone();
+        bad.evidence.motivating_case_ids = vec![format!("{GEN}-0002")];
+        assert!(tool.call(bad).await.is_err());
+        let mut bad = draft.clone();
+        bad.evidence.schema_version = 2;
+        assert!(tool.call(bad).await.is_err());
+        assert!(tool.accepted().is_none());
+        assert_eq!(tool.rejections().len(), 3);
+        assert!(tool.call(draft).await.is_ok());
+        assert!(tool.accepted().is_some());
+        assert!(tool.rejections().iter().all(|r| r.chars().count() <= 400));
     }
 }

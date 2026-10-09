@@ -19,7 +19,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub const PLANNER_PROMPT_VERSION: &str = "epic-planner-v4";
+pub const PLANNER_PROMPT_VERSION: &str = "epic-planner-v12";
 pub const PLANNER_PROMPT: &str = include_str!("../prompts/planner-system.md");
 pub const GOALS: &str = include_str!("../goals/goals.md");
 
@@ -485,6 +485,7 @@ impl PortableTool for ReadEvaluation {
                     "limitations": r.limitations,
                     "notes": r.notes,
                     "case_count": r.cases.len(),
+                    "evidence_eligibility": r.cases.iter().map(|c| json!({"case_id":c.case_id,"eligibility":r.evidence_eligibility(c)})).collect::<Vec<_>>(),
                 })),
                 EvaluationSection::Cases => {
                     let limit = args.limit.unwrap_or(10).clamp(1, MAX_CASES_PER_PAGE);
@@ -667,6 +668,25 @@ impl Inner {
 }
 
 impl Toolbox {
+    /// Check a citation without returning source text or spending the read-tool budget.
+    pub(crate) fn validate_citation(
+        &self,
+        path: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> Result<(), ToolError> {
+        if start_line == 0 || end_line < start_line || end_line - start_line >= MAX_READ_LINES {
+            return Err(ToolError("invalid citation range".into()));
+        }
+        let excerpt = self
+            .read_range(path, start_line, end_line)
+            .map_err(|_| ToolError("citation must resolve to an allowed repository file".into()))?;
+        if excerpt.lines.is_empty() || excerpt.end_line != end_line {
+            return Err(ToolError("citation range extends beyond the file".into()));
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_range(
         &self,
         path: &str,

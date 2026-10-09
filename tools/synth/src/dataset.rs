@@ -59,6 +59,40 @@ pub struct LoadedDataset {
 }
 
 impl LoadedDataset {
+    /// Build the existing Role oracle from a validated neutral synthetic fixture.
+    /// The caller supplies logical source-row numbers; other CSV columns stay out
+    /// of the restricted equality oracle.
+    pub fn from_synthetic_role_rows(rows: &[(u64, String)]) -> Result<Self, DatasetError> {
+        if rows.is_empty() || rows.len() > MAX_ROWS || rows.iter().any(|(row, _)| *row == 0) {
+            return Err(DatasetError::Layout("invalid synthetic rows".into()));
+        }
+        let mut counts = BTreeMap::<String, usize>::new();
+        let mut db_rows = Vec::with_capacity(rows.len());
+        for (row, role) in rows {
+            let row = i64::try_from(*row)
+                .map_err(|_| DatasetError::Layout("row index out of range".into()))?;
+            *counts.entry(role.clone()).or_default() += 1;
+            db_rows.push((row, role.clone()));
+        }
+        let directory = tempfile::Builder::new().prefix("baho-synth-").tempdir()?;
+        let database = directory.path().join("roles.duckdb");
+        prepare_database(&database, &db_rows)?;
+        let profile = DatasetProfile {
+            column: "Role",
+            total_rows: rows.len(),
+            roles: counts
+                .into_iter()
+                .map(|(value, count)| RoleCount { value, count })
+                .collect(),
+        };
+        Ok(Self {
+            _directory: directory,
+            database,
+            profile,
+            hash: format!("{:x}", Sha256::digest(format!("{db_rows:?}"))),
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Self, DatasetError> {
         let metadata = fs::metadata(path)?;
         if metadata.len() > MAX_SOURCE_BYTES {

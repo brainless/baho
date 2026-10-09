@@ -108,6 +108,42 @@ pub struct CaseEvidence {
     pub plan: Option<PlanEvidence>,
 }
 
+/// Derived evidence eligibility, independent of aggregate counts or model assertions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceEligibility {
+    Observation,
+    ConfirmedWrongPlan,
+    ConfirmedRefusal,
+}
+
+impl EvaluationReport {
+    pub fn evidence_eligibility(&self, case: &CaseReport) -> EvidenceEligibility {
+        // Altered text cannot establish semantics for the affected case. Unrelated
+        // stand-ins do not disqualify the rest of the batch.
+        let prompt = case.prompt.to_lowercase();
+        if self
+            .limitations
+            .iter()
+            .any(|l| prompt.contains(&l.stand_in.to_lowercase()))
+            || case.review != ReviewStatus::Confirmed
+            || case.evidence.spawn_failure.is_some()
+            || case.evidence.oracle_code.is_some()
+        {
+            return EvidenceEligibility::Observation;
+        }
+        if case.is_confirmed_wrong_plan() && case.evidence.plan.is_some() {
+            EvidenceEligibility::ConfirmedWrongPlan
+        } else if matches!(case.observed, ObservedResult::Refused)
+            && (case.evidence.refusal_reason.is_some() || !case.diagnostic_codes.is_empty())
+        {
+            EvidenceEligibility::ConfirmedRefusal
+        } else {
+            EvidenceEligibility::Observation
+        }
+    }
+}
+
 impl CaseReport {
     /// Requires all three independent conditions of the evidence contract.
     pub fn is_confirmed_wrong_plan(&self) -> bool {
