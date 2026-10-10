@@ -1,6 +1,6 @@
 # Epic 019: Structural Source Outline and Bounded Range Reads
 
-Status: Implemented (pending manual rerun)
+Status: Implemented (live rerun diagnosed)
 
 Motivating run: repair attempt `repair-1791610148027574000-14036-0` (Epic 018
 harness), evaluation `evaluation-1791470942646632000-53201-0`, case
@@ -257,7 +257,7 @@ evidence.
   review as `review_incomplete`; it never yields acceptance. Open questions are
   stored in the attempt record after `Redactor::scan_prose`; flagged questions
   are withheld and recorded only as a hash and violation kinds.
-- The reserved call runs inside the existing session timeout and output-byte
+- The reserved call obeys the provider request timeout and output-byte
   limits. A tool call emitted anyway ends the stage with cause
   `final_answer_tool_call`; invalid JSON ends with `invalid_final_json`.
 - If the provider rejects tool-call messages in history when no tools are
@@ -287,8 +287,8 @@ open questions marked unverified.
   `syn` suffices because reads target a compiling baseline, and `read_lines`
   covers parse failures. Revisit if non-Rust sources come into scope.
 - **rust-analyzer (LSP or `ra_ap_*`)**: definitions and references would help,
-  but startup cost, process lifecycle, and dependency weight do not fit a
-  confined 120-second session now.
+  but startup cost, process lifecycle, and dependency weight do not fit this
+  confined repair loop now.
 - **Raising the 64 KiB cap**: unbounded growth of per-response context; rejected
   by the user.
 
@@ -377,36 +377,69 @@ is verified during implementation as described in section 8.
 
 Steps 1-6 are implemented in `tools/synth` (`source_tools.rs`,
 `anchored_edits.rs`, `repair_agents.rs`, `repair_trace.rs`, `repair.rs`,
-`tests/syn_span_semantics.rs`). Criterion 11 (manual live rerun of the
-motivating command) remains for the user.
+`tests/syn_span_semantics.rs`).
 
-- `ATTEMPT_SCHEMA` was bumped to 2 as the explicit version decision for the new
-  budget settings in the contract and the v2 trace sidecar; schema-v1 readers
-  reject v2 events (`schema_v1_reader_rejects_v2_events`).
-- `completed_after_budget` is recorded in the trace (`agent_finished` cause)
-  only; it does not change the attempt outcome, which follows normal
-  validation of the reserved-call answer.
-- CRLF limitation: line splitting for anchored edits and diffs is on `\n`
-  only. In a CRLF file each line keeps its `\r`, so `old` must reproduce it
-  exactly or the patch is rejected as `edit_anchor_mismatch`. Safe (rejects,
-  never mis-applies); the baho checkout is LF.
-- No deterministic smoke test exists for synth beyond the unit and
-  mock-model tests; the mock-driven session tests serve that role.
+- Contracts use schema v2 and require the source budgets. Manifests and
+  ordinary attempt events remain v1, so existing manifests remain readable.
+  The source exposure sidecar uses schema v2; v1 readers reject it.
+- Investigator turns are pinned at 12; coder and reviewer retain 6 turns.
+  Each stage reserves its last call for an answer. A valid reserved answer
+  follows normal validation, and the manifest reason names every stage that
+  completed after its tool-turn budget.
+- A dedicated Neuralwatt HTTP client limits each repair API request to 600
+  seconds, accommodating Flex admission waits. There is no whole-stage timer;
+  turn, tool-call, and source-byte budgets remain. Confined worker processes
+  retain a separate 300-second timeout. A direct provider timeout gets the
+  `api_request_timeout` cause and its limit. Rig may normalize a transport
+  failure to an `http` report that does not preserve the native timeout flag;
+  that path remains distinguishable from a whole-stage deadline by its cause.
+- `read_lines` charges numbered text, including blank lines and newlines, to
+  its response and stage budgets. Clipped final lines report partial service.
+- CRLF anchors match the text shown by `read_lines`, while replacements retain
+  the original line terminators. An empty replacement deletes its selected
+  lines. If validation rejects an applied patch, edited and new files are
+  restored.
+- The trace records a payload-free response hash and length. A mock session
+  replays outline, search, and reads from a synthetic `protected/source.tar`,
+  checking the full tool results against model history and every recorded
+  exposure against archived source hashes. Generated outline/search text
+  requires the same version of the deterministic tool implementation to replay.
 
 ### Verification
 
-Synth: `cargo fmt --check`, `cargo check`,
-`cargo clippy --all-targets -- -D warnings`, `cargo test` (205 passed, 1
-ignored, plus 3 span tests) all pass. Root: `cargo fmt --check`,
-`cargo check --workspace`, `cargo test --workspace` pass. `.baho/` and `.env`
-are gitignored and nothing under them is tracked.
+Synth: formatting, `cargo check --tests`, and
+`cargo clippy --all-targets -- -D warnings` pass. With nightly LLVM codegen,
+`cargo test` passes (220 passed, 1 ignored, plus 3 span tests). Root formatting,
+`cargo check --workspace`, and `cargo test --workspace` pass. The synth tests
+that open local mock-provider sockets were run outside the outer sandbox.
+
+The motivating command was rerun against the same evaluation, case, review,
+dataset, and baseline. Attempt `repair-1791630635554636000-42102-0` ended
+`model_exhausted` with reason `investigation: session_timeout (limit=120)`.
+Its trace shows successful source requests, including outline and range reads
+for the formerly blocked large `intent.rs`; there were no failed source
+requests or path-guessing loop. A provider model call was still in progress
+when the session timed out. This satisfied the named-outcome branch of
+criterion 11 but did not establish repair success. After moving the timeout
+to each API request and raising it to 600 seconds, the same command ran for
+176 seconds in attempt `repair-1791636189372140000-46909-0` before a provider
+transport error ended investigation as `model_exhausted`, reason
+`investigation: http; tool_budget_exhausted=false`. Seven model calls had
+succeeded; the last failed after 21 seconds, far below the request timeout.
+The formerly blocked source navigation succeeded again. The trace records
+one rejected synthetic probe, whose tool error is separate from source
+navigation. This rerun confirms there is no whole-stage 120-second deadline,
+but a completed repair remains unverified because the provider connection
+failed.
 
 ### Criteria coverage
 
 1. `outline_of_large_file_has_correct_spans_and_stays_in_cap`,
    `read_lines_serves_any_range_of_large_file_within_cap`, syn span tests.
 2. `read_lines_cap_cuts_on_whole_lines_across_ranges`,
-   `overlong_multibyte_line_is_cut_on_char_boundary`.
+   `overlong_multibyte_line_is_cut_on_char_boundary`,
+   `blank_lines_count_toward_read_response_cap`,
+   `clipped_final_requested_line_is_reported_as_partial`.
 3. `search_is_sorted_has_enclosing_items_and_skips_unreadable_files`.
 4. `unparseable_file_gets_fallback_outline_and_still_reads`.
 5. `paths_outside_scope_or_checkout_are_denied_and_expose_nothing`.
@@ -415,18 +448,19 @@ are gitignored and nothing under them is tracked.
    `search_query_validation`, budget test.
 7. `any_mismatch_rejects_the_whole_patch_and_leaves_files_unchanged`,
    `applies_matching_edits_bottom_up_with_changing_line_counts`,
-   `failed_apply_restores_files`.
-8. `ledger_records_requests_and_exposure_without_source_text`,
-   `probe_arguments_are_hashes_and_sizes_only`. Gap: no test replays spans
-   against the source tarball byte for byte; hashing of profiled-literal
-   queries was not separately confirmed.
-9. `schema_v1_reader_rejects_v2_events`,
-   `contracts_reject_unknown_versions_and_tampered_reduction`.
+   `failed_apply_restores_files`, CRLF/deletion/rollback tests.
+8. `source_ledger_replays_every_exposure_from_protected_tar`,
+   `ledger_records_requests_and_exposure_without_source_text`, including
+   the profiled-literal query hash/length assertion.
+9. `schema_v1_reader_rejects_v2_events`, v1 manifest parsing and v2 contract
+   validation tests.
 10. `reserves_one_tool_free_call_after_tool_turns`,
     `tool_enabled_run_is_capped_below_max_agent_turns`,
     `reserved_call_may_declare_insufficient_evidence`,
     `open_questions_are_redacted_and_bounded`,
     `tool_call_or_bad_json_in_reserved_call_ends_with_named_cause`,
-    `normal_completion_makes_no_reserved_call`. The review-stage
-    `review_incomplete` mapping was not separately confirmed.
-11. Manual rerun: not done.
+    `normal_completion_makes_no_reserved_call`, coder/reviewer mock sessions,
+    review `ReviewIncomplete` mapping, and terminal manifest reason test.
+11. Live reruns: named `session_timeout` under the old whole-stage limit, then
+    named `http` after the per-request timeout change; source navigation
+    succeeded in both attempts.

@@ -13,9 +13,12 @@ use thiserror::Error;
 use crate::contracts::PlanComparison;
 
 /// Version 2 pins the source-tool budgets in `AttemptSettings` (Epic 019).
-/// Version 1 contracts and manifests lack them and are rejected, not defaulted,
-/// because no attempt was accepted under version 1.
+/// Version 1 contracts cannot supply those limits and are rejected.
 pub const ATTEMPT_SCHEMA: u32 = 2;
+/// The manifest shape remains compatible with version 1. New optional fields
+/// must have defaults so older manifests remain readable.
+pub const MANIFEST_SCHEMA: u32 = 1;
+const ATTEMPT_EVENT_SCHEMA: u32 = 1;
 const MAX_PATCH_BYTES: usize = 256 * 1024;
 const MAX_TREE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -55,8 +58,14 @@ pub struct AttemptSettings {
     pub coder_prompt_version: String,
     pub reviewer_prompt_version: String,
     pub model: String,
+    /// Investigator calls, including the reserved final answer.
+    pub max_investigator_turns: u32,
+    /// Coder and reviewer calls, including the reserved final answer.
     pub max_agent_turns: u32,
     pub max_tool_calls: u32,
+    /// Limit for one provider request; independent of the whole stage.
+    pub api_request_timeout_seconds: u64,
+    /// Limit for one confined worker process.
     pub process_timeout_seconds: u64,
     pub max_output_bytes: usize,
     /// Source text returned by one `read_lines` response.
@@ -93,8 +102,10 @@ impl RepairContract {
             || self.settings.coder_prompt_version.is_empty()
             || self.settings.reviewer_prompt_version.is_empty()
             || self.settings.model.is_empty()
+            || self.settings.max_investigator_turns == 0
             || self.settings.max_agent_turns == 0
             || self.settings.max_tool_calls == 0
+            || !(1..=3600).contains(&self.settings.api_request_timeout_seconds)
             || self.settings.process_timeout_seconds == 0
             || self.settings.max_output_bytes == 0
             || self.settings.max_output_bytes > 1024 * 1024
@@ -265,7 +276,7 @@ impl AttemptManifest {
     pub fn parse(bytes: &[u8]) -> Result<Self, RepairError> {
         let manifest: Self =
             serde_json::from_slice(bytes).map_err(|_| RepairError::InvalidContract)?;
-        if manifest.schema_version != ATTEMPT_SCHEMA {
+        if manifest.schema_version != MANIFEST_SCHEMA {
             return Err(RepairError::UnknownSchema(manifest.schema_version));
         }
         Ok(manifest)
@@ -320,7 +331,7 @@ impl AttemptRecord {
                     let mut record = Self {
                         dir,
                         manifest: AttemptManifest {
-                            schema_version: ATTEMPT_SCHEMA,
+                            schema_version: MANIFEST_SCHEMA,
                             attempt_id: id,
                             stage: Stage::Reserved,
                             outcome: None,
@@ -361,7 +372,7 @@ impl AttemptRecord {
         serde_json::to_writer(
             &mut file,
             &AttemptEvent {
-                schema_version: ATTEMPT_SCHEMA,
+                schema_version: ATTEMPT_EVENT_SCHEMA,
                 timestamp_ms: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -528,6 +539,10 @@ pub struct Investigation {
 pub trait Agents {
     fn failure_reason(&self) -> Option<&str> {
         None
+    }
+    /// Stages whose valid answer used the reserved call after tool turns ran out.
+    fn completed_after_budget_stages(&self) -> &[&'static str] {
+        &[]
     }
     /// Redacted open questions from a stage that declared insufficient evidence.
     fn open_questions(&self) -> &[String] {
@@ -925,6 +940,14 @@ pub fn run_attempt(
         .failure_reason()
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{:?}: {outcome:?}", record.manifest.stage));
+    let reason = if agents.completed_after_budget_stages().is_empty() {
+        reason
+    } else {
+        format!(
+            "completed_after_budget={}; {reason}",
+            agents.completed_after_budget_stages().join(",")
+        )
+    };
     record.manifest.open_questions = agents.open_questions().to_vec();
     record.finish(outcome, &reason)?;
     Ok(outcome)
@@ -957,8 +980,10 @@ mod tests {
                 coder_prompt_version: "v1".into(),
                 reviewer_prompt_version: "v1".into(),
                 model: "stub".into(),
+                max_investigator_turns: 12,
                 max_agent_turns: 6,
                 max_tool_calls: 20,
+                api_request_timeout_seconds: 600,
                 process_timeout_seconds: 30,
                 max_output_bytes: 64 * 1024,
                 max_read_bytes: 1024,
@@ -1119,7 +1144,14 @@ mod tests {
     }
     impl Agents for StubAgents {
         fn failure_reason(&self) -> Option<&str> {
-            (self.mode == "exhausted").then_some("investigation: session_timeout (limit=120)")
+            (self.mode == "exhausted").then_some("investigation: api_request_timeout (limit=600)")
+        }
+        fn completed_after_budget_stages(&self) -> &[&'static str] {
+            if self.mode == "budget" {
+                &["investigation", "review"]
+            } else {
+                &[]
+            }
         }
         fn open_questions(&self) -> &[String] {
             if self.mode == "exhausted" {
@@ -1237,9 +1269,24 @@ mod tests {
             AttemptManifest::parse(&fs::read(record.dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(
             manifest.reason.as_deref(),
-            Some("investigation: session_timeout (limit=120)")
+            Some("investigation: api_request_timeout (limit=600)")
         );
         assert_eq!(manifest.open_questions, ["which operator path?"]);
+    }
+
+    #[test]
+    fn reserved_answer_is_named_in_terminal_manifest() {
+        let (outcome, record, _, _, _root) = attempt("ok", "budget");
+        assert_eq!(outcome, Outcome::Accepted);
+        let manifest =
+            AttemptManifest::parse(&fs::read(record.dir.join("manifest.json")).unwrap()).unwrap();
+        assert!(
+            manifest
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("completed_after_budget=investigation,review")
+        );
     }
 
     #[test]
@@ -1295,8 +1342,63 @@ mod tests {
             AttemptManifest::parse(&serde_json::to_vec(&manifest).unwrap()),
             Err(RepairError::UnknownSchema(99))
         ));
-        manifest.schema_version = ATTEMPT_SCHEMA;
+        manifest.schema_version = MANIFEST_SCHEMA;
         assert!(AttemptManifest::parse(&serde_json::to_vec(&manifest).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn version_one_manifest_without_optional_questions_still_parses() {
+        let bytes = br#"{"schema_version":1,"attempt_id":"repair-old","stage":"terminal","outcome":"no_change","contract_sha256":"hash","baseline_build_id":null,"candidate_build_id":null,"patch_sha256":null,"reason":"unchanged","cleanup_error":null}"#;
+        let manifest = AttemptManifest::parse(bytes).unwrap();
+        assert_eq!(manifest.schema_version, MANIFEST_SCHEMA);
+        assert!(manifest.open_questions.is_empty());
+
+        let root = tempfile::tempdir().unwrap();
+        let record = AttemptRecord::reserve(root.path(), &contract()).unwrap();
+        let written =
+            AttemptManifest::parse(&fs::read(record.dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(written.schema_version, MANIFEST_SCHEMA);
+        let written_contract: RepairContract =
+            serde_json::from_slice(&fs::read(record.dir.join("protected/contract.json")).unwrap())
+                .unwrap();
+        assert_eq!(written_contract.schema_version, ATTEMPT_SCHEMA);
+    }
+
+    #[test]
+    fn version_one_contract_without_source_budgets_is_rejected() {
+        let mut old = serde_json::to_value(contract()).unwrap();
+        old["schema_version"] = serde_json::json!(1);
+        let settings = old["settings"].as_object_mut().unwrap();
+        for field in [
+            "max_read_bytes",
+            "max_outline_bytes",
+            "max_search_matches",
+            "max_exposed_bytes",
+        ] {
+            settings.remove(field);
+        }
+        assert!(RepairContract::parse(&serde_json::to_vec(&old).unwrap()).is_err());
+    }
+
+    #[test]
+    fn api_request_timeout_is_required_and_bounded_in_contract() {
+        let mut value = serde_json::to_value(contract()).unwrap();
+        value["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("api_request_timeout_seconds");
+        assert!(RepairContract::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut contract = contract();
+        for invalid in [0, 3601] {
+            contract.settings.api_request_timeout_seconds = invalid;
+            assert!(matches!(
+                contract.validate(),
+                Err(RepairError::InvalidContract)
+            ));
+        }
+        contract.settings.api_request_timeout_seconds = 600;
+        contract.validate().unwrap();
     }
 
     #[test]

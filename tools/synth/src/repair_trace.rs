@@ -437,6 +437,13 @@ impl AgentHook for AgentTrace {
                         }
                         (detail, exposed) = project_outcome(tool, &response);
                     }
+                    if let Some(body) = rendered.as_deref() {
+                        // A digest of the rendered tool result lets a replay
+                        // verify generated outline/search text and numbered
+                        // read output without persisting any source payload.
+                        detail.insert("response_sha256".into(), json!(sha(body)));
+                        detail.insert("response_bytes".into(), json!(body.len()));
+                    }
                 } else if let Some(c) = result
                     .and_then(|r| r.error())
                     .and_then(|e| e.code())
@@ -463,7 +470,7 @@ impl AgentHook for AgentTrace {
 mod tests {
     use super::*;
     use crate::source_tools::{
-        OutlineTool, ReadLinesTool, SearchTextTool, SourceLimits, SourceSession,
+        LineRange, OutlineTool, ReadLinesTool, SearchTextTool, SourceLimits, SourceSession,
     };
     use rig::{
         AgentBuilder,
@@ -615,6 +622,151 @@ mod tests {
         }
     }
 
+    fn find_response<'a>(v: &'a Value, marker: &str) -> Option<&'a Value> {
+        match v {
+            Value::Object(o) if o.contains_key(marker) && o.contains_key("exposed") => Some(v),
+            Value::Object(o) => o.values().find_map(|value| find_response(value, marker)),
+            Value::Array(a) => a.iter().find_map(|value| find_response(value, marker)),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn source_ledger_replays_every_exposure_from_protected_tar() {
+        use std::process::Command;
+
+        let (dir, session, rel) = fixture();
+        let protected = dir.path().join("protected");
+        std::fs::create_dir(&protected).unwrap();
+        let archive = protected.join("source.tar");
+        assert!(
+            Command::new("tar")
+                .args(["-cf"])
+                .arg(&archive)
+                .args(["-C"])
+                .arg(dir.path())
+                .arg("crates")
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let trace_path = dir.path().join("agent-events.jsonl");
+        let trace = AgentTrace::open(&trace_path, "investigation")
+            .unwrap()
+            .with_redactor(Redactor::new(["private_literal"]).unwrap());
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("outline", "outline", json!({"path":rel})),
+            MockTurn::tool_call("search", "search_text", json!({"query":"operator_symbol"})),
+            MockTurn::tool_call(
+                "read",
+                "read_lines",
+                json!({"path":rel,"ranges":[{"start":8,"end":12},{"start":10,"end":14}]}),
+            ),
+            MockTurn::text("done"),
+        ]);
+        let received = model.clone();
+        let agent = AgentBuilder::new(model)
+            .add_hook(trace.clone())
+            .tool(OutlineTool(session.clone()))
+            .tool(ReadLinesTool(session.clone()))
+            .tool(SearchTextTool(session))
+            .build();
+        agent.prompt("go").max_turns(6).await.unwrap();
+        assert!(trace.finish("completed", None, 3));
+
+        let checkout = dir.path().join("replay");
+        std::fs::create_dir(&checkout).unwrap();
+        assert!(
+            Command::new("tar")
+                .arg("-xf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&checkout)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let replay = fixture_session(&checkout);
+        let expected = [
+            (
+                "outline",
+                serde_json::to_value(replay.outline(&rel, None).unwrap()).unwrap(),
+            ),
+            (
+                "search",
+                serde_json::to_value(replay.search_text("operator_symbol").unwrap()).unwrap(),
+            ),
+            (
+                "read",
+                serde_json::to_value(
+                    replay
+                        .read_lines(
+                            &rel,
+                            &[
+                                LineRange { start: 8, end: 12 },
+                                LineRange { start: 10, end: 14 },
+                            ],
+                        )
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
+        ];
+        let history =
+            serde_json::to_value(&received.requests().last().unwrap().chat_history).unwrap();
+        let events = events(&trace_path);
+        let finished = named(&events, "tool_call_finished");
+        for (id, output) in expected {
+            let recorded = &finished
+                .iter()
+                .find(|event| event["detail"]["call_id"] == id)
+                .unwrap()["detail"];
+            let marker = match id {
+                "outline" => "outline_kind",
+                "search" => "matches",
+                _ => "ranges",
+            };
+            assert_eq!(
+                find_response(&history, marker).unwrap(),
+                &output,
+                "mock received a different {id} result"
+            );
+            let rendered = output.to_string();
+            assert_eq!(recorded["response_sha256"], sha(&rendered));
+            assert_eq!(recorded["response_bytes"], rendered.len());
+            assert_eq!(recorded["exposed"], output["exposed"]);
+            for span in recorded["exposed"].as_array().unwrap() {
+                let member = span["path"].as_str().unwrap();
+                let tar_bytes = Command::new("tar")
+                    .arg("-xOf")
+                    .arg(&archive)
+                    .arg(member)
+                    .output()
+                    .unwrap();
+                assert!(tar_bytes.status.success());
+                assert_eq!(
+                    span["file_sha256"],
+                    format!("{:x}", Sha256::digest(&tar_bytes.stdout))
+                );
+            }
+        }
+    }
+
+    fn fixture_session(root: &Path) -> SourceSession {
+        SourceSession::new(
+            root.to_path_buf(),
+            &[SCOPE],
+            SourceLimits {
+                max_calls: 50,
+                read_bytes: 1024,
+                outline_bytes: 6 * 1024,
+                search_matches: 40,
+                stage_bytes: 48 * 1024,
+            },
+        )
+    }
+
     #[tokio::test]
     async fn ledger_records_requests_and_exposure_without_source_text() {
         let (dir, session, rel) = fixture();
@@ -725,10 +877,6 @@ mod tests {
                 e["end_line"].as_u64().unwrap() as usize,
             );
             let span: Vec<&str> = lines[a - 1..b].to_vec();
-            assert_eq!(
-                e["bytes"].as_u64().unwrap() as usize,
-                span.iter().map(|l| l.len()).sum::<usize>()
-            );
             replayed.extend(span.iter().map(|l| format!("{l}\n")));
         }
         let history: Vec<Value> = received
@@ -741,7 +889,8 @@ mod tests {
             .find_map(find_ranges)
             .expect("read_lines result reached the model");
         let mut got = Vec::new();
-        for r in response["ranges"].as_array().unwrap() {
+        for (r, e) in response["ranges"].as_array().unwrap().iter().zip(&exposed) {
+            assert_eq!(e["bytes"], r["text"].as_str().unwrap().len());
             for l in r["text"].as_str().unwrap().lines() {
                 let body = l.split_once('|').unwrap().1;
                 got.push(format!("{}\n", body.strip_prefix(' ').unwrap_or(body)));

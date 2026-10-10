@@ -3,7 +3,9 @@ use synth::{
     cli_run::RunLimits,
     dataset::LoadedDataset,
     evaluate::{EvaluateOptions, evaluate},
-    generator::{Settings, credential, env_file_value, generate, neuralwatt_model},
+    generator::{
+        Settings, credential, env_file_value, generate, neuralwatt_model, neuralwatt_repair_model,
+    },
     planner::{PlanOptions, PlanSettings, plan_epic, resolve_credential},
 };
 
@@ -136,7 +138,12 @@ fn repair_command(
         std::fs::read_to_string(repo.join(".env")).ok().as_deref(),
     )?;
     let (outcome, path) = synth::repair_entry::repair(
-        neuralwatt_model(key, synth::planner::MODEL).into(),
+        neuralwatt_repair_model(
+            key,
+            synth::planner::MODEL,
+            options.settings.api_request_timeout_seconds,
+        )?
+        .into(),
         &options,
     )?;
     println!("{:?}: {}", outcome, path.display());

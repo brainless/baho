@@ -10,8 +10,10 @@ use rig::agent::{
 };
 use rig::{
     AgentBuilder, DynModel,
+    http_client::ReqwestClient,
     operation::Completion,
     providers::openai::OpenAIConfig,
+    rig_reqwest::reqwest,
     tool::{PortableTool, ToolExecutionError},
 };
 use serde::{Deserialize, Serialize};
@@ -65,6 +67,34 @@ pub fn neuralwatt_model(key: String, model: &str) -> impl Into<DynModel<Completi
         .with_base_url(BASE_URL)
         .client()
         .chat(model)
+}
+
+/// Repair limits each provider HTTP request independently of the agent stage.
+pub fn neuralwatt_repair_model(
+    key: String,
+    model: &str,
+    request_timeout_seconds: u64,
+) -> Result<impl Into<DynModel<Completion>>, GenerateError> {
+    let http = repair_http_client(request_timeout_seconds)?;
+    Ok(OpenAIConfig::new(key)
+        .with_base_url(BASE_URL)
+        .connect(http)
+        .chat(model))
+}
+
+fn repair_http_client(request_timeout_seconds: u64) -> Result<ReqwestClient, GenerateError> {
+    if request_timeout_seconds == 0 {
+        return Err(GenerateError(
+            "repair API request timeout must be positive".into(),
+        ));
+    }
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(request_timeout_seconds))
+        .build()
+        .map_err(|error| {
+            GenerateError(format!("repair HTTP client could not be built: {error}"))
+        })?;
+    Ok(ReqwestClient::from(http))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -594,6 +624,43 @@ mod tests {
     use super::*;
     use rig::completion::Usage;
     use rig::test_utils::{MockCompletionModel, MockStreamEvent, mock_final};
+
+    #[tokio::test]
+    async fn repair_http_timeout_is_per_request() {
+        use std::{io::Read, net::TcpListener, thread};
+
+        assert!(repair_http_client(0).is_err());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = [0u8; 1024];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                if index == 0 {
+                    thread::sleep(Duration::from_millis(1300));
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .unwrap();
+                }
+            }
+        });
+        let transport = repair_http_client(1).unwrap();
+        let client = transport.inner().unwrap();
+        let url = format!("http://{address}/repair");
+        assert!(client.get(&url).send().await.unwrap_err().is_timeout());
+        assert_eq!(
+            client.get(&url).send().await.unwrap().text().await.unwrap(),
+            "ok"
+        );
+        server.join().unwrap();
+    }
 
     fn dataset() -> Arc<LoadedDataset> {
         let mut file = tempfile::NamedTempFile::new().unwrap();

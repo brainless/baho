@@ -2,9 +2,10 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use rig::completion::message::ToolChoice;
+use rig::core::error::{ErrorKind, ProviderError};
+use rig::http_client::Error as HttpError;
 use rig::prelude::PromptError;
 use rig::tool::PortableTool;
 use rig::{Agent, AgentBuilder, DynModel, operation::Completion};
@@ -14,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::anchored_edits::{
     CodeAnswer, MAX_EDITS, MAX_NEW_FILE_BYTES, MAX_NEW_FILES, Planned, apply,
-    materialize_review_view, plan, render_diff,
+    materialize_review_view, plan, render_diff, restore,
 };
 use crate::redaction::Redactor;
 use crate::repair::SuiteId;
@@ -168,6 +169,7 @@ pub struct RigRepairAgents {
     reduced_sql: String,
     hypothesis: Option<Investigation>,
     failure_reason: Option<String>,
+    completed_after_budget_stages: Vec<&'static str>,
     open_questions: Vec<String>,
     /// The verified edit plan applied by `code`, kept so review can show a diff.
     applied: Option<Planned>,
@@ -194,6 +196,7 @@ impl RigRepairAgents {
             reduced_sql: String::new(),
             hypothesis: None,
             failure_reason: None,
+            completed_after_budget_stages: Vec::new(),
             open_questions: Vec::new(),
             applied: None,
         }
@@ -209,6 +212,11 @@ impl RigRepairAgents {
     ) -> Result<T, Outcome> {
         self.failure_reason = None;
         self.open_questions.clear();
+        let max_agent_turns = if stage == "investigation" {
+            self.settings.max_investigator_turns
+        } else {
+            self.settings.max_agent_turns
+        };
         let trace_path = self
             .checkout
             .parent()
@@ -220,7 +228,7 @@ impl RigRepairAgents {
                 self.failure_reason = Some(format!("{stage}: logging_io_error"));
                 Outcome::EnvironmentFailure
             })?;
-        trace.event("agent_started", json!({"max_agent_turns":self.settings.max_agent_turns,"max_tool_calls":self.settings.max_tool_calls,"session_timeout_seconds":self.settings.process_timeout_seconds,"max_output_bytes":self.settings.max_output_bytes,"max_read_bytes":self.settings.max_read_bytes,"max_outline_bytes":self.settings.max_outline_bytes,"max_search_matches":self.settings.max_search_matches,"max_exposed_bytes":self.settings.max_exposed_bytes,"navigation_tools":true}));
+        trace.event("agent_started", json!({"max_agent_turns":max_agent_turns,"max_tool_calls":self.settings.max_tool_calls,"api_request_timeout_seconds":self.settings.api_request_timeout_seconds,"max_output_bytes":self.settings.max_output_bytes,"max_read_bytes":self.settings.max_read_bytes,"max_outline_bytes":self.settings.max_outline_bytes,"max_search_matches":self.settings.max_search_matches,"max_exposed_bytes":self.settings.max_exposed_bytes,"navigation_tools":true}));
         let model = self.model.clone();
         let nav = SourceSession::new(root, scopes, SourceLimits::from_settings(&self.settings));
         let tools = SourceTools { nav: nav.clone() };
@@ -234,10 +242,10 @@ impl RigRepairAgents {
             worker: self.worker.clone(),
         };
         let limits = StageLimits {
-            max_agent_turns: self.settings.max_agent_turns as usize,
+            max_agent_turns: max_agent_turns as usize,
             max_bytes: self.settings.max_output_bytes,
+            api_request_timeout_seconds: self.settings.api_request_timeout_seconds,
         };
-        let timeout = Duration::from_secs(self.settings.process_timeout_seconds);
         let hook = trace.clone();
         let run_trace = trace.clone();
         let observer = nav.clone();
@@ -255,15 +263,7 @@ impl RigRepairAgents {
                     .tool(probe)
                     .tool(checks)
                     .build();
-                match tokio::time::timeout(
-                    timeout,
-                    run_stage::<T>(&agent, prompt, limits, &run_trace),
-                )
-                .await
-                {
-                    Ok(done) => done,
-                    Err(_) => Err(("session_timeout", Some(timeout.as_secs()))),
-                }
+                run_stage::<T>(&agent, prompt, limits, &run_trace).await
             })
         });
         let (cause, limit) = finish_cause(&result);
@@ -273,7 +273,12 @@ impl RigRepairAgents {
             return Err(Outcome::EnvironmentFailure);
         }
         match result {
-            Ok(Finish::Answer(value, _)) => Ok(value),
+            Ok(Finish::Answer(value, after_budget)) => {
+                if after_budget {
+                    self.completed_after_budget_stages.push(stage);
+                }
+                Ok(value)
+            }
             Ok(Finish::Insufficient(questions)) => {
                 self.open_questions = redact_questions(&self.redactor, &questions);
                 self.failure_reason = Some(format!("{stage}: insufficient_evidence"));
@@ -311,11 +316,16 @@ fn insufficient_outcome(stage: &str) -> Outcome {
 }
 
 /// Prompt text stating the navigation tools and the budgets they run under.
-fn navigation_note(s: &AttemptSettings, paths: &str) -> String {
+fn navigation_note(s: &AttemptSettings, stage: &str, paths: &str) -> String {
+    let turns = if stage == "investigation" {
+        s.max_investigator_turns
+    } else {
+        s.max_agent_turns
+    };
     format!(
         "Source navigation: call outline(path) for a line-numbered map of a file, read_lines(path, ranges) for small inclusive 1-based ranges, and search_text(query) to locate code; {paths}. Budgets: at most {} tool-using model turns (the last of {} model calls is reserved for your final answer), {} tool calls in total, {} bytes of source text in total; read_lines returns at most {} bytes per call and an outline page at most {} bytes. Tool errors state a code and the next step. If evidence is insufficient, answer {{\"insufficient_evidence\":true,\"open_questions\":[up to 5 short strings without data values]}} instead.",
-        s.max_agent_turns.saturating_sub(1),
-        s.max_agent_turns,
+        turns.saturating_sub(1),
+        turns,
         s.max_tool_calls,
         s.max_exposed_bytes,
         s.max_read_bytes,
@@ -346,6 +356,7 @@ type Failure = (&'static str, Option<u64>);
 struct StageLimits {
     max_agent_turns: usize,
     max_bytes: usize,
+    api_request_timeout_seconds: u64,
 }
 
 enum Finish<T> {
@@ -385,7 +396,7 @@ async fn run_stage<T: DeserializeOwned>(
                 Err(PromptError::UnknownToolCall { .. } | PromptError::MaxTurnsError { .. }) => {
                     Err(("final_answer_tool_call", None))
                 }
-                Err(error) => Err((prompt_error_cause(&error), None)),
+                Err(error) => Err(prompt_failure(&error, limits)),
             };
             let outcome = match &finished {
                 Ok(Finish::Answer(..)) => "answer",
@@ -395,20 +406,32 @@ async fn run_stage<T: DeserializeOwned>(
             trace.event("final_answer_finished", json!({"outcome":outcome}));
             finished
         }
-        Err(error) => Err((
-            prompt_error_cause(&error),
-            match error {
-                PromptError::MaxTurnsError { max_turns, .. } => Some(max_turns as u64),
-                _ => None,
-            },
-        )),
+        Err(error) => Err(prompt_failure(&error, limits)),
     }
+}
+
+fn prompt_failure(error: &PromptError, limits: StageLimits) -> Failure {
+    let cause = prompt_error_cause(error);
+    let limit = match error {
+        PromptError::MaxTurnsError { max_turns, .. } => Some(*max_turns as u64),
+        _ if cause == "api_request_timeout" => Some(limits.api_request_timeout_seconds),
+        _ => None,
+    };
+    (cause, limit)
 }
 
 fn prompt_error_cause(error: &PromptError) -> &'static str {
     match error {
         PromptError::MaxTurnsError { .. } => "max_agent_turns",
+        PromptError::CompletionError(ProviderError::Http(http))
+            if matches!(http.as_ref(), HttpError::Instance(source)
+                if source.downcast_ref::<rig::rig_reqwest::reqwest::Error>()
+                    .is_some_and(rig::rig_reqwest::reqwest::Error::is_timeout)) =>
+        {
+            "api_request_timeout"
+        }
         PromptError::CompletionError(_) => "provider_error",
+        PromptError::Report(report) if report.kind == ErrorKind::Timeout => "api_request_timeout",
         PromptError::Report(report) => report.kind.code(),
         PromptError::MemoryError(_) => "memory_error",
         PromptError::PromptCancelled { .. } => "agent_cancelled",
@@ -490,6 +513,9 @@ impl Agents for RigRepairAgents {
     fn failure_reason(&self) -> Option<&str> {
         self.failure_reason.as_deref()
     }
+    fn completed_after_budget_stages(&self) -> &[&'static str] {
+        &self.completed_after_budget_stages
+    }
     fn open_questions(&self) -> &[String] {
         &self.open_questions
     }
@@ -499,7 +525,7 @@ impl Agents for RigRepairAgents {
             self.target_prompt,
             target.result_id,
             target.plan,
-            navigation_note(&self.settings, CORE_PATHS),
+            navigation_note(&self.settings, "investigation", CORE_PATHS),
         );
         let root = self.checkout.clone();
         let answer: InvestigationAnswer = self.ask("investigation", "You are the independent repair investigator. State one testable mechanism. Do not request scope expansion. Navigate source with outline, read_lines, and search_text; never request whole files. Return JSON only.", prompt, root, &[CORE_SCOPE])?;
@@ -547,7 +573,7 @@ impl Agents for RigRepairAgents {
             self.reduced_csv,
             self.reduced_prompt,
             self.reduced_sql,
-            navigation_note(&self.settings, CORE_PATHS),
+            navigation_note(&self.settings, "coding", CORE_PATHS),
         );
         let answer: CodeAnswer = self.ask("coding", "You are the repair coder. Edit only the allowed core source files by anchored line ranges and add tests under crates/baho-core/tests/. Do not alter expectations or protected files. Navigate with outline, read_lines, and search_text; never request whole files. Return JSON only.", prompt, checkout.to_path_buf(), &[CORE_SCOPE])?;
         let before = snapshot(checkout).map_err(|_| Outcome::EnvironmentFailure)?;
@@ -560,8 +586,12 @@ impl Agents for RigRepairAgents {
             }
         };
         apply(checkout, &planned).map_err(|_| Outcome::EnvironmentFailure)?;
-        let after = snapshot(checkout).map_err(|_| Outcome::Rejected)?;
-        check_edits(&before, &after, checkout).map_err(|_| Outcome::Rejected)?;
+        let validation =
+            snapshot(checkout).and_then(|after| check_edits(&before, &after, checkout).map(|_| ()));
+        if validation.is_err() {
+            restore(checkout, &planned).map_err(|_| Outcome::EnvironmentFailure)?;
+            return Err(Outcome::Rejected);
+        }
         self.applied = Some(planned);
         Ok(())
     }
@@ -602,7 +632,7 @@ impl Agents for RigRepairAgents {
             self.reduced_csv,
             self.reduced_prompt,
             self.reduced_sql,
-            navigation_note(&self.settings, REVIEW_PATHS),
+            navigation_note(&self.settings, "review", REVIEW_PATHS),
         );
         let answer: Result<ReviewAnswer, Outcome> = self.ask("review", "You are an independent reviewer with a fresh Rig history. You cannot edit source or expectations. Inspect the patch with the diff and the read-only outline, read_lines, and search_text tools over the baseline and candidate trees; never request whole files. Return JSON only.", prompt, view.clone(), &REVIEW_SCOPES);
         let _ = fs::remove_dir_all(&view);
@@ -637,6 +667,7 @@ mod tests {
         PlanComparison, PlanEvidence, PlanLiteral, PlanOperator, TextMatchPolicy,
     };
     use crate::probe::{BodyObservation, OracleObservation, ProbeObservation, SyntheticRow};
+    use std::time::Duration;
 
     use rig::test_utils::{MockCompletionModel, MockTurn};
 
@@ -699,6 +730,7 @@ mod tests {
             let limits = StageLimits {
                 max_agent_turns,
                 max_bytes: 4096,
+                api_request_timeout_seconds: 600,
             };
             let result =
                 run_stage::<Value>(&self.agent, "private prompt".into(), limits, &self.trace).await;
@@ -742,13 +774,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decodes_timeouts_turn_limits_provider_errors_and_bad_output() {
-        let timeout = tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>());
-        assert!(timeout.await.is_err());
+    async fn decodes_turn_limits_provider_errors_and_bad_output() {
         let h = harness([MockTurn::text("{}")]);
         let limits = StageLimits {
             max_agent_turns: 0,
             max_bytes: 100,
+            api_request_timeout_seconds: 600,
         };
         let turns = run_stage::<Value>(&h.agent, "private prompt".into(), limits, &h.trace).await;
         assert_eq!(turns.err(), Some(("max_agent_turns", Some(0))));
@@ -770,6 +801,58 @@ mod tests {
             decode_answer::<Value>("{\"a\":1}", 100, false),
             Ok(Finish::Answer(_, false))
         ));
+    }
+
+    #[tokio::test]
+    async fn timed_out_provider_request_has_named_cause_and_limit() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        let client = rig::rig_reqwest::reqwest::Client::builder()
+            .timeout(Duration::from_millis(30))
+            .build()
+            .unwrap();
+        let error = client
+            .get(format!("http://{address}/waiting"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout());
+        let prompt =
+            PromptError::CompletionError(ProviderError::Http(Arc::new(HttpError::instance(error))));
+        assert_eq!(
+            prompt_failure(
+                &prompt,
+                StageLimits {
+                    max_agent_turns: 12,
+                    max_bytes: 4096,
+                    api_request_timeout_seconds: 600,
+                }
+            ),
+            ("api_request_timeout", Some(600))
+        );
+        let PromptError::CompletionError(provider_error) = prompt else {
+            unreachable!()
+        };
+        let report = rig::core::error::ErrorReport::from(&provider_error);
+        assert_eq!(report.kind, ErrorKind::Http);
+        assert_eq!(
+            prompt_failure(
+                &PromptError::Report(report),
+                StageLimits {
+                    max_agent_turns: 12,
+                    max_bytes: 4096,
+                    api_request_timeout_seconds: 600,
+                }
+            ),
+            ("http", None)
+        );
+        server.join().unwrap();
     }
 
     #[tokio::test]
@@ -958,14 +1041,15 @@ mod tests {
     #[test]
     fn navigation_note_states_turn_and_byte_budgets() {
         let settings = crate::repair_entry::RepairOptions::default_settings();
-        assert_eq!(settings.max_agent_turns, 12);
+        assert_eq!(settings.max_investigator_turns, 12);
+        assert_eq!(settings.max_agent_turns, 6);
         assert_eq!(
             settings.investigator_prompt_version,
             "repair-investigator-v2"
         );
         assert_eq!(settings.reviewer_prompt_version, "repair-reviewer-v2");
         assert_eq!(settings.coder_prompt_version, "repair-coder-v2");
-        let note = navigation_note(&settings, CORE_PATHS);
+        let note = navigation_note(&settings, "investigation", CORE_PATHS);
         for needle in [
             "11 tool-using",
             "12 model calls",
@@ -975,6 +1059,11 @@ mod tests {
             "insufficient_evidence",
         ] {
             assert!(note.contains(needle), "{needle}: {note}");
+        }
+        for stage in ["coding", "review"] {
+            let note = navigation_note(&settings, stage, CORE_PATHS);
+            assert!(note.contains("5 tool-using"));
+            assert!(note.contains("6 model calls"));
         }
     }
 
@@ -1113,5 +1202,149 @@ mod tests {
             &[good[0].clone(), file("crates/baho-core/tests/t.rs", "x")],
             &planned
         ));
+    }
+
+    fn stage_agents(
+        turns: impl IntoIterator<Item = MockTurn>,
+    ) -> Option<(tempfile::TempDir, RigRepairAgents, MockCompletionModel)> {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        fs::create_dir_all(checkout.join(CORE_SCOPE)).unwrap();
+        fs::write(
+            checkout.join("crates/baho-core/src/intent.rs"),
+            "pub fn before() {}\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("protected")).unwrap();
+        // No build or probe runs here. The worker is needed only because the
+        // source-session agent declares those tools alongside navigation.
+        let worker = match LiveWorker::new(
+            dir.path(),
+            dir.path(),
+            &"a".repeat(40),
+            Duration::from_secs(30),
+            Vec::new(),
+        ) {
+            Ok(worker) => worker,
+            Err(crate::repair_build::BuildError::WorkerUnavailable(_)) => return None,
+            Err(error) => panic!("worker setup failed: {error}"),
+        };
+        let model = MockCompletionModel::from_turns(turns);
+        let mut agents = RigRepairAgents::new(
+            model.clone().into(),
+            crate::repair_entry::RepairOptions::default_settings(),
+            checkout,
+            "show alpha".into(),
+            Redactor::new(["zebra_literal"]).unwrap(),
+            Arc::new(Mutex::new(worker)),
+        );
+        agents.hypothesis = Some(Investigation {
+            result_ids: vec!["r".into()],
+            causal_hypothesis: "operator mismatch".into(),
+            mechanism: "one branch is wrong".into(),
+            allowed_files: vec!["crates/baho-core/src/intent.rs".into()],
+            compatibility_checks: vec!["existing tests".into()],
+            reduction: None,
+        });
+        Some((dir, agents, model))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coder_and_reviewer_use_separate_mock_sessions() {
+        let path = "crates/baho-core/src/intent.rs";
+        let old = "pub fn before() {}";
+        let new = "pub fn after() {}";
+        let answer = json!({"edits":[{"path":path,"baseline_sha256":digest(format!("{old}\n")),"start_line":1,"end_line":1,"old":old,"new":new}],"new_files":[]});
+        let Some((_dir, mut agents, coder_model)) = stage_agents([
+            MockTurn::tool_call(
+                "read-1",
+                "read_lines",
+                json!({"path":path,"ranges":[{"start":1,"end":1}]}),
+            ),
+            MockTurn::text(answer.to_string()),
+        ]) else {
+            return;
+        };
+        let before = snapshot(&agents.checkout).unwrap();
+        let checkout = agents.checkout.clone();
+        assert_eq!(
+            agents.code(Path::new("unused-regression"), &checkout),
+            Ok(())
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join(path)).unwrap(),
+            format!("{new}\n")
+        );
+        assert_eq!(coder_model.requests().len(), 2);
+        let after = snapshot(&checkout).unwrap();
+        let (patch_hash, patch) = check_edits(&before, &after, &checkout).unwrap();
+        let reviewer_model = MockCompletionModel::from_turns([
+            MockTurn::tool_call(
+                "review-read",
+                "read_lines",
+                json!({"path":format!("candidate/{path}"),"ranges":[{"start":1,"end":1}]}),
+            ),
+            MockTurn::text(r#"{"pass":true,"reason":"the edit matches the evidence"}"#),
+        ]);
+        agents.model = reviewer_model.clone().into();
+        assert_eq!(agents.review(&patch_hash, &patch, &[]), Ok(true));
+        assert_eq!(reviewer_model.requests().len(), 2);
+        assert!(!checkout.parent().unwrap().join("review-view").exists());
+        let events: Vec<Value> =
+            fs::read_to_string(checkout.parent().unwrap().join("agent-events.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        for stage in ["coding", "review"] {
+            assert!(events.iter().any(|event| {
+                event["stage"] == stage
+                    && event["name"] == "agent_started"
+                    && event["detail"]["max_agent_turns"] == 6
+            }));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reviewer_reserved_insufficient_answer_maps_to_review_incomplete() {
+        let path = "crates/baho-core/src/intent.rs";
+        let old = "pub fn before() {}";
+        let answer = json!({"edits":[{"path":path,"baseline_sha256":digest(format!("{old}\n")),"start_line":1,"end_line":1,"old":old,"new":"pub fn after() {}"}],"new_files":[]});
+        let Some((_dir, mut agents, _)) = stage_agents([MockTurn::text(answer.to_string())]) else {
+            return;
+        };
+        let before = snapshot(&agents.checkout).unwrap();
+        let checkout = agents.checkout.clone();
+        agents
+            .code(Path::new("unused-regression"), &checkout)
+            .unwrap();
+        let after = snapshot(&checkout).unwrap();
+        let (patch_hash, patch) = check_edits(&before, &after, &checkout).unwrap();
+        agents.settings.max_agent_turns = 2;
+        let reviewer_model = MockCompletionModel::from_turns([
+            MockTurn::tool_call(
+                "review-read",
+                "read_lines",
+                json!({"path":format!("candidate/{path}"),"ranges":[{"start":1,"end":1}]}),
+            ),
+            MockTurn::text(
+                r#"{"insufficient_evidence":true,"open_questions":["Need one more counterexample"]}"#,
+            ),
+        ]);
+        agents.model = reviewer_model.clone().into();
+        assert_eq!(
+            agents.review(&patch_hash, &patch, &[]),
+            Err(Outcome::ReviewIncomplete)
+        );
+        assert_eq!(
+            agents.failure_reason(),
+            Some("review: insufficient_evidence")
+        );
+        assert_eq!(agents.open_questions(), &["Need one more counterexample"]);
+        assert_eq!(reviewer_model.requests().len(), 2);
+        assert_eq!(
+            reviewer_model.requests()[1].tool_choice,
+            Some(ToolChoice::None)
+        );
     }
 }

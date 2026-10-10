@@ -112,6 +112,9 @@ fn span(text: &str, starts: &[usize], start: usize, end: usize) -> (usize, usize
     let mut to = starts.get(end).copied().unwrap_or(text.len());
     if to > from && text.as_bytes()[to - 1] == b'\n' {
         to -= 1;
+        if to > from && text.as_bytes()[to - 1] == b'\r' {
+            to -= 1;
+        }
     }
     (from, to)
 }
@@ -193,7 +196,12 @@ pub fn plan(
             }
             previous_end = edit.end_line;
             let (from, to) = span(&original, &starts, edit.start_line, edit.end_line);
-            if original[from..to] != edit.old {
+            let current = &original[from..to];
+            // read_lines hides CRLF terminators, so accept the exact text it
+            // showed the coder while retaining the original bytes for writes.
+            let normalized = current.replace("\r\n", "\n");
+            let normalized = normalized.strip_suffix('\r').unwrap_or(&normalized);
+            if current != edit.old && normalized != edit.old {
                 return reject(
                     ANCHOR_MISMATCH,
                     format!(
@@ -202,11 +210,32 @@ pub fn plan(
                     ),
                 );
             }
+            let to = if edit.new.is_empty() {
+                if original[to..].starts_with("\r\n") {
+                    to + 2
+                } else if original[to..].starts_with('\n') {
+                    to + 1
+                } else {
+                    to
+                }
+            } else {
+                to
+            };
             spans.push((from, to, *edit));
         }
         let mut updated = original.clone();
         for (from, to, edit) in spans.iter().rev() {
-            updated.replace_range(*from..*to, &edit.new);
+            let replacement = if edit.new.is_empty() {
+                String::new()
+            } else if original[*from..*to].contains("\r\n")
+                || original[*from..*to].ends_with('\r')
+                || original.contains("\r\n")
+            {
+                edit.new.replace("\r\n", "\n").replace('\n', "\r\n")
+            } else {
+                edit.new.clone()
+            };
+            updated.replace_range(*from..*to, &replacement);
         }
         planned.files.push(FileEdit {
             path: path.to_path_buf(),
@@ -282,6 +311,25 @@ pub fn apply(root: &Path, planned: &Planned) -> io::Result<()> {
     result
 }
 
+/// Restores the files in a successfully applied plan after later validation
+/// rejects it. A failed restoration is reported after all paths are attempted.
+pub fn restore(root: &Path, planned: &Planned) -> io::Result<()> {
+    let mut first_error = None;
+    for (path, _) in &planned.new_files {
+        if let Err(error) = fs::remove_file(root.join(path))
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    for file in &planned.files {
+        if let Err(error) = fs::write(root.join(&file.path), &file.original) {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 /// Unified diff of a plan with `context` lines around each hunk, cut at a line
 /// boundary once it would exceed `max_bytes`. Returns the text and whether it
 /// was cut.
@@ -320,7 +368,7 @@ pub fn render_diff(planned: &Planned, context: usize, max_bytes: usize) -> (Stri
             let first_line = group[0].start_line.saturating_sub(context).max(1);
             let last_line = (group[group.len() - 1].end_line + context).min(starts.len());
             let old_count = last_line + 1 - first_line;
-            let new_lines = |h: &Hunk| h.new.matches('\n').count() + 1;
+            let new_lines = |h: &Hunk| usize::from(!h.new.is_empty()) + h.new.matches('\n').count();
             let group_delta: isize = group
                 .iter()
                 .map(|h| new_lines(h) as isize - (h.end_line - h.start_line + 1) as isize)
@@ -339,7 +387,9 @@ pub fn render_diff(planned: &Planned, context: usize, max_bytes: usize) -> (Stri
             for hunk in group {
                 lines.extend((cursor..hunk.start_line).map(|n| format!(" {}", line(n))));
                 lines.extend(hunk.old.split('\n').map(|l| format!("-{l}")));
-                lines.extend(hunk.new.split('\n').map(|l| format!("+{l}")));
+                if !hunk.new.is_empty() {
+                    lines.extend(hunk.new.split('\n').map(|l| format!("+{l}")));
+                }
                 cursor = hunk.end_line + 1;
             }
             lines.extend((cursor..=last_line).map(|n| format!(" {}", line(n))));
@@ -491,6 +541,55 @@ mod tests {
     }
 
     #[test]
+    fn crlf_anchor_matches_read_lines_text_and_preserves_terminators() {
+        let original = "one\r\ntwo\r\nthree\r\n";
+        let (dir, sha) = tree(original);
+        let planned = plan(
+            dir.path(),
+            &answer(vec![edit(&sha, 1, 2, "one\ntwo", "ONE\nTWO")]),
+            scope,
+        )
+        .unwrap();
+        assert_eq!(planned.files[0].updated, "ONE\r\nTWO\r\nthree\r\n");
+        apply(dir.path(), &planned).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join(SRC)).unwrap(),
+            "ONE\r\nTWO\r\nthree\r\n"
+        );
+    }
+
+    #[test]
+    fn empty_replacement_deletes_lines_instead_of_leaving_blank_line() {
+        let (dir, sha) = tree("one\ntwo\nthree\n");
+        let planned = plan(
+            dir.path(),
+            &answer(vec![edit(&sha, 2, 2, "two", "")]),
+            scope,
+        )
+        .unwrap();
+        assert_eq!(planned.files[0].updated, "one\nthree\n");
+        let (diff, truncated) = render_diff(&planned, 1, 1024);
+        assert!(!truncated);
+        assert!(diff.contains("@@ -1,3 +1,2 @@"));
+        assert!(diff.contains("-two\n"));
+        assert!(!diff.contains("+\n"));
+        apply(dir.path(), &planned).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join(SRC)).unwrap(),
+            "one\nthree\n"
+        );
+
+        let (dir, sha) = tree("one\r\ntwo\r\n");
+        let planned = plan(
+            dir.path(),
+            &answer(vec![edit(&sha, 2, 2, "two", "")]),
+            scope,
+        )
+        .unwrap();
+        assert_eq!(planned.files[0].updated, "one\r\n");
+    }
+
+    #[test]
     fn any_mismatch_rejects_the_whole_patch_and_leaves_files_unchanged() {
         let (dir, sha) = tree(TEXT);
         let good = edit(&sha, 1, 1, "a", "A");
@@ -593,6 +692,33 @@ mod tests {
             .push((PathBuf::from(SRC).join("nested.rs"), "x".into()));
         assert!(apply(dir.path(), &planned).is_err());
         assert_eq!(fs::read_to_string(dir.path().join(SRC)).unwrap(), TEXT);
+    }
+
+    #[test]
+    fn restore_after_later_rejection_reverts_edits_and_new_files() {
+        let (dir, sha) = tree(TEXT);
+        let new_path = "crates/baho-core/tests/new.rs";
+        let planned = plan(
+            dir.path(),
+            &CodeAnswer {
+                edits: vec![edit(&sha, 1, 1, "a", "A")],
+                new_files: vec![NewFile {
+                    path: new_path.into(),
+                    content: "#[test] fn new_test() {}\n".into(),
+                }],
+            },
+            scope,
+        )
+        .unwrap();
+        apply(dir.path(), &planned).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join(SRC)).unwrap(),
+            planned.files[0].updated
+        );
+        assert!(dir.path().join(new_path).is_file());
+        restore(dir.path(), &planned).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join(SRC)).unwrap(), TEXT);
+        assert!(!dir.path().join(new_path).exists());
     }
 
     #[test]

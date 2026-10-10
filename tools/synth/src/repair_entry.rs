@@ -64,9 +64,11 @@ impl RepairOptions {
             coder_prompt_version: "repair-coder-v2".into(),
             reviewer_prompt_version: "repair-reviewer-v2".into(),
             model: "neuralwatt".into(),
-            max_agent_turns: 12,
+            max_investigator_turns: 12,
+            max_agent_turns: 6,
             max_tool_calls: 20,
-            process_timeout_seconds: 120,
+            api_request_timeout_seconds: 600,
+            process_timeout_seconds: 300,
             max_output_bytes: 64 * 1024,
             max_read_bytes: 1024,
             max_outline_bytes: 6 * 1024,
@@ -263,5 +265,12 @@ mod tests {
             generation_path(evaluation, "generation-456").unwrap(),
             Path::new("synthetic/out/generation-456")
         );
+    }
+
+    #[test]
+    fn default_timeouts_separate_provider_request_from_worker_process() {
+        let settings = RepairOptions::default_settings();
+        assert_eq!(settings.api_request_timeout_seconds, 600);
+        assert_eq!(settings.process_timeout_seconds, 300);
     }
 }

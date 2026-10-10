@@ -531,21 +531,32 @@ impl SourceSession {
                 out.push(result);
                 continue;
             }
-            let mut served = 0usize;
             let mut line_no = r.start;
             while line_no <= end {
                 let line = file.line(line_no);
                 let room = cap - used;
-                let (shown, cut) = if line.len() <= room {
+                let prefix = format!("{line_no:>6}| ");
+                let overhead = prefix.len() + 1; // Number and trailing newline.
+                if room < overhead {
+                    break;
+                }
+                let available = room - overhead;
+                let (shown, cut) = if line.len() <= available {
                     (line, false)
                 } else if used == 0 {
-                    (&line[..floor_boundary(line, room)], true)
+                    let boundary = floor_boundary(line, available);
+                    if boundary == 0 {
+                        break;
+                    }
+                    (&line[..boundary], true)
                 } else {
                     break;
                 };
-                result.text.push_str(&format!("{line_no:>6}| {shown}\n"));
-                used += shown.len();
-                served += shown.len();
+                result.text.push_str(&prefix);
+                result.text.push_str(shown);
+                result.text.push('\n');
+                let line_bytes = overhead + shown.len();
+                used += line_bytes;
                 result.served_end = Some(line_no);
                 result.line_truncated |= cut;
                 line_no += 1;
@@ -553,16 +564,16 @@ impl SourceSession {
                     break;
                 }
             }
-            if served > 0 || result.served_end.is_some() {
+            if result.served_end.is_some() {
                 exposed.push(Exposed {
                     path: name.clone(),
                     file_sha256: file.sha256.clone(),
                     start_line: r.start,
                     end_line: result.served_end.unwrap_or(r.start),
-                    bytes: served,
+                    bytes: result.text.len(),
                 });
             }
-            if line_no > end {
+            if line_no > end && !result.line_truncated {
                 result.status = RangeStatus::Served;
             } else {
                 result.status = if result.served_end.is_some() {
@@ -1401,27 +1412,61 @@ mod tests {
             .unwrap();
         assert!(r.truncated);
         assert!(r.bytes <= 1024);
+        assert_eq!(
+            r.bytes,
+            r.ranges.iter().map(|range| range.text.len()).sum::<usize>()
+        );
         let first = &r.ranges[0];
         assert_eq!(first.status, RangeStatus::Partial);
-        assert_eq!(first.served_end, Some(146)); // 146 * 7 = 1022 <= 1024
-        assert_eq!(first.next_line, Some(147));
+        assert_eq!(first.served_end, Some(64)); // 64 * (9-byte numbering + 7-byte content)
+        assert_eq!(first.next_line, Some(65));
         assert_eq!(r.ranges[1].status, RangeStatus::NotServed);
         assert_eq!(r.ranges[1].next_line, Some(150));
         assert_eq!(r.ranges[2].status, RangeStatus::NotServed);
         assert_eq!(r.exposed.len(), 1);
-        assert_eq!((r.exposed[0].start_line, r.exposed[0].end_line), (1, 146));
-        assert_eq!(r.exposed[0].bytes, 1022);
+        assert_eq!((r.exposed[0].start_line, r.exposed[0].end_line), (1, 64));
+        assert_eq!(r.exposed[0].bytes, 1024);
         // Continuation starts exactly at next_line.
         let r2 = s
-            .read_lines(
-                &rel("a.rs"),
-                &[LineRange {
-                    start: 147,
-                    end: 148,
-                }],
-            )
+            .read_lines(&rel("a.rs"), &[LineRange { start: 65, end: 66 }])
             .unwrap();
-        assert!(r2.ranges[0].text.starts_with("   147| line147"));
+        assert!(r2.ranges[0].text.starts_with("    65| line065"));
+    }
+
+    #[test]
+    fn blank_lines_count_toward_read_response_cap() {
+        let (dir, s) = session_with(limits());
+        write(&dir, "blank.txt", &"\n".repeat(200));
+        let r = s
+            .read_lines(&rel("blank.txt"), &[LineRange { start: 1, end: 200 }])
+            .unwrap();
+        let range = &r.ranges[0];
+        assert_eq!(range.status, RangeStatus::Partial);
+        assert_eq!(range.served_end, Some(113)); // 113 numbered blank lines * 9 bytes
+        assert_eq!(range.next_line, Some(114));
+        assert!(!range.line_truncated);
+        assert!(r.truncated);
+        assert_eq!(r.bytes, range.text.len());
+        assert_eq!(r.bytes, r.exposed[0].bytes);
+        assert!(r.bytes <= 1024);
+        assert_eq!(range.text.lines().count(), 113);
+    }
+
+    #[test]
+    fn clipped_final_requested_line_is_reported_as_partial() {
+        let (dir, s) = session_with(limits());
+        write(&dir, "long.txt", &format!("{}\n", "a".repeat(1100)));
+        let r = s
+            .read_lines(&rel("long.txt"), &[LineRange { start: 1, end: 1 }])
+            .unwrap();
+        let range = &r.ranges[0];
+        assert_eq!(range.status, RangeStatus::Partial);
+        assert_eq!(range.served_end, Some(1));
+        assert_eq!(range.next_line, Some(2));
+        assert!(range.line_truncated);
+        assert!(r.truncated);
+        assert_eq!(r.bytes, 1024);
+        assert_eq!(r.bytes, range.text.len());
     }
 
     #[test]
@@ -1434,7 +1479,7 @@ mod tests {
             .unwrap();
         let range = &r.ranges[0];
         assert!(range.line_truncated);
-        assert_eq!(r.bytes, 1024); // 512 two-byte chars
+        assert_eq!(r.bytes, 1023); // 507 two-byte chars and 9 bytes of numbering
         assert_eq!(range.status, RangeStatus::Partial);
         assert_eq!(range.served_end, Some(1));
         assert_eq!(range.next_line, Some(2));
@@ -1620,20 +1665,20 @@ mod tests {
     fn call_and_byte_budgets_are_enforced_with_typed_errors() {
         let mut l = limits();
         l.max_calls = 3;
-        l.stage_bytes = 45;
+        l.stage_bytes = 48;
         let (dir, s) = session_with(l);
         write(&dir, "a.rs", &"0123456789\n".repeat(10));
         let p = rel("a.rs");
-        // 40-byte stage budget clamps the response (below the 1 KiB cap).
+        // The stage budget counts numbering and newlines as well as content.
         let r = s
             .read_lines(&p, &[LineRange { start: 1, end: 10 }])
             .unwrap();
-        assert_eq!(r.bytes, 40); // four 10-byte lines; a fifth exceeds 45
+        assert_eq!(r.bytes, 38); // two numbered 10-byte lines
         assert!(r.truncated);
         let r2 = s
             .read_lines(&p, &[LineRange { start: 1, end: 10 }])
             .unwrap();
-        assert_eq!(r2.bytes, 5); // only 5 bytes remain: first line is cut
+        assert_eq!(r2.bytes, 10); // 10 bytes remain: one character fits after numbering
         assert!(r2.ranges[0].line_truncated);
         // Budget now fully spent.
         let e = s
