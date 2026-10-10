@@ -506,6 +506,9 @@ pub struct Investigation {
 }
 
 pub trait Agents {
+    fn failure_reason(&self) -> Option<&str> {
+        None
+    }
     fn investigate(&mut self, target: &Observation) -> Result<Investigation, Outcome>;
     fn code(&mut self, regression: &Path, checkout: &Path) -> Result<(), Outcome>;
     fn review(
@@ -894,7 +897,11 @@ pub fn run_attempt(
         }
     };
     let outcome = run()?;
-    record.finish(outcome, "stage completed")?;
+    let reason = agents
+        .failure_reason()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{:?}: {outcome:?}", record.manifest.stage));
+    record.finish(outcome, &reason)?;
     Ok(outcome)
 }
 
@@ -1081,6 +1088,9 @@ mod tests {
         log: Vec<String>,
     }
     impl Agents for StubAgents {
+        fn failure_reason(&self) -> Option<&str> {
+            (self.mode == "exhausted").then_some("investigation: session_timeout (limit=120)")
+        }
         fn investigate(&mut self, observation: &Observation) -> Result<Investigation, Outcome> {
             self.log.push("investigate".into());
             if self.mode == "exhausted" {
@@ -1180,6 +1190,17 @@ mod tests {
             assert_eq!(outcome, expected, "{worker_mode}/{agent_mode}");
             assert_eq!(record.manifest.stage, Stage::Terminal);
         }
+    }
+
+    #[test]
+    fn agent_failure_reason_survives_terminal_manifest() {
+        let (_, record, _, _, _root) = attempt("ok", "exhausted");
+        let manifest =
+            AttemptManifest::parse(&fs::read(record.dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest.reason.as_deref(),
+            Some("investigation: session_timeout (limit=120)")
+        );
     }
 
     #[test]

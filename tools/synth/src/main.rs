@@ -140,6 +140,11 @@ fn repair_command(
         &options,
     )?;
     println!("{:?}: {}", outcome, path.display());
+    let manifest =
+        synth::repair::AttemptManifest::parse(&std::fs::read(path.join("manifest.json"))?)?;
+    if let Some(reason) = manifest.reason {
+        println!("reason: {reason}");
+    }
     Ok(())
 }
 

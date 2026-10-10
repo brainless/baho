@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::redaction::Redactor;
 use crate::repair::SuiteId;
 use crate::repair_live::LiveWorker;
+use crate::repair_trace::AgentTrace;
 
 #[derive(Debug, thiserror::Error)]
 #[error("repair source tool denied request")]
@@ -26,11 +27,18 @@ struct SourceTools {
     root: PathBuf,
     calls: Arc<AtomicU32>,
     max_calls: u32,
+    trace: AgentTrace,
 }
 
 impl SourceTools {
     fn charge(&self) -> Result<(), SourceToolError> {
         let before = self.calls.fetch_add(1, Ordering::Relaxed);
+        if before >= self.max_calls {
+            self.trace.event(
+                "tool_budget_exhausted",
+                json!({"limit":self.max_calls,"attempted_call":before + 1}),
+            );
+        }
         (before < self.max_calls)
             .then_some(())
             .ok_or(SourceToolError)
@@ -271,6 +279,7 @@ pub struct RigRepairAgents {
     reduced_prompt: String,
     reduced_sql: String,
     hypothesis: Option<Investigation>,
+    failure_reason: Option<String>,
 }
 
 impl RigRepairAgents {
@@ -293,15 +302,33 @@ impl RigRepairAgents {
             reduced_prompt: String::new(),
             reduced_sql: String::new(),
             hypothesis: None,
+            failure_reason: None,
         }
     }
 
-    fn ask<T: for<'de> Deserialize<'de>>(&self, role: &str, prompt: String) -> Result<T, Outcome> {
+    fn ask<T: for<'de> Deserialize<'de>>(
+        &mut self,
+        stage: &'static str,
+        role: &str,
+        prompt: String,
+    ) -> Result<T, Outcome> {
+        self.failure_reason = None;
+        let trace_path = self
+            .checkout
+            .parent()
+            .ok_or(Outcome::EnvironmentFailure)?
+            .join("agent-events.jsonl");
+        let trace = AgentTrace::open(&trace_path, stage).map_err(|_| {
+            self.failure_reason = Some(format!("{stage}: logging_io_error"));
+            Outcome::EnvironmentFailure
+        })?;
+        trace.event("agent_started", json!({"max_agent_turns":self.settings.max_agent_turns,"max_tool_calls":self.settings.max_tool_calls,"session_timeout_seconds":self.settings.process_timeout_seconds,"max_output_bytes":self.settings.max_output_bytes}));
         let model = self.model.clone();
         let tools = SourceTools {
             root: self.checkout.clone(),
             calls: Arc::new(AtomicU32::new(0)),
             max_calls: self.settings.max_tool_calls,
+            trace: trace.clone(),
         };
         let probe = ProbeTool {
             tools: tools.clone(),
@@ -314,10 +341,14 @@ impl RigRepairAgents {
         };
         let max_turns = self.settings.max_agent_turns as usize;
         let timeout = Duration::from_secs(self.settings.process_timeout_seconds);
-        let answer = tokio::task::block_in_place(|| {
+        let calls = tools.calls.clone();
+        let hook = trace.clone();
+        let max_bytes = self.settings.max_output_bytes;
+        let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let agent = AgentBuilder::new(model)
                     .preamble(role)
+                    .add_hook(hook)
                     .temperature(0.2)
                     .max_tokens(8192)
                     .tool(ReadSource(tools.clone()))
@@ -325,18 +356,80 @@ impl RigRepairAgents {
                     .tool(probe)
                     .tool(checks)
                     .build();
-                tokio::time::timeout(timeout, agent.prompt(prompt).max_turns(max_turns)).await
+                timed_answer(
+                    timeout,
+                    async {
+                        agent
+                            .prompt(prompt)
+                            .max_turns(max_turns)
+                            .await
+                            .map(|answer| answer.output().to_owned())
+                    },
+                    max_bytes,
+                )
+                .await
             })
-        })
-        .map_err(|_| Outcome::ModelExhausted)?
-        .map_err(|_| Outcome::ModelExhausted)?;
-        let output = answer.output();
-        if output.len() > self.settings.max_output_bytes {
-            return Err(Outcome::ModelExhausted);
+        });
+        let (cause, limit) = result
+            .as_ref()
+            .err()
+            .copied()
+            .unwrap_or(("completed", None));
+        let logged = trace.finish(cause, limit, calls.load(Ordering::Relaxed));
+        if !logged {
+            self.failure_reason = Some(format!("{stage}: logging_io_error; agent cause={cause}"));
+            return Err(Outcome::EnvironmentFailure);
         }
-        // Reject prose wrappers and markdown fences: the stage protocol is JSON.
-        serde_json::from_str(output).map_err(|_| Outcome::ModelExhausted)
+        result.map_err(|(cause, limit)| {
+            self.failure_reason = Some(format!(
+                "{stage}: {cause}{}; tool_budget_exhausted={}",
+                limit.map(|n| format!(" (limit={n})")).unwrap_or_default(),
+                calls.load(Ordering::Relaxed) > self.settings.max_tool_calls
+            ));
+            Outcome::ModelExhausted
+        })
     }
+}
+
+async fn timed_answer<T: for<'de> Deserialize<'de>>(
+    timeout: Duration,
+    future: impl std::future::Future<Output = Result<String, rig::prelude::PromptError>>,
+    max_bytes: usize,
+) -> Result<T, (&'static str, Option<u64>)> {
+    match tokio::time::timeout(timeout, future).await {
+        Err(_) => Err(("session_timeout", Some(timeout.as_secs()))),
+        Ok(Err(error)) => Err((
+            prompt_error_cause(&error),
+            match error {
+                rig::prelude::PromptError::MaxTurnsError { max_turns, .. } => {
+                    Some(max_turns as u64)
+                }
+                _ => None,
+            },
+        )),
+        Ok(Ok(output)) => decode_answer(&output, max_bytes),
+    }
+}
+
+fn prompt_error_cause(error: &rig::prelude::PromptError) -> &'static str {
+    use rig::prelude::PromptError;
+    match error {
+        PromptError::MaxTurnsError { .. } => "max_agent_turns",
+        PromptError::CompletionError(_) => "provider_error",
+        PromptError::Report(report) => report.kind.code(),
+        PromptError::MemoryError(_) => "memory_error",
+        PromptError::PromptCancelled { .. } => "agent_cancelled",
+        PromptError::UnknownToolCall { .. } => "unknown_tool_call",
+    }
+}
+fn decode_answer<T: for<'de> Deserialize<'de>>(
+    output: &str,
+    max_bytes: usize,
+) -> Result<T, (&'static str, Option<u64>)> {
+    if output.len() > max_bytes {
+        return Err(("max_output_bytes", Some(max_bytes as u64)));
+    }
+    serde_json::from_str(output).map_err(|_| ("invalid_final_json", None))
 }
 
 fn allowed(path: &Path, present: bool) -> bool {
@@ -358,12 +451,15 @@ fn verified_patch_json(patch_sha256: &str, patch: &[PatchFile]) -> Result<String
 }
 
 impl Agents for RigRepairAgents {
+    fn failure_reason(&self) -> Option<&str> {
+        self.failure_reason.as_deref()
+    }
     fn investigate(&mut self, target: &Observation) -> Result<Investigation, Outcome> {
         let prompt = format!(
             "Investigate this reproduced Role text-equality mismatch. Return only JSON with result_ids, causal_hypothesis, mechanism, allowed_files, compatibility_checks, reduction. Reduction has csv, prompt, sql fields only; use a small neutral synthetic CSV and restricted Role equality SQL. The harness computes expected rows. The result_ids must include the observed result. Target prompt: {:?}. Baseline result ID: {}. Baseline plan: {:?}. Allowed production scope: crates/baho-core/src/.",
             self.target_prompt, target.result_id, target.plan,
         );
-        let answer: InvestigationAnswer = self.ask("You are the independent repair investigator. State one testable mechanism. Do not request scope expansion. Return JSON only.", prompt)?;
+        let answer: InvestigationAnswer = self.ask("investigation", "You are the independent repair investigator. State one testable mechanism. Do not request scope expansion. Return JSON only.", prompt)?;
         let handoff = Investigation {
             result_ids: answer.result_ids,
             causal_hypothesis: answer.causal_hypothesis,
@@ -421,7 +517,7 @@ impl Agents for RigRepairAgents {
             self.reduced_sql,
             sources
         );
-        let answer: CodeAnswer = self.ask("You are the repair coder. Edit only the allowed core source files and add tests under crates/baho-core/tests/. Do not alter expectations or protected files. Return JSON only.", prompt)?;
+        let answer: CodeAnswer = self.ask("coding", "You are the repair coder. Edit only the allowed core source files and add tests under crates/baho-core/tests/. Do not alter expectations or protected files. Return JSON only.", prompt)?;
         if answer.files.is_empty() || answer.files.len() > 8 {
             return Err(Outcome::Rejected);
         }
@@ -456,7 +552,7 @@ impl Agents for RigRepairAgents {
             "Review this frozen repair. Return only JSON {{\"pass\":bool,\"reason\":string}}. Patch hash: {}. Patch: {}. Before/after observations: {:?}. Reduced CSV: {:?}; prompt: {:?}; SQL: {:?}. Check NL/SQL meaning, overfitting, preserved tests, and counterexamples. Reject uncertain semantics.",
             patch_sha256, patch, evidence, self.reduced_csv, self.reduced_prompt, self.reduced_sql
         );
-        let answer: ReviewAnswer = self.ask("You are an independent reviewer with a fresh Rig history. You cannot edit source or expectations. Return JSON only.", prompt)?;
+        let answer: ReviewAnswer = self.ask("review", "You are an independent reviewer with a fresh Rig history. You cannot edit source or expectations. Return JSON only.", prompt)?;
         if answer.reason.trim().is_empty() {
             return Err(Outcome::ReviewIncomplete);
         }
@@ -473,6 +569,105 @@ mod tests {
     };
     use crate::probe::{BodyObservation, OracleObservation, ProbeObservation, SyntheticRow};
 
+    #[tokio::test]
+    async fn distinguishes_timeout_turn_limit_provider_and_output_failures() {
+        use rig::test_utils::{MockCompletionModel, MockTurn};
+        let timeout =
+            timed_answer::<Value>(Duration::from_millis(1), std::future::pending(), 100).await;
+        assert_eq!(timeout.unwrap_err().0, "session_timeout");
+        let agent = AgentBuilder::new(MockCompletionModel::text("{}")).build();
+        let turns = timed_answer::<Value>(
+            Duration::from_secs(1),
+            async {
+                agent
+                    .prompt("private prompt")
+                    .max_turns(0)
+                    .await
+                    .map(|a| a.output().to_owned())
+            },
+            100,
+        )
+        .await;
+        assert_eq!(turns.unwrap_err(), ("max_agent_turns", Some(0)));
+        let agent = AgentBuilder::new(MockCompletionModel::from_turns([MockTurn::error(
+            "secret provider body",
+        )]))
+        .build();
+        let provider = timed_answer::<Value>(
+            Duration::from_secs(1),
+            async {
+                agent
+                    .prompt("private prompt")
+                    .await
+                    .map(|a| a.output().to_owned())
+            },
+            100,
+        )
+        .await;
+        assert!(matches!(
+            provider.unwrap_err().0,
+            "provider" | "provider_error"
+        ));
+        assert_eq!(
+            decode_answer::<Value>("private malformed output", 100)
+                .unwrap_err()
+                .0,
+            "invalid_final_json"
+        );
+        assert_eq!(
+            decode_answer::<Value>("12345", 4).unwrap_err(),
+            ("max_output_bytes", Some(4))
+        );
+    }
+
+    #[tokio::test]
+    async fn records_tool_budget_without_recording_source_or_arguments() {
+        use rig::test_utils::{MockCompletionModel, MockTurn};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-events.jsonl");
+        let trace = AgentTrace::open(&path, "investigation").unwrap();
+        let tools = SourceTools {
+            root: dir.path().into(),
+            calls: Arc::new(AtomicU32::new(0)),
+            max_calls: 0,
+            trace: trace.clone(),
+        };
+        let agent = AgentBuilder::new(MockCompletionModel::from_turns([
+            MockTurn::tool_call(
+                "private-call-id",
+                "read_file",
+                json!({"path":"private source path"}),
+            ),
+            MockTurn::text("{}"),
+        ]))
+        .add_hook(trace.clone())
+        .tool(ReadSource(tools.clone()))
+        .build();
+        agent.prompt("private prompt").max_turns(2).await.unwrap();
+        assert!(trace.finish("completed", None, tools.calls.load(Ordering::Relaxed)));
+        let text = fs::read_to_string(path).unwrap();
+        assert!(!text.contains("private"));
+        let events: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for name in [
+            "model_call_started",
+            "model_call_finished",
+            "tool_call_started",
+            "tool_budget_exhausted",
+            "tool_call_finished",
+            "agent_finished",
+        ] {
+            assert!(events.iter().any(|event| event["name"] == name), "{name}");
+        }
+        let finished = events
+            .iter()
+            .find(|event| event["name"] == "tool_call_finished")
+            .unwrap();
+        assert_eq!(finished["detail"]["succeeded"], false);
+        assert!(finished["detail"]["elapsed_ms"].is_number());
+    }
     #[test]
     fn synthetic_probe_exposes_observed_membership_diagnostics_and_typed_plan() {
         let observation = ProbeObservation {

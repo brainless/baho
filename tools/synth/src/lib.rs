@@ -17,5 +17,6 @@ pub mod repair_agents;
 pub mod repair_build;
 pub mod repair_entry;
 pub mod repair_live;
+mod repair_trace;
 pub mod sql;
 pub mod submit_epic;

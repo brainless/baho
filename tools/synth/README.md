@@ -301,3 +301,22 @@ output quality still requires reviewing a new draft against the same evaluation.
 The whole-run timeout is shared by all model stages and checked before final
 publication. Atomic publication can additionally wait up to ten seconds for the
 repository lock; that wait makes no provider calls.
+
+### Repair activity logs
+
+Each `repair` attempt writes incremental, payload-free model and tool activity to
+`agent-events.jsonl` in its attempt directory. Events record the stage, internal
+call identifier, start/end timing, token usage when returned, tool success, and
+budget denials. A start event survives a session timeout; the terminal events
+identify interrupted calls and the precise timeout, turn limit, output limit,
+provider error category, or JSON protocol failure. The 120-second default remains
+a deadline for the entire agent stage, including tools.
+
+The terminal manifest's `reason` and CLI output include the failing stage and
+cause. Tool-budget denials are recorded separately even if the session later ends
+on another limit. No prompts, model answers, tool arguments/results, provider
+error bodies, or credentials are stored in this activity log. Each stage retains
+up to 2,000 activity events plus its terminal summary, which reports omitted
+event counts. This new sidecar uses its own schema version 1; existing attempt
+manifest and contract schemas remain unchanged and historical records are not
+rewritten. Transport retries inside a provider call are not separate Rig calls.
