@@ -60,14 +60,18 @@ pub struct RepairOptions {
 impl RepairOptions {
     pub fn default_settings() -> AttemptSettings {
         AttemptSettings {
-            investigator_prompt_version: "repair-investigator-v1".into(),
-            coder_prompt_version: "repair-coder-v1".into(),
-            reviewer_prompt_version: "repair-reviewer-v1".into(),
+            investigator_prompt_version: "repair-investigator-v2".into(),
+            coder_prompt_version: "repair-coder-v2".into(),
+            reviewer_prompt_version: "repair-reviewer-v2".into(),
             model: "neuralwatt".into(),
-            max_agent_turns: 6,
+            max_agent_turns: 12,
             max_tool_calls: 20,
             process_timeout_seconds: 120,
             max_output_bytes: 64 * 1024,
+            max_read_bytes: 1024,
+            max_outline_bytes: 6 * 1024,
+            max_search_matches: 40,
+            max_exposed_bytes: 48 * 1024,
         }
     }
 }

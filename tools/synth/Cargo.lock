@@ -6123,10 +6123,12 @@ version = "0.1.0"
 dependencies = [
  "csv",
  "futures",
+ "proc-macro2",
  "rig",
  "serde",
  "serde_json",
  "sha2",
+ "syn 3.0.6",
  "tempfile",
  "thiserror",
  "tokio",

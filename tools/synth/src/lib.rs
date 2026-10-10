@@ -1,3 +1,4 @@
+pub mod anchored_edits;
 pub mod cli_run;
 pub mod context_pack;
 pub mod contracts;
@@ -18,5 +19,6 @@ pub mod repair_build;
 pub mod repair_entry;
 pub mod repair_live;
 mod repair_trace;
+pub mod source_tools;
 pub mod sql;
 pub mod submit_epic;

@@ -12,7 +12,10 @@ use thiserror::Error;
 
 use crate::contracts::PlanComparison;
 
-pub const ATTEMPT_SCHEMA: u32 = 1;
+/// Version 2 pins the source-tool budgets in `AttemptSettings` (Epic 019).
+/// Version 1 contracts and manifests lack them and are rejected, not defaulted,
+/// because no attempt was accepted under version 1.
+pub const ATTEMPT_SCHEMA: u32 = 2;
 const MAX_PATCH_BYTES: usize = 256 * 1024;
 const MAX_TREE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -56,6 +59,14 @@ pub struct AttemptSettings {
     pub max_tool_calls: u32,
     pub process_timeout_seconds: u64,
     pub max_output_bytes: usize,
+    /// Source text returned by one `read_lines` response.
+    pub max_read_bytes: usize,
+    /// Outline text returned by one `outline` page.
+    pub max_outline_bytes: usize,
+    /// Matches returned by one `search_text` response.
+    pub max_search_matches: usize,
+    /// Total source-derived bytes exposed to one stage.
+    pub max_exposed_bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +98,10 @@ impl RepairContract {
             || self.settings.process_timeout_seconds == 0
             || self.settings.max_output_bytes == 0
             || self.settings.max_output_bytes > 1024 * 1024
+            || !(1..=16 * 1024).contains(&self.settings.max_read_bytes)
+            || !(1..=32 * 1024).contains(&self.settings.max_outline_bytes)
+            || !(1..=200).contains(&self.settings.max_search_matches)
+            || !(1..=1024 * 1024).contains(&self.settings.max_exposed_bytes)
             || ![
                 &self.evaluation_sha256,
                 &self.generation_sha256,
@@ -240,6 +255,10 @@ pub struct AttemptManifest {
     pub patch_sha256: Option<String>,
     pub reason: Option<String>,
     pub cleanup_error: Option<String>,
+    /// Redacted questions a stage left open when it declared insufficient
+    /// evidence. Model output, so unverified.
+    #[serde(default)]
+    pub open_questions: Vec<String>,
 }
 
 impl AttemptManifest {
@@ -311,6 +330,7 @@ impl AttemptRecord {
                             patch_sha256: None,
                             reason: None,
                             cleanup_error: None,
+                            open_questions: Vec::new(),
                         },
                     };
                     record.persist()?;
@@ -508,6 +528,10 @@ pub struct Investigation {
 pub trait Agents {
     fn failure_reason(&self) -> Option<&str> {
         None
+    }
+    /// Redacted open questions from a stage that declared insufficient evidence.
+    fn open_questions(&self) -> &[String] {
+        &[]
     }
     fn investigate(&mut self, target: &Observation) -> Result<Investigation, Outcome>;
     fn code(&mut self, regression: &Path, checkout: &Path) -> Result<(), Outcome>;
@@ -901,6 +925,7 @@ pub fn run_attempt(
         .failure_reason()
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{:?}: {outcome:?}", record.manifest.stage));
+    record.manifest.open_questions = agents.open_questions().to_vec();
     record.finish(outcome, &reason)?;
     Ok(outcome)
 }
@@ -936,6 +961,10 @@ mod tests {
                 max_tool_calls: 20,
                 process_timeout_seconds: 30,
                 max_output_bytes: 64 * 1024,
+                max_read_bytes: 1024,
+                max_outline_bytes: 6 * 1024,
+                max_search_matches: 40,
+                max_exposed_bytes: 48 * 1024,
             },
             baseline_revision: "a".repeat(40),
             evaluation_sha256: "b".repeat(64),
@@ -1086,10 +1115,18 @@ mod tests {
     struct StubAgents {
         mode: &'static str,
         log: Vec<String>,
+        questions: Vec<String>,
     }
     impl Agents for StubAgents {
         fn failure_reason(&self) -> Option<&str> {
             (self.mode == "exhausted").then_some("investigation: session_timeout (limit=120)")
+        }
+        fn open_questions(&self) -> &[String] {
+            if self.mode == "exhausted" {
+                &self.questions
+            } else {
+                &[]
+            }
         }
         fn investigate(&mut self, observation: &Observation) -> Result<Investigation, Outcome> {
             self.log.push("investigate".into());
@@ -1137,6 +1174,7 @@ mod tests {
         let mut agents = StubAgents {
             mode: agent_mode,
             log: vec![],
+            questions: vec!["which operator path?".into()],
         };
         let result = run_attempt(&mut record, &contract, &mut worker, &mut agents).unwrap();
         assert_eq!(record.manifest.outcome, Some(result));
@@ -1201,6 +1239,7 @@ mod tests {
             manifest.reason.as_deref(),
             Some("investigation: session_timeout (limit=120)")
         );
+        assert_eq!(manifest.open_questions, ["which operator path?"]);
     }
 
     #[test]
@@ -1219,6 +1258,7 @@ mod tests {
         let mut agents = StubAgents {
             mode: "ok",
             log: vec![],
+            questions: vec!["which operator path?".into()],
         };
         assert_eq!(
             run_attempt(&mut record, &contract, &mut worker, &mut agents).unwrap(),
@@ -1249,6 +1289,7 @@ mod tests {
             patch_sha256: None,
             reason: None,
             cleanup_error: None,
+            open_questions: Vec::new(),
         };
         assert!(matches!(
             AttemptManifest::parse(&serde_json::to_vec(&manifest).unwrap()),
