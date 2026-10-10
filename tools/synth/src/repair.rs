@@ -508,7 +508,12 @@ pub struct Investigation {
 pub trait Agents {
     fn investigate(&mut self, target: &Observation) -> Result<Investigation, Outcome>;
     fn code(&mut self, regression: &Path, checkout: &Path) -> Result<(), Outcome>;
-    fn review(&mut self, patch_sha256: &str, evidence: &[Observation]) -> Result<bool, Outcome>;
+    fn review(
+        &mut self,
+        patch_sha256: &str,
+        patch: &[PatchFile],
+        evidence: &[Observation],
+    ) -> Result<bool, Outcome>;
 }
 
 /// Implementations must build/run only in a confined worker with no credentials,
@@ -882,7 +887,7 @@ pub fn run_attempt(
             }
         }
         record.advance(Stage::Review, "review_started")?;
-        match agents.review(&patch_hash, &evidence) {
+        match agents.review(&patch_hash, &patch, &evidence) {
             Ok(true) => Ok(Outcome::Accepted),
             Ok(false) => Ok(Outcome::Rejected),
             Err(o) => Ok(o),
@@ -1096,8 +1101,17 @@ mod tests {
             fs::write(checkout.join("crates/baho-core/src/intent.rs"), "repaired").unwrap();
             Ok(())
         }
-        fn review(&mut self, _: &str, _: &[Observation]) -> Result<bool, Outcome> {
+        fn review(
+            &mut self,
+            patch_sha256: &str,
+            patch: &[PatchFile],
+            _: &[Observation],
+        ) -> Result<bool, Outcome> {
             self.log.push("review".into());
+            assert_eq!(hash(serde_json::to_vec(patch).unwrap()), patch_sha256);
+            assert_eq!(patch.len(), 1);
+            assert_eq!(patch[0].path, Path::new("crates/baho-core/src/intent.rs"));
+            assert_eq!(patch[0].content, "repaired");
             Ok(self.mode != "reject")
         }
     }

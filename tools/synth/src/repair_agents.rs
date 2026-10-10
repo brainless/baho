@@ -152,6 +152,15 @@ struct ProbeTool {
     worker: Arc<Mutex<LiveWorker>>,
     redactor: Redactor,
 }
+
+fn probe_tool_output(
+    observation: crate::probe::ProbeObservation,
+) -> Result<Value, SourceToolError> {
+    let mut output = serde_json::to_value(observation).map_err(|_| SourceToolError)?;
+    output["asserted_desired_behavior"] = Value::Bool(false);
+    Ok(output)
+}
+
 impl PortableTool for ProbeTool {
     const NAME: &'static str = "probe";
     type Args = ProbeArgs;
@@ -177,17 +186,13 @@ impl PortableTool for ProbeTool {
         {
             return Err(SourceToolError);
         }
-        let source_rows =
-            crate::probe::validate_synthetic(args.csv.as_bytes()).map_err(|_| SourceToolError)?;
         let observation = self
             .worker
             .lock()
             .map_err(|_| SourceToolError)?
             .synthetic_probe(&args.build_id, &args.csv, &args.prompt, args.sql.as_deref())
             .map_err(|_| SourceToolError)?;
-        Ok(
-            json!({"build_id":observation.build_id,"fixture_sha256":observation.fixture_sha256,"prompt_sha256":observation.prompt_sha256,"result_id":observation.result_id,"source_rows":source_rows,"actual_result_rows":observation.source_rows,"plan_comparison":observation.plan,"asserted_desired_behavior":false}),
-        )
+        probe_tool_output(observation)
     }
 }
 
@@ -266,7 +271,6 @@ pub struct RigRepairAgents {
     reduced_prompt: String,
     reduced_sql: String,
     hypothesis: Option<Investigation>,
-    patch: Vec<PatchFile>,
 }
 
 impl RigRepairAgents {
@@ -289,7 +293,6 @@ impl RigRepairAgents {
             reduced_prompt: String::new(),
             reduced_sql: String::new(),
             hypothesis: None,
-            patch: Vec::new(),
         }
     }
 
@@ -344,6 +347,14 @@ fn allowed(path: &Path, present: bool) -> bool {
     let text = path.to_string_lossy();
     text.starts_with("crates/baho-core/src/")
         || (!present && text.starts_with("crates/baho-core/tests/") && text.ends_with(".rs"))
+}
+
+fn verified_patch_json(patch_sha256: &str, patch: &[PatchFile]) -> Result<String, Outcome> {
+    let bytes = serde_json::to_vec(patch).map_err(|_| Outcome::ReviewIncomplete)?;
+    if digest(&bytes) != patch_sha256 {
+        return Err(Outcome::ReviewIncomplete);
+    }
+    String::from_utf8(bytes).map_err(|_| Outcome::ReviewIncomplete)
 }
 
 impl Agents for RigRepairAgents {
@@ -431,13 +442,16 @@ impl Agents for RigRepairAgents {
         }
         let after = snapshot(checkout).map_err(|_| Outcome::Rejected)?;
         check_edits(&before, &after, checkout).map_err(|_| Outcome::Rejected)?;
-        self.patch = answer.files;
         Ok(())
     }
 
-    fn review(&mut self, patch_sha256: &str, evidence: &[Observation]) -> Result<bool, Outcome> {
-        let patch = serde_json::to_string(&self.patch).map_err(|_| Outcome::ReviewIncomplete)?;
-        if digest(&patch) == patch_sha256 { /* hash is independently checked by the harness */ }
+    fn review(
+        &mut self,
+        patch_sha256: &str,
+        patch: &[PatchFile],
+        evidence: &[Observation],
+    ) -> Result<bool, Outcome> {
+        let patch = verified_patch_json(patch_sha256, patch)?;
         let prompt = format!(
             "Review this frozen repair. Return only JSON {{\"pass\":bool,\"reason\":string}}. Patch hash: {}. Patch: {}. Before/after observations: {:?}. Reduced CSV: {:?}; prompt: {:?}; SQL: {:?}. Check NL/SQL meaning, overfitting, preserved tests, and counterexamples. Reject uncertain semantics.",
             patch_sha256, patch, evidence, self.reduced_csv, self.reduced_prompt, self.reduced_sql
@@ -447,5 +461,84 @@ impl Agents for RigRepairAgents {
             return Err(Outcome::ReviewIncomplete);
         }
         Ok(answer.pass)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli_run::DiagnosticSummary;
+    use crate::contracts::{
+        PlanComparison, PlanEvidence, PlanLiteral, PlanOperator, TextMatchPolicy,
+    };
+    use crate::probe::{BodyObservation, OracleObservation, ProbeObservation, SyntheticRow};
+
+    #[test]
+    fn synthetic_probe_exposes_observed_membership_diagnostics_and_typed_plan() {
+        let observation = ProbeObservation {
+            build_id: "build".into(),
+            binary_sha256: "binary".into(),
+            fixture_sha256: "fixture".into(),
+            prompt_sha256: "prompt".into(),
+            result_id: "result".into(),
+            run_id: "000001".into(),
+            outcome: "Materialized".into(),
+            source_rows: vec![SyntheticRow {
+                source_row: 1,
+                cells: vec!["Analyst".into()],
+            }],
+            body_rows: vec![BodyObservation {
+                source_row: 1,
+                kind: "Data".into(),
+            }],
+            result_rows: Some(vec![1]),
+            diagnostic_codes: vec!["exec.rows_filtered".into()],
+            diagnostics: vec![DiagnosticSummary {
+                code: "exec.rows_filtered".into(),
+                severity: "Info".into(),
+                message: "one row removed".into(),
+            }],
+            plan: Some(PlanEvidence {
+                column: "Role".into(),
+                operator: PlanOperator::Equal,
+                literal: PlanLiteral::Text("Analyst".into()),
+                text_match_policy: TextMatchPolicy::UnicodeLowercase,
+            }),
+            oracle: Some(OracleObservation {
+                expected_rows: vec![1],
+                ordered_rows_match: true,
+                plan_comparison: PlanComparison::Equivalent,
+            }),
+        };
+        let output = probe_tool_output(observation).unwrap();
+        assert_eq!(output["body_rows"][0]["source_row"], 1);
+        assert_eq!(output["result_rows"], serde_json::json!([1]));
+        assert_eq!(output["diagnostics"][0]["code"], "exec.rows_filtered");
+        assert_eq!(output["plan"]["column"], "Role");
+        assert_eq!(output["oracle"]["expected_rows"], serde_json::json!([1]));
+        assert_eq!(output["asserted_desired_behavior"], false);
+        assert_eq!(output["result_id"], "result");
+    }
+
+    #[test]
+    fn review_patch_must_match_the_frozen_hash() {
+        let patch = vec![PatchFile {
+            path: PathBuf::from("crates/baho-core/src/intent.rs"),
+            baseline_sha256: Some("old".into()),
+            content: "checked content".into(),
+        }];
+        let serialized = serde_json::to_vec(&patch).unwrap();
+        let sha256 = digest(&serialized);
+        assert_eq!(
+            verified_patch_json(&sha256, &patch).unwrap().as_bytes(),
+            serialized
+        );
+
+        let mut different_patch = patch;
+        different_patch[0].content = "different content".into();
+        assert!(matches!(
+            verified_patch_json(&sha256, &different_patch),
+            Err(Outcome::ReviewIncomplete)
+        ));
     }
 }

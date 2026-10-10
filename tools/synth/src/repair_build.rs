@@ -1,6 +1,6 @@
 //! Isolated source export and confined process execution for repair attempts.
 //! The candidate's build scripts and binary are never run in the user's tree.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 #[cfg(unix)]
@@ -191,12 +191,14 @@ impl SandboxWorker {
             ));
         }
         let registry = fs::canonicalize(cargo_home.join("registry"))?;
+        let git_cache = fs::canonicalize(cargo_home.join("git"))?;
         let rustup_home = fs::canonicalize(rustup_home)?;
-        let cargo_bin = fs::canonicalize(cargo_bin)?;
+        let cargo_target = fs::canonicalize(cargo_bin)?;
         if !build_root.is_dir()
             || !registry.is_dir()
+            || !git_cache.is_dir()
             || !rustup_home.is_dir()
-            || !cargo_bin.is_file()
+            || !cargo_target.is_file()
         {
             return Err(BuildError::WorkerUnavailable("offline Cargo/toolchain"));
         }
@@ -204,6 +206,8 @@ impl SandboxWorker {
         fs::create_dir(&cargo_home)?;
         #[cfg(unix)]
         std::os::unix::fs::symlink(&registry, cargo_home.join("registry"))?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&git_cache, cargo_home.join("git"))?;
         let profile = protected_dir.join("worker.sb");
         let quote = |path: &Path| {
             format!(
@@ -213,11 +217,31 @@ impl SandboxWorker {
                     .replace('"', "\\\"")
             )
         };
+        let mut ancestor_rules = BTreeSet::new();
+        for path in [
+            &build_root,
+            &registry,
+            &git_cache,
+            &rustup_home,
+            cargo_bin,
+            &cargo_target,
+        ] {
+            for ancestor in path.ancestors().skip(1) {
+                if ancestor != Path::new("/") {
+                    ancestor_rules.insert(format!("(literal {})", quote(ancestor)));
+                }
+            }
+        }
+        let ancestor_rules = ancestor_rules.into_iter().collect::<Vec<_>>().join(" ");
         let contents = format!(
-            "(version 1)\n(deny default)\n(allow process*)\n(allow file-read* (subpath \"/usr\") (subpath \"/System\") (subpath \"/Library\") (subpath \"/private/etc\") (subpath \"/dev\") (subpath {}) (subpath {}) (subpath {}) (literal {}))\n(allow file-write* (subpath {}))\n(deny network*)\n",
+            "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read (sysctl-name \"hw.pagesize_compat\"))\n(allow file-read* (literal \"/\") {} (literal \"/var\") (literal \"/var/select\") (literal \"/var/select/developer_dir\") (literal \"/private/var\") (literal \"/private/var/select\") (literal \"/private/var/select/developer_dir\") (subpath \"/usr\") (subpath \"/System\") (subpath \"/Library\") (subpath \"/private/etc\") (subpath \"/dev\") (subpath {}) (subpath {}) (subpath {}) (subpath {}) (subpath {}) (subpath {}) (literal {}))\n(allow file-write* (literal \"/dev/null\") (subpath {}))\n(deny network*)\n",
+            ancestor_rules,
             quote(&build_root),
             quote(&registry),
+            quote(&git_cache),
             quote(&rustup_home),
+            quote(cargo_bin.parent().ok_or(BuildError::Export)?),
+            quote(cargo_target.parent().ok_or(BuildError::Export)?),
             quote(&profile),
             quote(&build_root)
         );
@@ -238,7 +262,7 @@ impl SandboxWorker {
             profile,
             cargo_home,
             rustup_home,
-            cargo_bin,
+            cargo_bin: cargo_bin.to_path_buf(),
         })
     }
 
@@ -267,6 +291,7 @@ impl SandboxWorker {
             .env("CARGO_HOME", &self.cargo_home)
             .env("RUSTUP_HOME", &self.rustup_home)
             .env("CARGO_TARGET_DIR", self.build_root.join("target"))
+            .env("CARGO_BUILD_JOBS", "1")
             .env("TMPDIR", self.build_root.join("tmp"))
             .env(
                 "PATH",
@@ -383,6 +408,7 @@ pub fn tree_digest(tree: &Path) -> Result<String, BuildError> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn worker_profile_is_protected_and_denies_network() {
         if !Path::new("/usr/bin/sandbox-exec").exists() {
@@ -393,10 +419,19 @@ mod tests {
         let protected = temp.path().join("protected");
         let cargo = temp.path().join("cargo");
         let rustup = temp.path().join("rustup");
-        for path in [&build, &protected, &cargo.join("registry"), &rustup] {
+        for path in [
+            &build,
+            &protected,
+            &cargo.join("registry"),
+            &cargo.join("git"),
+            &rustup,
+        ] {
             fs::create_dir_all(path).unwrap();
         }
-        let binary = std::env::current_exe().unwrap();
+        let bin = cargo.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let binary = bin.join("cargo");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &binary).unwrap();
         let worker = match SandboxWorker::new(&build, &protected, &cargo, &rustup, &binary) {
             Ok(worker) => worker,
             Err(BuildError::WorkerUnavailable("sandbox profile launch")) => return,
@@ -404,8 +439,13 @@ mod tests {
         };
         let profile_path = worker.profile.clone();
         let profile = fs::read_to_string(profile_path.clone()).unwrap();
+        assert_eq!(worker.cargo_bin, binary);
         assert!(profile.contains("(deny network*)"));
+        assert!(profile.contains("(literal \"/\")"));
+        assert!(profile.contains("(sysctl-name \"hw.pagesize_compat\")"));
+        assert!(profile.contains("(literal \"/dev/null\")"));
         assert!(profile.contains(&format!("(literal \"{}\")", profile_path.display())));
+        assert!(profile.contains(&format!("(subpath \"{}\")", bin.display())));
         assert!(SandboxWorker::new(&build, &build, &cargo, &rustup, &binary).is_err());
     }
     #[test]

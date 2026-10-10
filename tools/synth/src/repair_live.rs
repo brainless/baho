@@ -9,22 +9,67 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 use crate::cli_run::parse_run;
-use crate::contracts::compare_plan;
+use crate::contracts::{PlanComparison, PlanEvidence, compare_plan};
+use crate::probe::{OracleObservation, ProbeObservation, selected_body_rows, validate_synthetic};
 use crate::repair::{
     BuildIdentity, CheckResult, ConfinedWorker, FrozenCase, Observation, Outcome, SuiteId,
     SyntheticReduction,
 };
-use crate::repair_build::{BuildError, IsolatedSource, SandboxWorker, tree_digest};
+use crate::repair_build::{BuildError, IsolatedSource, ProcessResult, SandboxWorker, tree_digest};
 
 fn digest(bytes: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn generated_regression_failed(result: &ProcessResult) -> bool {
+    result.exit_code != Some(0)
+        && !result.timed_out
+        && result
+            .stdout
+            .contains("test frozen_role_equality_regression ... FAILED")
+}
+
+fn case_plan_comparison(case: &FrozenCase, evidence: Option<&PlanEvidence>) -> PlanComparison {
+    if case.sql_sha256 == digest("") {
+        PlanComparison::Unavailable
+    } else {
+        compare_plan("Role", &case.expected_literal, evidence)
+    }
+}
+
+fn observation_id(
+    build: &BuildIdentity,
+    case: &FrozenCase,
+    rows: &Option<Vec<u64>>,
+    plan: PlanComparison,
+) -> String {
+    digest(format!(
+        "{}:{}:{}:{}:{rows:?}:{plan:?}",
+        build.build_id, case.fixture_sha256, case.prompt_sha256, case.sql_sha256
+    ))
 }
 
 #[derive(Clone)]
 pub struct PrivateCase {
     pub csv: Vec<u8>,
     pub prompt: String,
-    pub literal: String,
+}
+
+fn index_cases(
+    cases: Vec<PrivateCase>,
+) -> Result<BTreeMap<(String, String), PrivateCase>, BuildError> {
+    let mut keyed = BTreeMap::<(String, String), PrivateCase>::new();
+    for case in cases {
+        let key = (digest(&case.csv), digest(&case.prompt));
+        if let Some(existing) = keyed.get(&key) {
+            if existing.csv != case.csv || existing.prompt != case.prompt {
+                return Err(BuildError::Export);
+            }
+        } else {
+            keyed.insert(key, case);
+        }
+    }
+    Ok(keyed)
 }
 
 pub struct LiveWorker {
@@ -59,7 +104,7 @@ impl LiveWorker {
             .unwrap_or_else(|| {
                 PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".rustup")
             });
-        let cargo_bin = fs::canonicalize(cargo_home.join("bin/cargo"))?;
+        let cargo_bin = cargo_home.join("bin/cargo");
         let sandbox = SandboxWorker::new(
             &build_root,
             &attempt.join("protected"),
@@ -67,13 +112,7 @@ impl LiveWorker {
             &rustup_home,
             &cargo_bin,
         )?;
-        let mut keyed = BTreeMap::new();
-        for case in cases {
-            let key = (digest(&case.csv), digest(&case.prompt));
-            if keyed.insert(key, case).is_some() {
-                return Err(BuildError::Export);
-            }
-        }
+        let keyed = index_cases(cases)?;
         Ok(Self {
             repo: repo.into(),
             attempt: attempt.into(),
@@ -217,13 +256,13 @@ impl LiveWorker {
         csv: &str,
         prompt: &str,
         sql: Option<&str>,
-    ) -> Result<Observation, Outcome> {
+    ) -> Result<ProbeObservation, Outcome> {
         let build = self
             .identities
             .get(build_id)
             .cloned()
             .ok_or(Outcome::EnvironmentFailure)?;
-        crate::probe::validate_synthetic(csv.as_bytes()).map_err(|_| Outcome::NeedsDesign)?;
+        let source_rows = validate_synthetic(csv.as_bytes()).map_err(|_| Outcome::NeedsDesign)?;
         if prompt.is_empty() || prompt.len() > 2048 {
             return Err(Outcome::NeedsDesign);
         }
@@ -242,16 +281,52 @@ impl LiveWorker {
                 expected_literal: String::new(),
             }
         };
-        let key = (case.fixture_sha256.clone(), case.prompt_sha256.clone());
-        self.cases.entry(key).or_insert_with(|| PrivateCase {
-            csv: csv.as_bytes().to_vec(),
-            prompt: prompt.into(),
-            literal: case.expected_literal.clone(),
-        });
-        let mut observation = self.probe(&build, &case)?;
-        if sql.is_none() {
-            observation.plan = crate::contracts::PlanComparison::Unavailable;
+        let (tree, binary) = self.paths(&build)?.clone();
+        let input_path = tree.join(format!(
+            "repair-synthetic-{}.csv",
+            &case.fixture_sha256[..16]
+        ));
+        fs::write(&input_path, csv).map_err(|_| Outcome::EnvironmentFailure)?;
+        let result = self
+            .sandbox
+            .run_cli(&binary, &input_path, prompt, &tree, self.timeout)
+            .map_err(map_build)?;
+        if result.timed_out {
+            return Err(Outcome::ProcessTimeout);
         }
+        let run = fs::read_dir(tree.join(".baho/runs"))
+            .map_err(|_| Outcome::EnvironmentFailure)?
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .max_by_key(|e| e.file_name())
+            .ok_or(Outcome::EnvironmentFailure)?;
+        let parsed = parse_run(&run.path()).map_err(|_| Outcome::EnvironmentFailure)?;
+        let body_rows = selected_body_rows(&run.path()).map_err(|_| Outcome::EnvironmentFailure)?;
+        let oracle = sql.map(|_| OracleObservation {
+            ordered_rows_match: parsed.result_rows.as_ref() == Some(&case.expected_source_rows),
+            plan_comparison: case_plan_comparison(&case, parsed.plan_evidence.as_ref()),
+            expected_rows: case.expected_source_rows.clone(),
+        });
+        let mut observation = ProbeObservation {
+            build_id: build.build_id,
+            binary_sha256: build.binary_sha256,
+            fixture_sha256: case.fixture_sha256,
+            prompt_sha256: case.prompt_sha256,
+            result_id: String::new(),
+            run_id: parsed.run_id,
+            outcome: format!("{:?}", parsed.outcome),
+            source_rows,
+            body_rows,
+            result_rows: parsed.result_rows,
+            diagnostic_codes: parsed.diagnostics.iter().map(|d| d.code.clone()).collect(),
+            diagnostics: parsed.diagnostics,
+            plan: parsed.plan_evidence,
+            oracle,
+        };
+        let mut stable = observation.clone();
+        stable.run_id.clear();
+        observation.result_id =
+            digest(serde_json::to_vec(&stable).map_err(|_| Outcome::EnvironmentFailure)?);
         Ok(observation)
     }
     pub fn fixed_check(&mut self, build_id: &str, suite: SuiteId) -> Result<CheckResult, Outcome> {
@@ -313,11 +388,8 @@ impl ConfinedWorker for LiveWorker {
             .max_by_key(|e| e.file_name())
             .ok_or(Outcome::EnvironmentFailure)?;
         let parsed = parse_run(&run.path()).map_err(|_| Outcome::EnvironmentFailure)?;
-        let plan = compare_plan("Role", &input.literal, parsed.plan_evidence.as_ref());
-        let result_id = digest(format!(
-            "{}:{}:{}:{:?}:{:?}",
-            build.build_id, case.fixture_sha256, case.prompt_sha256, parsed.result_rows, plan
-        ));
+        let plan = case_plan_comparison(case, parsed.plan_evidence.as_ref());
+        let result_id = observation_id(build, case, &parsed.result_rows, plan);
         Ok(Observation {
             build_id: build.build_id.clone(),
             result_id,
@@ -357,7 +429,6 @@ impl ConfinedWorker for LiveWorker {
             PrivateCase {
                 csv: reduction.csv.as_bytes().to_vec(),
                 prompt: reduction.prompt.clone(),
-                literal: case.expected_literal.clone(),
             },
         );
         Ok(())
@@ -384,10 +455,7 @@ impl ConfinedWorker for LiveWorker {
         }
         // An assertion failure in the generated test is required; a compile
         // failure or an unrelated failing test does not establish a regression.
-        Ok(result.exit_code != Some(0)
-            && result
-                .stderr
-                .contains("test frozen_role_equality_regression ... FAILED"))
+        Ok(generated_regression_failed(&result))
     }
 
     fn candidate(&mut self, _: &str, regression: &Path) -> Result<BuildIdentity, Outcome> {
@@ -416,7 +484,88 @@ impl ConfinedWorker for LiveWorker {
 #[cfg(test)]
 mod smoke_tests {
     use super::*;
+    use crate::contracts::{PlanLiteral, PlanOperator, TextMatchPolicy};
     use std::process::Command;
+
+    #[test]
+    fn same_input_with_distinct_sql_keeps_each_probe_expectation() {
+        let csv = b"Id,Role\n1,Alpha\n2,Beta\n";
+        let prompt = "show matching roles";
+        let cases = index_cases(vec![
+            PrivateCase {
+                csv: csv.to_vec(),
+                prompt: prompt.into(),
+            },
+            PrivateCase {
+                csv: csv.to_vec(),
+                prompt: prompt.into(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(cases.len(), 1);
+
+        let mut case = FrozenCase {
+            fixture_sha256: digest(csv),
+            prompt_sha256: digest(prompt),
+            sql_sha256: digest("SELECT Alpha"),
+            expected_source_rows: vec![1],
+            expected_literal: "Alpha".into(),
+        };
+        let plan = PlanEvidence {
+            column: "Role".into(),
+            operator: PlanOperator::Equal,
+            literal: PlanLiteral::Text("Alpha".into()),
+            text_match_policy: TextMatchPolicy::UnicodeLowercase,
+        };
+        let build = BuildIdentity {
+            build_id: "build".into(),
+            revision: "revision".into(),
+            tree_sha256: "tree".into(),
+            toolchain: "toolchain".into(),
+            binary_sha256: "binary".into(),
+        };
+        let alpha_plan = case_plan_comparison(&case, Some(&plan));
+        assert_eq!(alpha_plan, PlanComparison::Equivalent);
+        let alpha_id = observation_id(&build, &case, &Some(vec![1]), alpha_plan);
+
+        case.sql_sha256 = digest("SELECT Beta");
+        case.expected_literal = "Beta".into();
+        case.expected_source_rows = vec![2];
+        let beta_plan = case_plan_comparison(&case, Some(&plan));
+        assert_eq!(beta_plan, PlanComparison::Different);
+        assert_ne!(
+            alpha_id,
+            observation_id(&build, &case, &Some(vec![1]), beta_plan)
+        );
+
+        case.sql_sha256 = digest("");
+        case.expected_literal.clear();
+        assert_eq!(
+            case_plan_comparison(&case, Some(&plan)),
+            PlanComparison::Unavailable
+        );
+    }
+
+    #[test]
+    fn regression_failure_requires_generated_test_failure() {
+        let mut result = ProcessResult {
+            exit_code: Some(101),
+            timed_out: false,
+            stdout: "running 1 test\ntest frozen_role_equality_regression ... FAILED\n".into(),
+            stderr: "error: test failed".into(),
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        };
+        assert!(generated_regression_failed(&result));
+
+        result.stdout.clear();
+        result.stderr = "error: could not compile baho-core".into();
+        assert!(!generated_regression_failed(&result));
+
+        result.stdout = "test frozen_role_equality_regression ... FAILED".into();
+        result.exit_code = Some(0);
+        assert!(!generated_regression_failed(&result));
+    }
 
     /// Run explicitly before a live agent trial. This uses real pinned source,
     /// confined Cargo builds, and public CLI artifacts without a provider.
@@ -453,7 +602,6 @@ mod smoke_tests {
             vec![PrivateCase {
                 csv: csv.as_bytes().to_vec(),
                 prompt: prompt.into(),
-                literal: case.expected_literal.clone(),
             }],
         )
         .unwrap();
@@ -478,12 +626,9 @@ mod smoke_tests {
         assert_eq!(before.plan, after.plan);
         assert_eq!(before.fixture_sha256, after.fixture_sha256);
         assert_eq!(before.prompt_sha256, after.prompt_sha256);
-        assert_eq!(
-            worker
-                .check(&candidate, SuiteId::ProtectedCompatibility)
-                .unwrap()
-                .exit_code,
-            Some(0)
-        );
+        let check = worker
+            .check(&candidate, SuiteId::ProtectedCompatibility)
+            .unwrap();
+        assert_eq!(check.exit_code, Some(0), "{}", check.output_excerpt);
     }
 }

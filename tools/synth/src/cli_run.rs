@@ -404,7 +404,7 @@ pub enum RunOutcome {
     Other(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct DiagnosticSummary {
     pub code: String,
     pub severity: String,

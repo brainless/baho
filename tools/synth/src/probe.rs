@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::cli_run::{
-    CliBinary, CliRunError, RunLimits, create_evaluation_dir, parse_run, run_case,
+    CliBinary, CliRunError, DiagnosticSummary, RunLimits, create_evaluation_dir, parse_run,
+    run_case,
 };
 use crate::contracts::{PlanComparison, compare_plan};
 use crate::dataset::{DatasetError, LoadedDataset};
@@ -65,6 +66,7 @@ pub struct ProbeObservation {
     pub body_rows: Vec<BodyObservation>,
     pub result_rows: Option<Vec<u64>>,
     pub diagnostic_codes: Vec<String>,
+    pub diagnostics: Vec<DiagnosticSummary>,
     pub plan: Option<crate::contracts::PlanEvidence>,
     pub oracle: Option<OracleObservation>,
 }
@@ -183,7 +185,7 @@ pub fn probe_with_sql(
     let parsed = parse_run(&run_dir)?;
     let body_rows = selected_body_rows(&run_dir)?;
     let outcome = format!("{:?}", parsed.outcome);
-    let diagnostic_codes = parsed.diagnostics.into_iter().map(|d| d.code).collect();
+    let diagnostic_codes = parsed.diagnostics.iter().map(|d| d.code.clone()).collect();
     let oracle = match expected {
         Some((expected_rows, literal)) => Some(OracleObservation {
             ordered_rows_match: parsed.result_rows.as_ref() == Some(&expected_rows),
@@ -204,6 +206,7 @@ pub fn probe_with_sql(
         body_rows,
         result_rows: parsed.result_rows,
         diagnostic_codes,
+        diagnostics: parsed.diagnostics,
         plan: parsed.plan_evidence,
         oracle,
     };
@@ -214,7 +217,7 @@ pub fn probe_with_sql(
     Ok(observation)
 }
 
-fn selected_body_rows(run_dir: &Path) -> Result<Vec<BodyObservation>, ProbeError> {
+pub(crate) fn selected_body_rows(run_dir: &Path) -> Result<Vec<BodyObservation>, ProbeError> {
     let path = run_dir.join("candidates.json");
     let metadata = fs::metadata(&path).map_err(|_| ProbeError::Candidates)?;
     if metadata.len() > 256 * 1024 {

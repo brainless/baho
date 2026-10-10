@@ -1,6 +1,6 @@
 //! Trusted intake for one reviewed evaluation case and pinned baseline.
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rig::{DynModel, operation::Completion};
@@ -17,6 +17,7 @@ use crate::repair::{
     SyntheticReduction, run_attempt,
 };
 use crate::repair_agents::RigRepairAgents;
+use crate::repair_build::BuildError;
 use crate::repair_live::{LiveWorker, PrivateCase, SharedLiveWorker};
 use crate::sql::{SqlRunner, parse_role_query};
 
@@ -35,6 +36,14 @@ fn hash(bytes: impl AsRef<[u8]>) -> String {
 }
 fn invalid(_: impl std::fmt::Display) -> EntryError {
     EntryError::Invalid("source, oracle, or schema verification failed")
+}
+
+fn generation_path(evaluation: &Path, generation_id: &str) -> Result<PathBuf, EntryError> {
+    let output_root = evaluation
+        .parent()
+        .and_then(Path::parent)
+        .ok_or(EntryError::Invalid("evaluation path"))?;
+    Ok(output_root.join(generation_id))
 }
 
 pub struct RepairOptions {
@@ -100,11 +109,7 @@ pub fn prepare(
         return Err(EntryError::Invalid("dataset hash differs"));
     }
     let generation = load_generation(
-        &options
-            .evaluation
-            .parent()
-            .ok_or(EntryError::Invalid("evaluation path"))?
-            .join(&report.generation_id),
+        &generation_path(&options.evaluation, &report.generation_id)?,
         &dataset,
     )
     .map_err(invalid)?;
@@ -152,7 +157,6 @@ pub fn prepare(
         private.push(PrivateCase {
             csv: target_csv.clone(),
             prompt: case.prompt.clone(),
-            literal: query.literal.clone(),
         });
         Ok(FrozenCase {
             fixture_sha256: hash(&target_csv),
@@ -222,8 +226,12 @@ pub fn repair(
     );
     let worker = match worker {
         Ok(worker) => worker,
-        Err(_) => {
-            record.fail_before_start(Outcome::EnvironmentFailure, "confined worker unavailable")?;
+        Err(error) => {
+            let reason = match error {
+                BuildError::WorkerUnavailable(reason) => reason,
+                _ => "confined worker setup failed",
+            };
+            record.fail_before_start(Outcome::EnvironmentFailure, reason)?;
             return Ok((Outcome::EnvironmentFailure, record.dir));
         }
     };
@@ -238,4 +246,18 @@ pub fn repair(
     );
     let outcome = run_attempt(&mut record, &contract, &mut worker, &mut agents)?;
     Ok((outcome, record.dir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_is_sibling_of_evaluation_directory() {
+        let evaluation = Path::new("synthetic/out/evaluation-123/evaluation.json");
+        assert_eq!(
+            generation_path(evaluation, "generation-456").unwrap(),
+            Path::new("synthetic/out/generation-456")
+        );
+    }
 }

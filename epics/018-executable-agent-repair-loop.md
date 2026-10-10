@@ -1,6 +1,6 @@
 # Epic 018: Executable Investigation and Agent Repair Loop
 
-Status: In progress — live trial unavailable pending working process confinement.
+Status: In progress — confined offline smoke passes; live agent trial pending.
 
 Motivating run: `plan-1791532155115582000-44931`, evaluation
 `evaluation-1791470942646632000-53201-0`.
@@ -233,3 +233,29 @@ immediately; the interrupted escalation waited approximately 1,605 seconds, whic
 was approval wait time rather than trial execution. Batch orchestration is not
 justified by this trial. A future manual trial needs a functioning confined worker
 and a new attempt ID; it must revalidate the frozen inputs.
+
+## Post-review corrections (2026-10-09)
+
+The repair harness now detects the generated regression's failure marker on the
+test runner's stdout, compares each probe with its own frozen SQL expectation,
+and binds reviewer input to the exact checked patch hash. Agent-facing probes
+now include observed body membership, diagnostics, and typed plan evidence for
+neutral synthetic fixtures; private replays remain sanitized. Offline synth
+tests, synth Clippy, and workspace formatting, check, and tests pass. The live
+trial remains inconclusive until a confined worker can start.
+
+Manual-test intake also resolves the pinned generation beside its evaluation
+directory under `synthetic/out/`; the earlier nested lookup could not load a
+normal evaluation record.
+
+## Confined worker correction (2026-10-10)
+
+Manual attempt `repair-1791560447353124000-90849-0` ended before a baseline
+build with `environment_failure`: the worker profile could not launch. A
+restricted preflight and the real offline smoke test exposed missing macOS
+directory, page-size, developer-tool, and `/dev/null` permissions; the worker
+also invoked Rustup instead of Cargo after resolving Cargo's symlink. The
+profile now grants those narrow reads and writes, retains network denial, and
+uses the existing Cargo registry and Git caches read-only. The confined offline
+smoke test builds and probes baseline and candidate binaries and passes its
+protected check. No model call or live repair was made during this correction.
