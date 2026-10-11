@@ -646,15 +646,17 @@ impl SourceSession {
             };
             for (line_no, text) in hits {
                 let excerpt = clip(text.trim(), MAX_EXCERPT_CHARS);
-                if matches.len() >= self.limits.search_matches || bytes + excerpt.len() > budget {
-                    truncated = true;
-                    break 'files;
-                }
                 let inner = file
                     .items
                     .iter()
                     .rfind(|i| i.start <= line_no && line_no <= i.end);
-                bytes += excerpt.len();
+                let item = inner.map(|i| clip(&i.label, MAX_OUTLINE_LINE_CHARS));
+                let match_bytes = excerpt.len() + item.as_ref().map_or(0, String::len);
+                if matches.len() >= self.limits.search_matches || match_bytes > budget - bytes {
+                    truncated = true;
+                    break 'files;
+                }
+                bytes += match_bytes;
                 exposed.push(Exposed {
                     path: name.clone(),
                     file_sha256: file.sha256.clone(),
@@ -662,11 +664,20 @@ impl SourceSession {
                     end_line: line_no,
                     bytes: excerpt.len(),
                 });
+                if let (Some(item), Some(label)) = (inner, item.as_ref()) {
+                    exposed.push(Exposed {
+                        path: name.clone(),
+                        file_sha256: file.sha256.clone(),
+                        start_line: item.start,
+                        end_line: item.end,
+                        bytes: label.len(),
+                    });
+                }
                 matches.push(SearchMatch {
                     path: name.clone(),
                     line: line_no,
                     excerpt,
-                    item: inner.map(|i| i.label.clone()),
+                    item,
                     item_start: inner.map(|i| i.start),
                     item_end: inner.map(|i| i.end),
                 });
@@ -1569,6 +1580,58 @@ mod tests {
                 ToolErrorCode::QueryInvalid
             );
         }
+    }
+
+    #[test]
+    fn search_charges_and_bounds_enclosing_item_labels() {
+        let mut l = limits();
+        l.stage_bytes = 256;
+        let (dir, s) = session_with(l);
+        let long_header = format!("impl {} {{\n", "VeryLongTypeName".repeat(80));
+        write(
+            &dir,
+            "long.rs",
+            &format!("{long_header}    // marker\n}}\n"),
+        );
+
+        let r = s.search_text("marker").unwrap();
+        assert_eq!(r.matches.len(), 1);
+        let m = &r.matches[0];
+        assert!(m.item.as_ref().unwrap().chars().count() <= MAX_OUTLINE_LINE_CHARS);
+        assert_eq!(r.bytes, m.excerpt.len() + m.item.as_ref().unwrap().len());
+        assert_eq!(r.bytes, r.exposed.iter().map(|e| e.bytes).sum::<usize>());
+        assert_eq!(s.exposed_bytes(), r.bytes);
+        assert!(r.bytes <= 256);
+        assert!(
+            r.exposed
+                .iter()
+                .any(|e| e.start_line == 1 && e.end_line == 3)
+        );
+
+        let again = s.search_text("marker").unwrap();
+        assert!(again.matches.is_empty());
+        assert!(again.truncated);
+        assert_eq!(again.bytes, 0);
+        assert_eq!(s.exposed_bytes(), r.bytes);
+    }
+
+    #[test]
+    fn search_bounds_fallback_item_label() {
+        let mut l = limits();
+        l.stage_bytes = 320;
+        let (dir, s) = session_with(l);
+        write(
+            &dir,
+            "bad.rs",
+            &format!("pub fn {} marker {{\nlet = ;\n", "name".repeat(300)),
+        );
+
+        let r = s.search_text("marker").unwrap();
+        let m = &r.matches[0];
+        assert!(m.item.as_ref().unwrap().chars().count() <= MAX_OUTLINE_LINE_CHARS);
+        assert_eq!(r.bytes, m.excerpt.len() + m.item.as_ref().unwrap().len());
+        assert_eq!(r.bytes, r.exposed.iter().map(|e| e.bytes).sum::<usize>());
+        assert!(r.bytes <= 320);
     }
 
     #[test]
