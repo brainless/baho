@@ -260,7 +260,11 @@ impl RigRepairAgents {
                     .preamble(role)
                     .add_hook(hook)
                     .temperature(0.2)
-                    .max_tokens(8192);
+                    .max_tokens(if stage == "investigation" {
+                        INVESTIGATION_MAX_TOKENS
+                    } else {
+                        OTHER_STAGE_MAX_TOKENS
+                    });
                 let agent = base
                     .tool(OutlineTool(nav.clone()))
                     .tool(ReadLinesTool(nav.clone()))
@@ -343,6 +347,8 @@ fn navigation_note(s: &AttemptSettings, stage: &str, paths: &str) -> String {
 const FINAL_ANSWER_PROMPT: &str = "The turn budget is exhausted and tools are no longer available. Return the final JSON answer now, using only what you have already seen. If the evidence is insufficient, return {\"insufficient_evidence\":true,\"open_questions\":[up to 5 short strings without data values]} instead. Do not call tools.";
 const MAX_OPEN_QUESTIONS: usize = 5;
 const MAX_QUESTION_CHARS: usize = 200;
+const INVESTIGATION_MAX_TOKENS: u64 = 16_384;
+const OTHER_STAGE_MAX_TOKENS: u64 = 8_192;
 
 const CORE_SCOPE: &str = "crates/baho-core/src/";
 const INITIAL_MAP_MAX_BYTES: usize = 12 * 1024;

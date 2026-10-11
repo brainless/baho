@@ -1,5 +1,5 @@
 //! Incremental repair-agent activity ledger. This sidecar has its own schema
-//! (v2, Epic 019); existing attempt manifests/contracts are unaffected.
+//! (v3, Epic 019); existing attempt manifests/contracts are unaffected.
 //!
 //! The ledger records what an agent asked for (a safe projection of tool
 //! arguments) and which source spans reached it (file hash, line span, byte
@@ -9,6 +9,7 @@ use rig::agent::{
     AgentHook, CompletionCallAction, CompletionCallEvent, DispatchAction, DispatchEvent,
     HookContext, ModelTurnAction, ModelTurnFinished, OutcomeAction, OutcomeEvent,
 };
+use rig::core::completion::FinishReason;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -27,8 +28,9 @@ use crate::source_tools::{
 };
 
 const MAX_ACTIVITY_EVENTS: u32 = 2000;
-/// Bumped from 1: v2 adds the request and exposure ledger.
-pub(crate) const TRACE_SCHEMA_VERSION: u32 = 2;
+/// V2 added the request and exposure ledger; v3 adds normalized finish reasons
+/// and applied output-token caps. Older traces remain readable by their version.
+pub(crate) const TRACE_SCHEMA_VERSION: u32 = 3;
 const MAX_VERBATIM_CHARS: usize = 256;
 // A validated contract allows 200 search matches, each with an excerpt and
 // an enclosing item label exposure.
@@ -379,7 +381,15 @@ impl AgentHook for AgentTrace {
             .active_model
             .take()
             .map(|start| start.elapsed().as_millis());
-        s.write("model_call_finished", json!({"elapsed_ms":elapsed,"input_tokens":event.usage.input_tokens,"output_tokens":event.usage.output_tokens,"total_tokens":event.usage.total_tokens,"cached_input_tokens":event.usage.cached_input_tokens}));
+        let finish_reason = match event.finish_reason {
+            Some(FinishReason::Stop) => Some("stop"),
+            Some(FinishReason::Length) => Some("length"),
+            Some(FinishReason::ToolCalls) => Some("tool_calls"),
+            Some(FinishReason::ContentFilter) => Some("content_filter"),
+            Some(FinishReason::Other(_)) => Some("other"),
+            None => None,
+        };
+        s.write("model_call_finished", json!({"elapsed_ms":elapsed,"input_tokens":event.usage.input_tokens,"output_tokens":event.usage.output_tokens,"total_tokens":event.usage.total_tokens,"cached_input_tokens":event.usage.cached_input_tokens,"finish_reason":finish_reason,"max_tokens":event.max_tokens}));
         ModelTurnAction::Continue
     }
     async fn on_dispatch(&self, _: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
@@ -479,6 +489,38 @@ mod tests {
         test_utils::{MockCompletionModel, MockTurn},
         tool::PortableTool,
     };
+    #[tokio::test]
+    async fn model_trace_records_finish_reason_and_cap_without_provider_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-events.jsonl");
+        let trace = AgentTrace::open(&path, "investigation").unwrap();
+        let agent = AgentBuilder::new(MockCompletionModel::from_turns([MockTurn::text(
+            "partial answer",
+        )
+        .with_finish_reason(FinishReason::Length)]))
+        .max_tokens(16_384)
+        .add_hook(trace.clone())
+        .build();
+        agent.prompt("private prompt").await.unwrap();
+        assert!(trace.finish("completed", None, 0));
+        let events: Vec<Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let turn = events
+            .iter()
+            .find(|event| event["name"] == "model_call_finished")
+            .unwrap();
+        assert_eq!(turn["detail"]["finish_reason"], "length");
+        assert_eq!(turn["detail"]["max_tokens"], 16_384);
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("private prompt")
+        );
+    }
+
     #[derive(Clone)]
     struct WaitingTool;
     impl PortableTool for WaitingTool {
@@ -960,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_reader_rejects_v2_events() {
+    fn trace_reader_requires_matching_schema_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent-events.jsonl");
         let trace = AgentTrace::open(&path, "review").unwrap();
@@ -974,11 +1016,19 @@ mod tests {
         assert_eq!(
             read_event(&line, 1),
             Err(TraceReadError::UnsupportedSchema {
-                found: 2,
+                found: 3,
                 supported: 1
             })
         );
-        assert!(read_event(&line, 2).is_ok());
-        assert_eq!(read_event("not json", 2), Err(TraceReadError::Malformed));
+        assert_eq!(
+            read_event(&line, 2),
+            Err(TraceReadError::UnsupportedSchema {
+                found: 3,
+                supported: 2
+            })
+        );
+        assert!(read_event(&line, 3).is_ok());
+        assert!(read_event(r#"{"schema_version":2,"name":"agent_finished"}"#, 2).is_ok());
+        assert_eq!(read_event("not json", 3), Err(TraceReadError::Malformed));
     }
 }
