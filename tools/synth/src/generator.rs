@@ -30,6 +30,7 @@ use std::{
 pub const PROVIDER: &str = "Neuralwatt";
 pub const BASE_URL: &str = "https://api.neuralwatt.com/v1";
 pub const MODEL: &str = "deepseek-v4.1-flash-flex";
+pub const REPAIR_MODEL: &str = "glm-5.3-flex";
 pub const PROMPT_VERSION: &str = "role-equality-v1";
 const SYSTEM: &str = include_str!("../prompts/generator-system.md");
 
@@ -41,6 +42,14 @@ pub fn credential(value: Option<String>) -> Result<String, GenerateError> {
     value
         .filter(|v| !v.trim().is_empty())
         .ok_or_else(|| GenerateError("NEURALWATT_API_KEY is missing or empty".into()))
+}
+
+/// `NEURALWATT_API_KEY` from the environment, else from the repository `.env` contents.
+pub fn resolve_credential(
+    env: Option<String>,
+    root_env_contents: Option<&str>,
+) -> Result<String, GenerateError> {
+    credential(env.or_else(|| env_file_value(root_env_contents?, "NEURALWATT_API_KEY")))
 }
 
 /// Reads `name` from `.env` contents: `KEY=value`, optional `export `, optional matching quotes.
@@ -716,12 +725,25 @@ mod tests {
         assert_eq!(credential(Some("key".into())).unwrap(), "key");
         assert_eq!(BASE_URL, "https://api.neuralwatt.com/v1");
         assert_eq!(MODEL, "deepseek-v4.1-flash-flex");
+        assert_eq!(REPAIR_MODEL, "glm-5.3-flex");
         assert_eq!(
             served_tier(&json!({"additional_params":{"service_tier":"flex"}})),
             "flex"
         );
         assert_eq!(served_tier(&json!({})), "unknown");
         assert_eq!(served_tier(&json!({"service_tier":"standard"})), "standard");
+    }
+
+    #[test]
+    fn repair_credential_uses_process_value_then_root_env_file() {
+        let root = "NEURALWATT_API_KEY=file-key\n";
+        assert_eq!(
+            resolve_credential(Some("process-key".into()), Some(root)).unwrap(),
+            "process-key"
+        );
+        assert_eq!(resolve_credential(None, Some(root)).unwrap(), "file-key");
+        assert!(resolve_credential(None, None).is_err());
+        assert!(resolve_credential(Some(" ".into()), Some(root)).is_err());
     }
     #[tokio::test]
     async fn streamed_mock_rejections_submission_and_redaction() {

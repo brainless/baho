@@ -4,9 +4,9 @@ use synth::{
     dataset::LoadedDataset,
     evaluate::{EvaluateOptions, evaluate},
     generator::{
-        Settings, credential, env_file_value, generate, neuralwatt_model, neuralwatt_repair_model,
+        REPAIR_MODEL, Settings, credential, env_file_value, generate, neuralwatt_model,
+        neuralwatt_repair_model, resolve_credential,
     },
-    planner::{PlanOptions, PlanSettings, plan_epic, resolve_credential},
 };
 
 #[tokio::main]
@@ -22,9 +22,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match args.next().as_deref() {
         Some("generate") => {}
         Some("evaluate") => return evaluate_command(args),
-        Some("plan-epic") => return plan_epic_command(args).await,
         Some("repair") => return repair_command(args),
-        _ => return Err("usage: synth plan-epic --evaluation EVALUATION_JSON [--context NAME] [--proposal PROPOSAL_JSON] [--reasoning-effort low|medium|high] [--max-turns N] [--max-tool-calls N] [--stage-max-turns N] [--stage-max-tool-calls N] [--per-call-seconds N] [--whole-run-seconds N]\n       synth evaluate --dataset CSV --baho-bin PATH [--generation DIR] [--review FILE] [--output DIR]\n       synth generate --dataset CSV --feature MARKDOWN --count N [--output DIR] [--per-call-seconds N] [--whole-run-seconds N] [--max-turns N] [--variation TEXT]".into()),
+        _ => return Err("usage: synth repair --evaluation EVALUATION_JSON --case CASE_ID --baseline COMMIT --dataset CSV --review FILE [--output DIR]\n       synth evaluate --dataset CSV --baho-bin PATH [--generation DIR] [--review FILE] [--output DIR]\n       synth generate --dataset CSV --feature MARKDOWN --count N [--output DIR] [--per-call-seconds N] [--whole-run-seconds N] [--max-turns N] [--variation TEXT]".into()),
     }
     let mut dataset = None;
     let mut feature = None;
@@ -140,7 +139,7 @@ fn repair_command(
     let (outcome, path) = synth::repair_entry::repair(
         neuralwatt_repair_model(
             key,
-            synth::planner::MODEL,
+            REPAIR_MODEL,
             options.settings.api_request_timeout_seconds,
         )?
         .into(),
@@ -198,89 +197,5 @@ fn evaluate_command(
         );
     }
     outcome.require_started_replay()?;
-    Ok(())
-}
-
-async fn plan_epic_command(
-    mut args: impl Iterator<Item = String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut evaluation = None;
-    let mut settings = PlanSettings::default();
-    let mut context = None;
-    let mut proposal = None;
-    while let Some(flag) = args.next() {
-        let value = args.next().ok_or("option requires a value")?;
-        match flag.as_str() {
-            "--evaluation" => evaluation = Some(PathBuf::from(value)),
-            "--context" => context = Some(value),
-            "--proposal" => proposal = Some(PathBuf::from(value)),
-            "--reasoning-effort" => settings.reasoning_effort = value.parse()?,
-            "--max-turns" => settings.max_turns = value.parse()?,
-            "--max-tool-calls" => settings.limits.max_calls = value.parse()?,
-            "--stage-max-turns" => {
-                let cap = value.parse()?;
-                settings.stage_budgets.investigation.max_turns = cap;
-                settings.stage_budgets.draft.max_turns = cap;
-                settings.stage_budgets.review.max_turns = cap;
-            }
-            "--stage-max-tool-calls" => {
-                let cap = value.parse()?;
-                settings.stage_budgets.investigation.max_tool_calls = cap;
-                settings.stage_budgets.draft.max_tool_calls = cap;
-                settings.stage_budgets.review.max_tool_calls = cap;
-            }
-            "--per-call-seconds" => settings.per_call_seconds = value.parse()?,
-            "--whole-run-seconds" => settings.whole_run_seconds = value.parse()?,
-            _ => return Err("unknown option".into()),
-        }
-    }
-    settings.validate()?;
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let evaluation = evaluation.ok_or("--evaluation is required")?;
-    // The sidecar is checked inside `plan_epic`, but the key is resolved only once it is
-    // known the run can start, so a missing key reports before any provider traffic.
-    let key = resolve_credential(
-        std::env::var("NEURALWATT_API_KEY").ok(),
-        std::fs::read_to_string(repo.join(".env")).ok().as_deref(),
-    )?;
-    let result = plan_epic(
-        neuralwatt_model(key, synth::planner::MODEL),
-        &PlanOptions {
-            evaluation,
-            repo,
-            settings,
-            context,
-            proposal,
-        },
-    )
-    .await?;
-    let r = &result.record;
-    println!("{}: {}", r.id, r.outcome);
-    if let Some(path) = &r.epic_path {
-        println!("epic: {path}");
-    }
-    if let Some(why) = &r.explanation {
-        println!("no epic: {why}");
-    }
-    if let Some(excerpt) = &r.final_text_excerpt {
-        let label = if r.outcome == "malformed_tool_call" {
-            "malformed tool call (final text excerpt)"
-        } else {
-            "no terminal action (final text excerpt)"
-        };
-        println!("{label}: {excerpt}");
-    }
-    if let Some(path) = &r.proposal_path {
-        println!("proposal: {path}");
-    }
-    println!("record: {}", result.record_path.display());
-    for call in &r.calls {
-        if !matches!(call.served_tier.as_str(), "standard" | "default") {
-            eprintln!(
-                "{} turn {}: served tier {} (requested {})",
-                call.stage, call.turn, call.served_tier, call.requested_tier
-            );
-        }
-    }
     Ok(())
 }

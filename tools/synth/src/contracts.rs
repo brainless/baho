@@ -1,4 +1,4 @@
-//! Versioned serde contracts shared by `synth evaluate` and `synth plan-epic` (Epic 016).
+//! Versioned serde contracts for synthetic evaluation and repair.
 //!
 //! Every persisted structure carries a `schema_version`; readers reject versions they do
 //! not know. Reports never hold source-derived row lists, only counts.
