@@ -231,6 +231,11 @@ impl RigRepairAgents {
         trace.event("agent_started", json!({"max_agent_turns":max_agent_turns,"max_tool_calls":self.settings.max_tool_calls,"api_request_timeout_seconds":self.settings.api_request_timeout_seconds,"max_output_bytes":self.settings.max_output_bytes,"max_read_bytes":self.settings.max_read_bytes,"max_outline_bytes":self.settings.max_outline_bytes,"max_search_matches":self.settings.max_search_matches,"max_exposed_bytes":self.settings.max_exposed_bytes,"navigation_tools":true}));
         let model = self.model.clone();
         let nav = SourceSession::new(root, scopes, SourceLimits::from_settings(&self.settings));
+        let prompt = if stage == "investigation" {
+            initial_investigation_prompt(&nav, &self.settings, prompt, &trace)
+        } else {
+            prompt
+        };
         let tools = SourceTools { nav: nav.clone() };
         let probe = ProbeTool {
             tools: tools.clone(),
@@ -323,7 +328,7 @@ fn navigation_note(s: &AttemptSettings, stage: &str, paths: &str) -> String {
         s.max_agent_turns
     };
     format!(
-        "Source navigation: call outline(path) for a line-numbered map of a file, read_lines(path, ranges) for small inclusive 1-based ranges, and search_text(query) to locate code; {paths}. Budgets: at most {} tool-using model turns (the last of {} model calls is reserved for your final answer), {} tool calls in total, {} bytes of source text in total; read_lines returns at most {} bytes per call and an outline page at most {} bytes. Tool errors state a code and the next step. If evidence is insufficient, answer {{\"insufficient_evidence\":true,\"open_questions\":[up to 5 short strings without data values]}} instead.",
+        "Source navigation: the initial source map lists allowed files and item spans; call outline(path) for more of a file, read_lines(path, ranges) for inclusive 1-based ranges (large bodies may require pagination), and search_text(query) to locate code; {paths}. Budgets: at most {} tool-using model turns (the last of {} model calls is reserved for your final answer), {} tool calls in total, {} bytes of source text in total; read_lines returns at most {} bytes per call and an outline page at most {} bytes. Tool errors state a code and the next step. If evidence is insufficient, answer {{\"insufficient_evidence\":true,\"open_questions\":[up to 5 short strings without data values]}} instead.",
         turns.saturating_sub(1),
         turns,
         s.max_tool_calls,
@@ -340,6 +345,18 @@ const MAX_OPEN_QUESTIONS: usize = 5;
 const MAX_QUESTION_CHARS: usize = 200;
 
 const CORE_SCOPE: &str = "crates/baho-core/src/";
+const INITIAL_MAP_MAX_BYTES: usize = 12 * 1024;
+
+fn initial_investigation_prompt(
+    nav: &SourceSession,
+    settings: &AttemptSettings,
+    prompt: String,
+    trace: &AgentTrace,
+) -> String {
+    let map = nav.initial_outline_map(INITIAL_MAP_MAX_BYTES.min(settings.max_exposed_bytes / 4));
+    trace.event("initial_source_map", json!({"bytes":map.len(),"source_bytes_charged":nav.exposed_bytes(),"tool_calls_charged":nav.calls_charged()}));
+    format!("{prompt}\n\n{map}")
+}
 const CORE_PATHS: &str = "paths are root-relative under crates/baho-core/src/";
 const REVIEW_SCOPES: [&str; 3] = [
     "candidate/crates/baho-core/src/",
@@ -1039,13 +1056,29 @@ mod tests {
     }
 
     #[test]
+    fn investigator_prompt_includes_charged_initial_map() {
+        let h = harness([]);
+        let settings = crate::repair_entry::RepairOptions::default_settings();
+        let prompt =
+            initial_investigation_prompt(&h.session, &settings, "case evidence".into(), &h.trace);
+        assert!(prompt.contains("case evidence"));
+        assert!(prompt.contains(h_file()));
+        assert!(prompt.contains("item_0"));
+        assert!(prompt.contains("item_39"));
+        let map = prompt.strip_prefix("case evidence\n\n").unwrap();
+        assert!(map.len() <= INITIAL_MAP_MAX_BYTES);
+        assert_eq!(h.session.exposed_bytes(), map.len());
+        assert_eq!(h.session.calls_charged(), 0);
+    }
+
+    #[test]
     fn navigation_note_states_turn_and_byte_budgets() {
         let settings = crate::repair_entry::RepairOptions::default_settings();
         assert_eq!(settings.max_investigator_turns, 12);
         assert_eq!(settings.max_agent_turns, 6);
         assert_eq!(
             settings.investigator_prompt_version,
-            "repair-investigator-v2"
+            "repair-investigator-v3"
         );
         assert_eq!(settings.reviewer_prompt_version, "repair-reviewer-v2");
         assert_eq!(settings.coder_prompt_version, "repair-coder-v2");
@@ -1055,7 +1088,7 @@ mod tests {
             "12 model calls",
             "20 tool calls",
             "49152 bytes",
-            "1024 bytes",
+            "16384 bytes",
             "insufficient_evidence",
         ] {
             assert!(note.contains(needle), "{needle}: {note}");

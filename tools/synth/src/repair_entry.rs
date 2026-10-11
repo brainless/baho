@@ -60,7 +60,7 @@ pub struct RepairOptions {
 impl RepairOptions {
     pub fn default_settings() -> AttemptSettings {
         AttemptSettings {
-            investigator_prompt_version: "repair-investigator-v2".into(),
+            investigator_prompt_version: "repair-investigator-v3".into(),
             coder_prompt_version: "repair-coder-v2".into(),
             reviewer_prompt_version: "repair-reviewer-v2".into(),
             model: "neuralwatt".into(),
@@ -70,7 +70,7 @@ impl RepairOptions {
             api_request_timeout_seconds: 600,
             process_timeout_seconds: 300,
             max_output_bytes: 64 * 1024,
-            max_read_bytes: 1024,
+            max_read_bytes: 16 * 1024,
             max_outline_bytes: 6 * 1024,
             max_search_matches: 40,
             max_exposed_bytes: 48 * 1024,

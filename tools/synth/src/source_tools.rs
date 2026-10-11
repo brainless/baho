@@ -281,6 +281,99 @@ impl SourceSession {
         self.lock().exposed_bytes
     }
 
+    /// A compact, deterministic map for the initial investigator prompt.
+    /// This spends source bytes but no model tool call. Paths precede item
+    /// signatures so a bounded map still identifies every allowed file.
+    pub fn initial_outline_map(&self, max_bytes: usize) -> String {
+        let cap = max_bytes.min(self.limits.stage_bytes.saturating_sub(self.exposed_bytes()));
+        let mut paths = Vec::new();
+        let mut skipped = 0;
+        for scope in self.scopes.iter() {
+            collect_files(
+                &self.root,
+                Path::new(scope.trim_end_matches('/')),
+                &mut paths,
+                &mut skipped,
+            );
+        }
+        paths.sort();
+        paths.dedup();
+        let mut files = Vec::new();
+        for path in paths.into_iter().filter(|p| p.ends_with(".rs")) {
+            if let Ok((name, parsed)) = self.load(&path) {
+                files.push((name, parsed));
+            }
+        }
+        const OMITTED: &str = "[map truncated; call outline or search_text for omitted items]\n";
+        let mut map = String::from("Initial source map (1-based item spans):\n");
+        let mut truncated = false;
+        for (index, (name, file)) in files.iter().enumerate() {
+            let line = format!("[{index}] {name} ({} lines)\n", file.total_lines);
+            if map.len() + line.len() + OMITTED.len() > cap {
+                truncated = true;
+                break;
+            }
+            map.push_str(&line);
+        }
+        // Prioritize signatures relevant to the fixed Role equality repair,
+        // then traverse the remaining items round-robin across files.
+        let mut order = Vec::new();
+        let max_items = files
+            .iter()
+            .map(|(_, file)| file.items.len())
+            .max()
+            .unwrap_or(0);
+        for item_index in 0..max_items {
+            for (file_index, (_, file)) in files.iter().enumerate() {
+                if let Some(item) = file.items.get(item_index) {
+                    order.push((file_index, item));
+                }
+            }
+        }
+        let priority = |item: &Item| {
+            let label = item.label.to_ascii_lowercase();
+            if label.contains("parse_atomic") || label.contains("parse_literal") {
+                0
+            } else if ["filter", "predicate", "equality"]
+                .iter()
+                .any(|term| label.contains(term))
+            {
+                1
+            } else {
+                2
+            }
+        };
+        for level in 0..=2 {
+            for (index, item) in &order {
+                if priority(item) != level {
+                    continue;
+                }
+                let line = format!(
+                    "[{index}] {}-{} {}\n",
+                    item.start,
+                    item.end,
+                    clip(&item.text, MAX_OUTLINE_LINE_CHARS)
+                );
+                if map.len() + line.len() + OMITTED.len() > cap {
+                    truncated = true;
+                    break;
+                }
+                map.push_str(&line);
+            }
+            if truncated {
+                break;
+            }
+        }
+        if truncated && map.len() + OMITTED.len() <= cap {
+            map.push_str(OMITTED);
+        }
+        if map.len() > cap {
+            map.truncate(floor_boundary(&map, cap));
+        }
+        self.spend(map.len());
+        map
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -1324,6 +1417,111 @@ mod tests {
 
     fn rel(name: &str) -> String {
         format!("{SCOPE}{name}")
+    }
+
+    #[test]
+    fn initial_map_lists_files_and_signatures_without_spending_a_call() {
+        let (dir, s) = session_with(limits());
+        write(&dir, "a.rs", "fn first() {}\nfn second() {}\n");
+        write(&dir, "b.rs", "pub fn other() {}\n");
+        let map = s.initial_outline_map(1024);
+        for expected in [
+            "a.rs (2 lines)",
+            "b.rs (1 lines)",
+            "fn first",
+            "fn second",
+            "fn other",
+        ] {
+            assert!(map.contains(expected), "missing {expected}: {map}");
+        }
+        assert_eq!(s.calls_charged(), 0);
+        assert_eq!(s.exposed_bytes(), map.len());
+        let read = s
+            .read_lines(&rel("a.rs"), &[LineRange { start: 1, end: 2 }])
+            .unwrap();
+        assert_eq!(s.calls_charged(), 1);
+        assert_eq!(s.exposed_bytes(), map.len() + read.bytes);
+    }
+
+    #[test]
+    fn initial_map_prioritizes_real_filter_parser_signatures() {
+        let (dir, s) = session_with(limits());
+        write(
+            &dir,
+            "candidate_selection.rs",
+            include_str!("../../../crates/baho-core/src/candidate_selection.rs"),
+        );
+        write(
+            &dir,
+            "error.rs",
+            include_str!("../../../crates/baho-core/src/error.rs"),
+        );
+        write(
+            &dir,
+            "grounding.rs",
+            include_str!("../../../crates/baho-core/src/grounding.rs"),
+        );
+        write(
+            &dir,
+            "intent.rs",
+            include_str!("../../../crates/baho-core/src/intent.rs"),
+        );
+        write(
+            &dir,
+            "lib.rs",
+            include_str!("../../../crates/baho-core/src/lib.rs"),
+        );
+        write(
+            &dir,
+            "orchestration.rs",
+            include_str!("../../../crates/baho-core/src/orchestration.rs"),
+        );
+        let map = s.initial_outline_map(12 * 1024);
+        for path in [
+            "candidate_selection.rs",
+            "error.rs",
+            "grounding.rs",
+            "intent.rs",
+            "lib.rs",
+            "orchestration.rs",
+        ] {
+            assert!(map.contains(&rel(path)), "missing path {path}");
+        }
+        assert!(map.contains("parse_atomic"));
+        assert!(map.contains("parse_literal"));
+        assert!(map.contains("[map truncated;"));
+        assert!(map.len() <= 12 * 1024);
+        assert_eq!(s.exposed_bytes(), map.len());
+        assert_eq!(s.calls_charged(), 0);
+    }
+
+    #[test]
+    fn tiny_initial_map_still_respects_exposure_cap() {
+        let (dir, s) = session_with(limits());
+        write(&dir, "a.rs", "fn a() {}\n");
+        let map = s.initial_outline_map(16);
+        assert!(map.len() <= 16);
+        assert_eq!(s.exposed_bytes(), map.len());
+        assert_eq!(s.calls_charged(), 0);
+    }
+
+    #[test]
+    fn larger_read_cap_serves_a_function_body_in_one_call() {
+        let mut l = limits();
+        l.read_bytes = 16 * 1024;
+        let (dir, s) = session_with(l);
+        let mut source = String::from("fn body() {\n");
+        for _ in 0..100 {
+            source.push_str("    let _value = 123456789;\n");
+        }
+        source.push_str("}\n");
+        write(&dir, "body.rs", &source);
+        let read = s
+            .read_lines(&rel("body.rs"), &[LineRange { start: 1, end: 102 }])
+            .unwrap();
+        assert!(!read.truncated);
+        assert_eq!(read.ranges[0].served_end, Some(102));
+        assert!(read.bytes > 1024);
     }
 
     /// Over 64 KiB: a use block, an enum, an impl with methods, many generated
