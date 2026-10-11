@@ -206,6 +206,8 @@ pub struct SearchResponse {
     pub matches: Vec<SearchMatch>,
     pub files_searched: usize,
     pub files_skipped: usize,
+    /// True when a result or byte limit stops the search, or the file cap
+    /// leaves part of the allowed scope unsearched.
     pub truncated: bool,
     pub bytes: usize,
     pub exposed: Vec<Exposed>,
@@ -619,20 +621,25 @@ impl SourceSession {
         }
         files.sort();
         files.dedup();
+        let file_limit_reached = files.len() > MAX_SEARCH_FILES;
         files.truncate(MAX_SEARCH_FILES);
 
         let mut matches = Vec::new();
         let mut exposed = Vec::new();
         let mut bytes = 0usize;
         let mut searched = 0usize;
-        let mut truncated = false;
+        let mut truncated = file_limit_reached;
         let budget = left;
         'files: for rel in &files {
             let Ok((name, canon)) = self.resolve(rel) else {
                 skipped += 1;
                 continue;
             };
-            let Ok(hits) = scan_lines(&canon, query) else {
+            // Keep one extra hit to distinguish an exact fit from omitted
+            // results without retaining every match in a large file.
+            let hit_limit = self.limits.search_matches.saturating_sub(matches.len());
+            let Ok((hits, more_hits)) = scan_lines(&canon, query, hit_limit.saturating_add(1))
+            else {
                 skipped += 1;
                 continue;
             };
@@ -682,6 +689,10 @@ impl SourceSession {
                     item_end: inner.map(|i| i.end),
                 });
             }
+            if more_hits {
+                truncated = true;
+                break 'files;
+            }
         }
         self.spend(bytes);
         Ok(SearchResponse {
@@ -718,9 +729,13 @@ fn collect_files(root: &Path, rel: &Path, out: &mut Vec<String>, skipped: &mut u
     }
 }
 
-/// Streams a file by line, keeping only matching lines. Overlong lines are
-/// examined only up to a bound so a minified file cannot exhaust memory.
-fn scan_lines(path: &Path, query: &str) -> std::io::Result<Vec<(usize, String)>> {
+/// Streams a file by line, retaining only bounded excerpts up to `hit_limit`.
+/// An extra hit signals that results remain without collecting them.
+fn scan_lines(
+    path: &Path,
+    query: &str,
+    hit_limit: usize,
+) -> std::io::Result<(Vec<(usize, String)>, bool)> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut hits = Vec::new();
     let mut buf = Vec::new();
@@ -732,18 +747,32 @@ fn scan_lines(path: &Path, query: &str) -> std::io::Result<Vec<(usize, String)>>
             .take(MAX_SEARCH_LINE_BYTES)
             .read_until(b'\n', &mut buf)?;
         if n == 0 {
-            return Ok(hits);
+            return Ok((hits, false));
         }
         if buf.last() != Some(&b'\n') && n as u64 == MAX_SEARCH_LINE_BYTES {
-            // Discard the remainder of the overlong line.
-            let mut sink = Vec::new();
-            reader.read_until(b'\n', &mut sink)?;
+            // Drain via BufRead's fixed-size buffer: read_until would grow a
+            // second Vec to the full length of a minified line.
+            loop {
+                let available = reader.fill_buf()?;
+                if available.is_empty() {
+                    break;
+                }
+                let newline = available.iter().position(|b| *b == b'\n');
+                let consumed = newline.map_or(available.len(), |at| at + 1);
+                reader.consume(consumed);
+                if newline.is_some() {
+                    break;
+                }
+            }
         }
         number += 1;
         let line = String::from_utf8_lossy(&buf);
         let line = line.trim_end_matches(['\n', '\r']);
         if line.contains(query) {
-            hits.push((number, line.to_owned()));
+            if hits.len() == hit_limit {
+                return Ok((hits, true));
+            }
+            hits.push((number, clip(line.trim(), MAX_EXCERPT_CHARS)));
         }
     }
 }
@@ -1580,6 +1609,58 @@ mod tests {
                 ToolErrorCode::QueryInvalid
             );
         }
+    }
+
+    #[test]
+    fn line_scan_keeps_only_bounded_excerpts_and_detects_extra_hits() {
+        let (dir, _) = session_with(limits());
+        write(&dir, "many.rs", &"needle and filler\n".repeat(10_000));
+        let path = dir.path().join(SCOPE).join("many.rs");
+
+        let (hits, extra) = scan_lines(&path, "needle", 2).unwrap();
+        assert_eq!(
+            hits.iter().map(|(line, _)| *line).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(
+            hits.iter()
+                .all(|(_, excerpt)| excerpt.chars().count() <= 160)
+        );
+        assert!(extra);
+
+        let (hits, extra) = scan_lines(&path, "absent", 2).unwrap();
+        assert!(hits.is_empty());
+        assert!(!extra);
+    }
+
+    #[test]
+    fn line_scan_discards_megabyte_line_and_preserves_next_line_number() {
+        let (dir, _) = session_with(limits());
+        write(
+            &dir,
+            "long.rs",
+            &format!("{}\nneedle\n", "x".repeat(2_000_000)),
+        );
+        let path = dir.path().join(SCOPE).join("long.rs");
+
+        let (hits, extra) = scan_lines(&path, "needle", 1).unwrap();
+        assert_eq!(hits, [(2, "needle".to_owned())]);
+        assert!(!extra);
+    }
+
+    #[test]
+    fn search_reports_when_file_limit_omits_later_matches() {
+        let (dir, s) = session_with(limits());
+        for index in 0..MAX_SEARCH_FILES {
+            write(&dir, &format!("{index:05}.rs"), "nothing here\n");
+        }
+        write(&dir, "zzzzz.rs", "needle\n");
+
+        let result = s.search_text("needle").unwrap();
+        assert!(result.matches.is_empty());
+        assert_eq!(result.files_searched, MAX_SEARCH_FILES);
+        assert_eq!(result.files_skipped, 0);
+        assert!(result.truncated);
     }
 
     #[test]
