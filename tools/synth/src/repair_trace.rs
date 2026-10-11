@@ -30,7 +30,9 @@ const MAX_ACTIVITY_EVENTS: u32 = 2000;
 /// Bumped from 1: v2 adds the request and exposure ledger.
 pub(crate) const TRACE_SCHEMA_VERSION: u32 = 2;
 const MAX_VERBATIM_CHARS: usize = 256;
-const MAX_EXPOSED_PER_CALL: usize = 64;
+// A validated contract allows 200 search matches, each with an excerpt and
+// an enclosing item label exposure.
+const MAX_EXPOSED_PER_CALL: usize = 400;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -596,6 +598,21 @@ mod tests {
             },
         );
         (dir, session, rel)
+    }
+
+    #[test]
+    fn search_trace_keeps_every_excerpt_and_item_label_exposure() {
+        let (_dir, session, _rel) = fixture();
+        let response = serde_json::to_value(session.search_text("BODY_MARKER").unwrap()).unwrap();
+        assert_eq!(response["matches"].as_array().unwrap().len(), 40);
+        let (projected, exposed) = project_outcome("search_text", &response);
+        assert_eq!(projected["match_count"], 40);
+        assert_eq!(exposed.len(), 80);
+        assert_eq!(
+            exposed.iter().map(|e| e.bytes).sum::<usize>(),
+            response["bytes"].as_u64().unwrap() as usize
+        );
+        assert_eq!(serde_json::to_value(&exposed).unwrap(), response["exposed"]);
     }
 
     fn events(path: &Path) -> Vec<Value> {
