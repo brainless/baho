@@ -23,6 +23,7 @@ use std::{
 
 use crate::redaction::Redactor;
 use crate::repair_agents::{CheckArgs, ProbeArgs};
+use crate::repair_progress::RepairProgress;
 use crate::source_tools::{
     Exposed, OutlineArgs, ReadLinesArgs, SOURCE_TOOL_NAMES, SearchTextArgs, ToolErrorCode,
 };
@@ -72,6 +73,7 @@ struct State {
     events: u32,
     dropped_events: u32,
     redactor: Option<Redactor>,
+    progress: Option<RepairProgress>,
     source_bytes_exposed: usize,
     /// Exposed inclusive line spans per (path, file hash).
     spans: BTreeMap<(String, String), Vec<(usize, usize)>>,
@@ -89,6 +91,7 @@ impl AgentTrace {
             events: 0,
             dropped_events: 0,
             redactor: None,
+            progress: None,
             source_bytes_exposed: 0,
             spans: BTreeMap::new(),
         }))))
@@ -97,6 +100,10 @@ impl AgentTrace {
     /// never logged verbatim.
     pub fn with_redactor(self, redactor: Redactor) -> Self {
         self.0.lock().unwrap().redactor = Some(redactor);
+        self
+    }
+    pub fn with_progress(self, progress: RepairProgress) -> Self {
+        self.0.lock().unwrap().progress = Some(progress);
         self
     }
     pub fn event(&self, name: &'static str, detail: Value) {
@@ -142,6 +149,11 @@ impl State {
             Ok(())
         })();
         self.io_failed |= result.is_err();
+        if result.is_ok() {
+            if let Some(progress) = &self.progress {
+                progress.agent(self.stage, name, &detail, self.model_calls);
+            }
+        }
     }
     fn record_exposure(&mut self, exposed: &[Exposed]) {
         for e in exposed {

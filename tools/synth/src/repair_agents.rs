@@ -20,6 +20,7 @@ use crate::anchored_edits::{
 use crate::redaction::Redactor;
 use crate::repair::SuiteId;
 use crate::repair_live::LiveWorker;
+use crate::repair_progress::RepairProgress;
 use crate::repair_trace::AgentTrace;
 use crate::source_tools::{
     OutlineTool, ReadLinesTool, SearchTextTool, SourceLimits, SourceSession,
@@ -163,6 +164,7 @@ pub struct RigRepairAgents {
     checkout: PathBuf,
     target_prompt: String,
     redactor: Redactor,
+    progress: Option<RepairProgress>,
     worker: Arc<Mutex<LiveWorker>>,
     reduced_csv: String,
     reduced_prompt: String,
@@ -190,6 +192,7 @@ impl RigRepairAgents {
             checkout,
             target_prompt,
             redactor,
+            progress: None,
             worker,
             reduced_csv: String::new(),
             reduced_prompt: String::new(),
@@ -200,6 +203,11 @@ impl RigRepairAgents {
             open_questions: Vec::new(),
             applied: None,
         }
+    }
+
+    pub fn with_progress(mut self, progress: RepairProgress) -> Self {
+        self.progress = Some(progress);
+        self
     }
 
     fn ask<T: DeserializeOwned>(
@@ -228,6 +236,10 @@ impl RigRepairAgents {
                 self.failure_reason = Some(format!("{stage}: logging_io_error"));
                 Outcome::EnvironmentFailure
             })?;
+        let trace = match &self.progress {
+            Some(progress) => trace.with_progress(progress.clone()),
+            None => trace,
+        };
         trace.event("agent_started", json!({"max_agent_turns":max_agent_turns,"max_tool_calls":self.settings.max_tool_calls,"api_request_timeout_seconds":self.settings.api_request_timeout_seconds,"max_output_bytes":self.settings.max_output_bytes,"max_read_bytes":self.settings.max_read_bytes,"max_outline_bytes":self.settings.max_outline_bytes,"max_search_matches":self.settings.max_search_matches,"max_exposed_bytes":self.settings.max_exposed_bytes,"navigation_tools":true}));
         let model = self.model.clone();
         let nav = SourceSession::new(root, scopes, SourceLimits::from_settings(&self.settings));

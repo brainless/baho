@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::contracts::PlanComparison;
+use crate::repair_progress::RepairProgress;
 
 /// Version 2 pins the source-tool budgets in `AttemptSettings` (Epic 019).
 /// Version 1 contracts cannot supply those limits and are rejected.
@@ -309,6 +310,7 @@ pub enum RepairError {
 pub struct AttemptRecord {
     pub dir: PathBuf,
     pub manifest: AttemptManifest,
+    progress: Option<RepairProgress>,
 }
 
 impl AttemptRecord {
@@ -330,6 +332,7 @@ impl AttemptRecord {
                     fs::write(dir.join("protected/contract.json"), &bytes)?;
                     let mut record = Self {
                         dir,
+                        progress: None,
                         manifest: AttemptManifest {
                             schema_version: MANIFEST_SCHEMA,
                             attempt_id: id,
@@ -355,6 +358,12 @@ impl AttemptRecord {
         Err(RepairError::Io(std::io::Error::other(
             "attempt ID exhausted",
         )))
+    }
+
+    pub fn with_progress(mut self, progress: RepairProgress) -> Self {
+        progress.stage(Stage::Reserved, "attempt_reserved", "");
+        self.progress = Some(progress);
+        self
     }
 
     fn persist(&mut self) -> Result<(), RepairError> {
@@ -383,6 +392,9 @@ impl AttemptRecord {
             },
         )?;
         file.write_all(b"\n")?;
+        if let Some(progress) = &self.progress {
+            progress.stage(stage, name, detail);
+        }
         Ok(())
     }
 
@@ -770,9 +782,11 @@ pub fn run_attempt(
                 "toolchain": baseline.toolchain, "binary_sha256": baseline.binary_sha256,
             }))?,
         )?;
+        record.event(Stage::Baseline, "baseline_checks_started", "")?;
         if let Err(o) = worker.baseline_checks(&baseline) {
             return Ok(o);
         }
+        record.event(Stage::Baseline, "target_probe_started", "")?;
         let target_before = match worker.probe(&baseline, &contract.target) {
             Ok(v) => v,
             Err(o) => return Ok(o),
@@ -829,6 +843,7 @@ pub fn run_attempt(
             Ok(false) => return Ok(Outcome::RegressionFailure),
             Err(o) => return Ok(o),
         }
+        record.event(Stage::Regression, "protected_baseline_started", "")?;
         let mut protected_before = Vec::new();
         for case in &contract.protected_cases {
             let observation = match worker.probe(&baseline, case) {
@@ -883,6 +898,7 @@ pub fn run_attempt(
                 "patch_sha256": patch_hash,
             }))?,
         )?;
+        record.event(Stage::Check, "candidate_probes_started", "")?;
         let mut evidence = vec![target_before, reduced_before];
         for case in std::iter::once(&frozen.target).chain(std::iter::once(&frozen.reduced)) {
             let observation = match worker.probe(&candidate, case) {
@@ -913,6 +929,7 @@ pub fn run_attempt(
             evidence.push(observation);
         }
         for suite in SuiteId::ALL {
+            record.event(Stage::Check, "suite_started", &format!("{suite:?}"))?;
             let result = match worker.check(&candidate, suite) {
                 Ok(v) => v,
                 Err(o) => return Ok(o),
@@ -1237,6 +1254,34 @@ mod tests {
             AttemptManifest::parse(&fs::read(record.dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(saved.cleanup_error.as_deref(), Some("checkout busy"));
         assert_eq!(saved.outcome, Some(Outcome::Accepted));
+    }
+
+    #[test]
+    fn successful_attempt_records_worker_progress_before_each_long_gate() {
+        let (_, record, _, _, _root) = attempt("ok", "ok");
+        let events: Vec<AttemptEvent> = fs::read_to_string(record.dir.join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+        for name in [
+            "baseline_checks_started",
+            "target_probe_started",
+            "protected_baseline_started",
+            "candidate_probes_started",
+            "suite_started",
+        ] {
+            assert!(names.contains(&name), "missing {name}");
+        }
+        assert_eq!(names.last(), Some(&"attempt_finished"));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == "suite_started")
+                .count(),
+            SuiteId::ALL.len()
+        );
     }
 
     #[test]

@@ -80,7 +80,8 @@ cargo run -- repair \
   --baseline <full-40-character-commit-hash> \
   --dataset ../../.datasets/<local-role-dataset>.csv \
   --review <review-file.json> \
-  --output ../../synthetic/out/repair
+  --output ../../synthetic/out/repair \
+  --verbose
 ```
 
 All arguments except `--output` are required. The default output is
@@ -101,7 +102,11 @@ patch remain in the attempt's `protected/` directory for review; an accepted
 attempt is still not integrated automatically.
 
 The CLI prints the outcome and attempt path, then the manifest reason when
-present. `manifest.json` records the terminal stage, outcome, build IDs, patch
+present. It also prints live stage progress to stdout by default. `--verbose`
+(`-v`) adds model-call and tool-call progress; `--quiet` (`-q`) suppresses
+progress while preserving the final outcome. These messages contain only fixed
+stage names, tool names, and call numbers. The complete bounded event records
+remain in the attempt directory. `manifest.json` records the terminal stage, outcome, build IDs, patch
 hash, and a short reason. Outcomes include `accepted`, `rejected`, `no_change`,
 `needs_design`, `regression_failure`, `build_failure`, `check_failure`,
 `model_exhausted`, and `environment_failure`; consult the manifest for the

@@ -1,4 +1,5 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
+use synth::repair_progress::{RepairProgress, Verbosity};
 use synth::{
     cli_run::RunLimits,
     dataset::LoadedDataset,
@@ -23,7 +24,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("generate") => {}
         Some("evaluate") => return evaluate_command(args),
         Some("repair") => return repair_command(args),
-        _ => return Err("usage: synth repair --evaluation EVALUATION_JSON --case CASE_ID --baseline COMMIT --dataset CSV --review FILE [--output DIR]\n       synth evaluate --dataset CSV --baho-bin PATH [--generation DIR] [--review FILE] [--output DIR]\n       synth generate --dataset CSV --feature MARKDOWN --count N [--output DIR] [--per-call-seconds N] [--whole-run-seconds N] [--max-turns N] [--variation TEXT]".into()),
+        _ => return Err("usage: synth repair --evaluation EVALUATION_JSON --case CASE_ID --baseline COMMIT --dataset CSV --review FILE [--output DIR] [--verbose | --quiet]\n       synth evaluate --dataset CSV --baho-bin PATH [--generation DIR] [--review FILE] [--output DIR]\n       synth generate --dataset CSV --feature MARKDOWN --count N [--output DIR] [--per-call-seconds N] [--whole-run-seconds N] [--max-turns N] [--variation TEXT]".into()),
     }
     let mut dataset = None;
     let mut feature = None;
@@ -106,7 +107,15 @@ fn repair_command(
     let mut dataset = None;
     let mut review = None;
     let mut output = PathBuf::from("synthetic/out/repair");
+    let mut verbosity = Verbosity::Normal;
     while let Some(flag) = args.next() {
+        if matches!(flag.as_str(), "--verbose" | "-v" | "--quiet" | "-q") {
+            verbosity = match flag.as_str() {
+                "--verbose" | "-v" => Verbosity::Verbose,
+                _ => Verbosity::Quiet,
+            };
+            continue;
+        }
         let value = args.next().ok_or("option requires a value")?;
         match flag.as_str() {
             "--evaluation" => evaluation = Some(PathBuf::from(value)),
@@ -131,12 +140,15 @@ fn repair_command(
     };
     // Intake runs before credential loading, so invalid or unreviewed cases
     // cannot trigger a provider call.
+    let progress = RepairProgress::new(verbosity, |line| println!("{line}"));
+    progress.message("repair: validating intake");
     synth::repair_entry::prepare(&options)?;
+    progress.message("repair: loading provider credential");
     let key = resolve_credential(
         std::env::var("NEURALWATT_API_KEY").ok(),
         std::fs::read_to_string(repo.join(".env")).ok().as_deref(),
     )?;
-    let (outcome, path) = synth::repair_entry::repair(
+    let (outcome, path) = synth::repair_entry::repair_with_progress(
         neuralwatt_repair_model(
             key,
             REPAIR_MODEL,
@@ -144,6 +156,7 @@ fn repair_command(
         )?
         .into(),
         &options,
+        Some(progress),
     )?;
     println!("{:?}: {}", outcome, path.display());
     let manifest =

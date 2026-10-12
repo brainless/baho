@@ -13,6 +13,7 @@ pub mod repair_agents;
 pub mod repair_build;
 pub mod repair_entry;
 pub mod repair_live;
+pub mod repair_progress;
 mod repair_trace;
 pub mod source_tools;
 pub mod sql;
