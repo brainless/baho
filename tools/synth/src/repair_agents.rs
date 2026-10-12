@@ -27,8 +27,18 @@ use crate::source_tools::{
 };
 
 #[derive(Debug, thiserror::Error)]
-#[error("repair tool denied request")]
-struct ToolDenied;
+enum ToolDenied {
+    #[error("repair tool denied request")]
+    Denied,
+    #[error(
+        "invalid_build_id: use the exact build_id issued in the stage prompt or a prior build result; do not derive or shorten it"
+    )]
+    InvalidBuildId,
+}
+
+fn require_issued_build_id(issued: bool) -> Result<(), ToolDenied> {
+    issued.then_some(()).ok_or(ToolDenied::InvalidBuildId)
+}
 
 /// Probe and check tools draw on the same call budget as source navigation.
 #[derive(Clone)]
@@ -38,7 +48,7 @@ struct SourceTools {
 
 impl SourceTools {
     fn charge(&self) -> Result<(), ToolDenied> {
-        self.nav.charge_call().map_err(|_| ToolDenied)
+        self.nav.charge_call().map_err(|_| ToolDenied::Denied)
     }
 }
 
@@ -59,7 +69,7 @@ struct ProbeTool {
 }
 
 fn probe_tool_output(observation: crate::probe::ProbeObservation) -> Result<Value, ToolDenied> {
-    let mut output = serde_json::to_value(observation).map_err(|_| ToolDenied)?;
+    let mut output = serde_json::to_value(observation).map_err(|_| ToolDenied::Denied)?;
     output["asserted_desired_behavior"] = Value::Bool(false);
     Ok(output)
 }
@@ -87,14 +97,13 @@ impl PortableTool for ProbeTool {
             ))
             .is_empty()
         {
-            return Err(ToolDenied);
+            return Err(ToolDenied::Denied);
         }
-        let observation = self
-            .worker
-            .lock()
-            .map_err(|_| ToolDenied)?
+        let mut worker = self.worker.lock().map_err(|_| ToolDenied::Denied)?;
+        require_issued_build_id(worker.has_issued_build_id(&args.build_id))?;
+        let observation = worker
             .synthetic_probe(&args.build_id, &args.csv, &args.prompt, args.sql.as_deref())
-            .map_err(|_| ToolDenied)?;
+            .map_err(|_| ToolDenied::Denied)?;
         probe_tool_output(observation)
     }
 }
@@ -124,13 +133,12 @@ impl PortableTool for RunChecksTool {
     }
     async fn call(&self, args: CheckArgs) -> Result<Value, ToolDenied> {
         self.tools.charge()?;
-        let result = self
-            .worker
-            .lock()
-            .map_err(|_| ToolDenied)?
+        let mut worker = self.worker.lock().map_err(|_| ToolDenied::Denied)?;
+        require_issued_build_id(worker.has_issued_build_id(&args.build_id))?;
+        let result = worker
             .fixed_check(&args.build_id, args.suite)
-            .map_err(|_| ToolDenied)?;
-        serde_json::to_value(result).map_err(|_| ToolDenied)
+            .map_err(|_| ToolDenied::Denied)?;
+        serde_json::to_value(result).map_err(|_| ToolDenied::Denied)
     }
 }
 use crate::repair::{
@@ -375,6 +383,20 @@ fn initial_investigation_prompt(
     trace.event("initial_source_map", json!({"bytes":map.len(),"source_bytes_charged":nav.exposed_bytes(),"tool_calls_charged":nav.calls_charged()}));
     format!("{prompt}\n\n{map}")
 }
+
+fn investigation_prompt(
+    target: &Observation,
+    target_prompt: &str,
+    settings: &AttemptSettings,
+) -> String {
+    format!(
+        "Investigate this reproduced Role text-equality mismatch. Return only JSON with result_ids, causal_hypothesis, mechanism, allowed_files, compatibility_checks, reduction. Reduction has csv, prompt, sql fields only; use a small neutral synthetic CSV and restricted Role equality SQL. The harness computes expected rows. The result_ids must include the observed result. Target prompt: {target_prompt:?}. Baseline result ID: {}. Baseline build_id: {}. Pass this exact build_id to probe and run_checks; it is an issued opaque identifier, so do not derive it from the revision, result ID, or binary hash and do not shorten it. Baseline plan: {:?}. Allowed production scope: crates/baho-core/src/. {}",
+        target.result_id,
+        target.build_id,
+        target.plan,
+        navigation_note(settings, "investigation", CORE_PATHS),
+    )
+}
 const CORE_PATHS: &str = "paths are root-relative under crates/baho-core/src/";
 const REVIEW_SCOPES: [&str; 3] = [
     "candidate/crates/baho-core/src/",
@@ -555,13 +577,7 @@ impl Agents for RigRepairAgents {
         &self.open_questions
     }
     fn investigate(&mut self, target: &Observation) -> Result<Investigation, Outcome> {
-        let prompt = format!(
-            "Investigate this reproduced Role text-equality mismatch. Return only JSON with result_ids, causal_hypothesis, mechanism, allowed_files, compatibility_checks, reduction. Reduction has csv, prompt, sql fields only; use a small neutral synthetic CSV and restricted Role equality SQL. The harness computes expected rows. The result_ids must include the observed result. Target prompt: {:?}. Baseline result ID: {}. Baseline plan: {:?}. Allowed production scope: crates/baho-core/src/. {}",
-            self.target_prompt,
-            target.result_id,
-            target.plan,
-            navigation_note(&self.settings, "investigation", CORE_PATHS),
-        );
+        let prompt = investigation_prompt(target, &self.target_prompt, &self.settings);
         let root = self.checkout.clone();
         let answer: InvestigationAnswer = self.ask("investigation", "You are the independent repair investigator. State one testable mechanism. Do not request scope expansion. Navigate source with outline, read_lines, and search_text; never request whole files. Return JSON only.", prompt, root, &[CORE_SCOPE])?;
         let handoff = Investigation {
@@ -1090,13 +1106,44 @@ mod tests {
     }
 
     #[test]
+    fn investigator_receives_exact_issued_build_id_for_executable_tools() {
+        let target = Observation {
+            build_id: "issued-build-identity-123".into(),
+            result_id: "observed-result-456".into(),
+            fixture_sha256: "fixture".into(),
+            prompt_sha256: "prompt".into(),
+            source_rows: None,
+            plan: PlanComparison::Unavailable,
+        };
+        let settings = crate::repair_entry::RepairOptions::default_settings();
+        let prompt = investigation_prompt(&target, "private target", &settings);
+        assert!(prompt.contains("Baseline build_id: issued-build-identity-123"));
+        assert!(prompt.contains("Pass this exact build_id to probe and run_checks"));
+        assert!(prompt.contains("do not derive it from the revision, result ID, or binary hash"));
+        assert!(prompt.contains("Baseline result ID: observed-result-456"));
+    }
+
+    #[test]
+    fn unknown_build_id_error_is_specific_and_payload_free() {
+        assert!(require_issued_build_id(true).is_ok());
+        let error = require_issued_build_id(false).unwrap_err().to_string();
+        assert!(error.starts_with("invalid_build_id:"));
+        assert!(error.contains("exact build_id"));
+        assert!(!error.contains("private target"));
+        assert_eq!(
+            crate::source_tools::ToolErrorCode::find_in(&error),
+            Some(crate::source_tools::ToolErrorCode::InvalidBuildId)
+        );
+    }
+
+    #[test]
     fn navigation_note_states_turn_and_byte_budgets() {
         let settings = crate::repair_entry::RepairOptions::default_settings();
         assert_eq!(settings.max_investigator_turns, 12);
         assert_eq!(settings.max_agent_turns, 6);
         assert_eq!(
             settings.investigator_prompt_version,
-            "repair-investigator-v3"
+            "repair-investigator-v4"
         );
         assert_eq!(settings.reviewer_prompt_version, "repair-reviewer-v2");
         assert_eq!(settings.coder_prompt_version, "repair-coder-v2");

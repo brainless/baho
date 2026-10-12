@@ -47,10 +47,11 @@ pub enum ToolErrorCode {
     /// `syn` could not parse the file. Outline falls back instead of failing,
     /// so this is reported in the response and the trace, not as an `Err`.
     ParseFailed,
+    InvalidBuildId,
 }
 
 impl ToolErrorCode {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::PathNotAllowed,
         Self::NotFound,
         Self::NotAFile,
@@ -59,6 +60,7 @@ impl ToolErrorCode {
         Self::BudgetExhausted,
         Self::SessionBytesExhausted,
         Self::ParseFailed,
+        Self::InvalidBuildId,
     ];
 
     /// The code a tool error text starts with, as rendered by
@@ -81,6 +83,7 @@ impl ToolErrorCode {
             Self::BudgetExhausted => "budget_exhausted",
             Self::SessionBytesExhausted => "session_bytes_exhausted",
             Self::ParseFailed => "parse_failed",
+            Self::InvalidBuildId => "invalid_build_id",
         }
     }
 }

@@ -250,6 +250,10 @@ impl ConfinedWorker for SharedLiveWorker {
 }
 
 impl LiveWorker {
+    pub fn has_issued_build_id(&self, build_id: &str) -> bool {
+        self.identities.contains_key(build_id)
+    }
+
     pub fn synthetic_probe(
         &mut self,
         build_id: &str,
