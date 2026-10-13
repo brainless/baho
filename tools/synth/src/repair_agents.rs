@@ -306,6 +306,7 @@ impl RigRepairAgents {
             max_agent_turns: max_agent_turns as usize,
             max_bytes: self.settings.max_output_bytes,
             api_request_timeout_seconds: self.settings.api_request_timeout_seconds,
+            answer_shape: answer_shape(stage),
         };
         let hook = trace.clone();
         let run_trace = trace.clone();
@@ -450,6 +451,20 @@ struct StageLimits {
     max_agent_turns: usize,
     max_bytes: usize,
     api_request_timeout_seconds: u64,
+    answer_shape: &'static str,
+}
+
+fn answer_shape(stage: &str) -> &'static str {
+    match stage {
+        "investigation" => {
+            "{\"result_ids\":[string],\"causal_hypothesis\":string,\"mechanism\":string,\"allowed_files\":[string],\"compatibility_checks\":[string],\"reduction\":{\"csv\":string,\"prompt\":string,\"sql\":string}}"
+        }
+        "coding" => {
+            "{\"edits\":[{\"path\":string,\"baseline_sha256\":string,\"start_line\":integer,\"end_line\":integer,\"old\":string,\"new\":string}],\"new_files\":[{\"path\":string,\"content\":string}]}"
+        }
+        "review" => "{\"pass\":boolean,\"reason\":string}",
+        _ => "a JSON object with the stage's required fields and types",
+    }
 }
 
 enum Finish<T> {
@@ -469,7 +484,48 @@ async fn run_stage<T: DeserializeOwned>(
     let reserve = limits.max_agent_turns > 0;
     let tool_turns = limits.max_agent_turns.saturating_sub(usize::from(reserve));
     match agent.prompt(prompt).max_turns(tool_turns).await {
-        Ok(response) => decode_answer(response.output(), limits.max_bytes, false),
+        Ok(response) => {
+            let decoded = decode_answer(response.output(), limits.max_bytes, false);
+            if !matches!(decoded, Err(("invalid_final_json", _))) {
+                return decoded;
+            }
+            let correction = correction_prompt(response.output(), limits.answer_shape);
+            // The tool-enabled run uses at most max_agent_turns - 1 calls.
+            // Reuse its transcript for one corrective call, without tools.
+            let Some(history) = response.messages else {
+                return decoded;
+            };
+            if response.completion_calls.len() >= limits.max_agent_turns {
+                return decoded;
+            }
+            trace.event(
+                "final_answer_correction_requested",
+                json!({"cause":"invalid_final_json","tool_choice":"none"}),
+            );
+            let corrected = match agent
+                .prompt(correction)
+                .history(history)
+                .tool_choice(ToolChoice::None)
+                .max_turns(1)
+                .await
+            {
+                Ok(answer) => decode_answer(answer.output(), limits.max_bytes, false),
+                Err(PromptError::UnknownToolCall { .. } | PromptError::MaxTurnsError { .. }) => {
+                    Err(("final_answer_tool_call", None))
+                }
+                Err(error) => Err(stage_failure(&error, limits, trace)),
+            };
+            let outcome = match &corrected {
+                Ok(Finish::Answer(..)) => "answer",
+                Ok(Finish::Insufficient(_)) => "insufficient_evidence",
+                Err((cause, _)) => cause,
+            };
+            trace.event(
+                "final_answer_correction_finished",
+                json!({"outcome":outcome}),
+            );
+            corrected
+        }
         Err(PromptError::MaxTurnsError { chat_history, .. }) if reserve => {
             trace.event(
                 "final_answer_requested",
@@ -568,6 +624,20 @@ fn decode_answer<T: DeserializeOwned>(
     serde_json::from_value(value)
         .map(|answer| Finish::Answer(answer, after_budget))
         .map_err(|_| ("invalid_final_json", None))
+}
+
+fn correction_prompt(output: &str, shape: &str) -> String {
+    let feedback = match serde_json::from_str::<Value>(output) {
+        Ok(_) => "The JSON object did not match the required fields or field types.".to_owned(),
+        Err(error) => format!(
+            "JSON syntax is invalid at line {}, column {}.",
+            error.line(),
+            error.column()
+        ),
+    };
+    format!(
+        "Your previous final answer could not be validated. {feedback} Return one corrected JSON object with this exact shape and types: {shape}. Do not call tools. Do not include Markdown or commentary. If the evidence is insufficient, return {{\"insufficient_evidence\":true,\"open_questions\":[up to 5 short strings without data values]}} instead."
+    )
 }
 
 /// Model-written open questions are prose: any the redactor flags are replaced
@@ -827,6 +897,7 @@ mod tests {
                 max_agent_turns,
                 max_bytes: 4096,
                 api_request_timeout_seconds: 600,
+                answer_shape: answer_shape("review"),
             };
             let result =
                 run_stage::<Value>(&self.agent, "private prompt".into(), limits, &self.trace).await;
@@ -876,6 +947,7 @@ mod tests {
             max_agent_turns: 0,
             max_bytes: 100,
             api_request_timeout_seconds: 600,
+            answer_shape: answer_shape("review"),
         };
         let turns = run_stage::<Value>(&h.agent, "private prompt".into(), limits, &h.trace).await;
         assert_eq!(turns.err(), Some(("max_agent_turns", Some(0))));
@@ -962,6 +1034,7 @@ mod tests {
                     max_agent_turns: 12,
                     max_bytes: 4096,
                     api_request_timeout_seconds: 600,
+                    answer_shape: answer_shape("review"),
                 }
             ),
             ("api_request_timeout", Some(600))
@@ -978,6 +1051,7 @@ mod tests {
                     max_agent_turns: 12,
                     max_bytes: 4096,
                     api_request_timeout_seconds: 600,
+                    answer_shape: answer_shape("review"),
                 }
             ),
             ("http", None)
@@ -1039,6 +1113,69 @@ mod tests {
         assert_eq!(
             named(&events, "agent_finished")[0]["detail"]["cause"],
             "completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_final_answer_gets_one_tool_free_correction() {
+        let h = harness([
+            MockTurn::text("{\"pass\": tru"),
+            MockTurn::text("{\"pass\":false,\"reason\":\"unsupported\"}"),
+        ]);
+        let limits = StageLimits {
+            max_agent_turns: 3,
+            max_bytes: 4096,
+            api_request_timeout_seconds: 600,
+            answer_shape: answer_shape("review"),
+        };
+        let result = run_stage::<ReviewAnswer>(&h.agent, "private prompt".into(), limits, &h.trace)
+            .await
+            .unwrap();
+        let Finish::Answer(answer, false) = result else {
+            panic!("expected corrected review answer");
+        };
+        assert!(!answer.pass);
+        assert_eq!(answer.reason, "unsupported");
+        let requests = h.model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].tool_choice, Some(ToolChoice::None));
+        let history = serde_json::to_string(&requests[1].chat_history).unwrap();
+        assert!(history.contains("pass"));
+        let events = h.events();
+        assert_eq!(named(&events, "final_answer_correction_requested").len(), 1);
+        assert_eq!(
+            named(&events, "final_answer_correction_finished")[0]["detail"]["outcome"],
+            "answer"
+        );
+        assert!(
+            !fs::read_to_string(&h.trace_path)
+                .unwrap()
+                .contains("private prompt")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_schema_still_invalid_after_one_correction() {
+        let h = harness([
+            MockTurn::text("{\"pass\":\"yes\",\"reason\":3}"),
+            MockTurn::text("{\"pass\":\"yes\",\"reason\":3}"),
+        ]);
+        let limits = StageLimits {
+            max_agent_turns: 3,
+            max_bytes: 4096,
+            api_request_timeout_seconds: 600,
+            answer_shape: answer_shape("review"),
+        };
+        let result =
+            run_stage::<ReviewAnswer>(&h.agent, "private prompt".into(), limits, &h.trace).await;
+        assert_eq!(result.err(), Some(("invalid_final_json", None)));
+        assert_eq!(h.model.requests().len(), 2);
+        let requests = h.model.requests();
+        let correction = serde_json::to_string(&requests[1].chat_history).unwrap();
+        assert!(correction.contains("boolean"));
+        assert_eq!(
+            named(&h.events(), "final_answer_correction_finished")[0]["detail"]["outcome"],
+            "invalid_final_json"
         );
     }
 
