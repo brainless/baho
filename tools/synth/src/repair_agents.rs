@@ -34,6 +34,10 @@ enum ToolDenied {
         "invalid_build_id: use the exact build_id issued in the stage prompt or a prior build result; do not derive or shorten it"
     )]
     InvalidBuildId,
+    #[error(
+        "invalid_sql: use SELECT _row FROM data WHERE lower(\"Role\") = lower('VALUE') ORDER BY _row (replace VALUE with a synthetic Role value, double embedded single quotes, omit the semicolon)"
+    )]
+    InvalidSql,
 }
 
 fn require_issued_build_id(issued: bool) -> Result<(), ToolDenied> {
@@ -74,13 +78,42 @@ fn probe_tool_output(observation: crate::probe::ProbeObservation) -> Result<Valu
     Ok(output)
 }
 
+const PROBE_SQL_TEMPLATE: &str =
+    "SELECT _row FROM data WHERE lower(\"Role\") = lower('VALUE') ORDER BY _row";
+
+fn validate_probe_sql(csv: &str, sql: &str) -> Result<(), ToolDenied> {
+    let rows = crate::probe::validate_synthetic(csv.as_bytes()).map_err(|_| ToolDenied::Denied)?;
+    let role = rows[0]
+        .cells
+        .iter()
+        .position(|cell| cell == "Role")
+        .ok_or(ToolDenied::InvalidSql)?;
+    let profile = crate::dataset::DatasetProfile {
+        column: "Role",
+        total_rows: rows.len() - 1,
+        roles: rows
+            .iter()
+            .skip(1)
+            .map(|row| crate::dataset::RoleCount {
+                value: row.cells[role].clone(),
+                count: 1,
+            })
+            .collect(),
+    };
+    crate::sql::parse_role_query(sql, &profile)
+        .map(|_| ())
+        .map_err(|_| ToolDenied::InvalidSql)
+}
+
 impl PortableTool for ProbeTool {
     const NAME: &'static str = "probe";
     type Args = ProbeArgs;
     type Output = Value;
     type Error = ToolDenied;
     fn description(&self) -> String {
-        "Run the confined public CLI on bounded neutral synthetic CSV; optional SQL uses restricted Role equality.".into()
+        format!(
+            "Run the confined public CLI on bounded neutral synthetic CSV. Optional SQL must use exactly {PROBE_SQL_TEMPLATE}; replace VALUE with a value in the synthetic Role column (double embedded single quotes). No semicolon or extra clauses."
+        )
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"build_id":{"type":"string"},"csv":{"type":"string"},"prompt":{"type":"string"},"sql":{"type":["string","null"]}},"required":["build_id","csv","prompt"],"additionalProperties":false})
@@ -98,6 +131,9 @@ impl PortableTool for ProbeTool {
             .is_empty()
         {
             return Err(ToolDenied::Denied);
+        }
+        if let Some(sql) = args.sql.as_deref() {
+            validate_probe_sql(&args.csv, sql)?;
         }
         let mut worker = self.worker.lock().map_err(|_| ToolDenied::Denied)?;
         require_issued_build_id(worker.has_issued_build_id(&args.build_id))?;
@@ -390,7 +426,7 @@ fn investigation_prompt(
     settings: &AttemptSettings,
 ) -> String {
     format!(
-        "Investigate this reproduced Role text-equality mismatch. Return only JSON with result_ids, causal_hypothesis, mechanism, allowed_files, compatibility_checks, reduction. Reduction has csv, prompt, sql fields only; use a small neutral synthetic CSV and restricted Role equality SQL. The harness computes expected rows. The result_ids must include the observed result. Target prompt: {target_prompt:?}. Baseline result ID: {}. Baseline build_id: {}. Pass this exact build_id to probe and run_checks; it is an issued opaque identifier, so do not derive it from the revision, result ID, or binary hash and do not shorten it. Baseline plan: {:?}. Allowed production scope: crates/baho-core/src/. {}",
+        "Investigate this reproduced Role text-equality mismatch. Return only JSON with result_ids, causal_hypothesis, mechanism, allowed_files, compatibility_checks, reduction. Reduction has csv, prompt, sql fields only; use a small neutral synthetic CSV. The only supported SQL is {PROBE_SQL_TEMPLATE}; replace VALUE with a value present in the synthetic Role column, double embedded single quotes, and add no semicolon or clauses. The harness computes expected rows. The result_ids must include the observed result. Target prompt: {target_prompt:?}. Baseline result ID: {}. Baseline build_id: {}. Pass this exact build_id to probe and run_checks; it is an issued opaque identifier, so do not derive it from the revision, result ID, or binary hash and do not shorten it. Baseline plan: {:?}. Allowed production scope: crates/baho-core/src/. {}",
         target.result_id,
         target.build_id,
         target.plan,
@@ -453,7 +489,7 @@ async fn run_stage<T: DeserializeOwned>(
                 Err(PromptError::UnknownToolCall { .. } | PromptError::MaxTurnsError { .. }) => {
                     Err(("final_answer_tool_call", None))
                 }
-                Err(error) => Err(prompt_failure(&error, limits)),
+                Err(error) => Err(stage_failure(&error, limits, trace)),
             };
             let outcome = match &finished {
                 Ok(Finish::Answer(..)) => "answer",
@@ -463,8 +499,17 @@ async fn run_stage<T: DeserializeOwned>(
             trace.event("final_answer_finished", json!({"outcome":outcome}));
             finished
         }
-        Err(error) => Err(prompt_failure(&error, limits)),
+        Err(error) => Err(stage_failure(&error, limits, trace)),
     }
+}
+
+fn stage_failure(error: &PromptError, limits: StageLimits, trace: &AgentTrace) -> Failure {
+    // Rig returns an answerless length-truncated turn as CompletionError and
+    // does not expose its accumulated history for a bounded final-answer call.
+    if matches!(error, PromptError::CompletionError(_)) && trace.last_turn_hit_output_limit() {
+        return ("output_token_limit", None);
+    }
+    prompt_failure(error, limits)
 }
 
 fn prompt_failure(error: &PromptError, limits: StageLimits) -> Failure {
@@ -855,6 +900,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn answerless_length_turn_has_output_limit_cause() {
+        let h =
+            harness([MockTurn::text("").with_finish_reason(rig::completion::FinishReason::Length)]);
+        assert_eq!(h.run(3).await.err(), Some(("output_token_limit", None)));
+        let events = h.events();
+        assert_eq!(
+            named(&events, "agent_finished")[0]["detail"]["cause"],
+            "output_token_limit"
+        );
+        assert_eq!(h.model.requests().len(), 1);
+    }
+
+    #[test]
+    fn probe_sql_feedback_is_stable_and_contains_no_fixture_values() {
+        let csv = "Id,Role\n1,zebra_literal\n2,analyst\n";
+        assert!(
+            validate_probe_sql(
+                csv,
+                "SELECT _row FROM data WHERE lower(\"Role\") = lower('analyst') ORDER BY _row"
+            )
+            .is_ok()
+        );
+        for sql in [
+            "SELECT * FROM data WHERE Role = 'zebra_literal'",
+            "SELECT _row FROM data WHERE lower(\"Role\") = lower('missing') ORDER BY _row",
+        ] {
+            let error = validate_probe_sql(csv, sql).unwrap_err().to_string();
+            assert!(error.starts_with("invalid_sql:"));
+            assert!(!error.contains("zebra_literal"));
+            assert!(!error.contains("missing"));
+        }
+    }
+
+    #[tokio::test]
     async fn timed_out_provider_request_has_named_cause_and_limit() {
         use std::net::TcpListener;
 
@@ -1121,6 +1200,8 @@ mod tests {
         assert!(prompt.contains("Pass this exact build_id to probe and run_checks"));
         assert!(prompt.contains("do not derive it from the revision, result ID, or binary hash"));
         assert!(prompt.contains("Baseline result ID: observed-result-456"));
+        assert!(prompt.contains(PROBE_SQL_TEMPLATE));
+        assert!(prompt.contains("double embedded single quotes"));
     }
 
     #[test]
@@ -1143,7 +1224,7 @@ mod tests {
         assert_eq!(settings.max_agent_turns, 6);
         assert_eq!(
             settings.investigator_prompt_version,
-            "repair-investigator-v4"
+            "repair-investigator-v5"
         );
         assert_eq!(settings.reviewer_prompt_version, "repair-reviewer-v2");
         assert_eq!(settings.coder_prompt_version, "repair-coder-v2");

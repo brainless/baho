@@ -68,6 +68,7 @@ struct State {
     start: Instant,
     model_calls: u32,
     active_model: Option<Instant>,
+    last_finish_reason: Option<FinishReason>,
     tools: BTreeMap<String, Instant>,
     io_failed: bool,
     events: u32,
@@ -86,6 +87,7 @@ impl AgentTrace {
             start: Instant::now(),
             model_calls: 0,
             active_model: None,
+            last_finish_reason: None,
             tools: BTreeMap::new(),
             io_failed: false,
             events: 0,
@@ -108,6 +110,12 @@ impl AgentTrace {
     }
     pub fn event(&self, name: &'static str, detail: Value) {
         self.0.lock().unwrap().write(name, detail);
+    }
+    pub fn last_turn_hit_output_limit(&self) -> bool {
+        matches!(
+            self.0.lock().unwrap().last_finish_reason,
+            Some(FinishReason::Length)
+        )
     }
     pub fn finish(&self, cause: &'static str, limit: Option<u64>, calls: u32) -> bool {
         let mut s = self.0.lock().unwrap();
@@ -380,6 +388,7 @@ impl AgentHook for AgentTrace {
         let mut s = self.0.lock().unwrap();
         s.model_calls += 1;
         s.active_model = Some(Instant::now());
+        s.last_finish_reason = None;
         s.write("model_call_started", json!({}));
         CompletionCallAction::Continue
     }
@@ -401,6 +410,7 @@ impl AgentHook for AgentTrace {
             Some(FinishReason::Other(_)) => Some("other"),
             None => None,
         };
+        s.last_finish_reason = event.finish_reason.cloned();
         s.write("model_call_finished", json!({"elapsed_ms":elapsed,"input_tokens":event.usage.input_tokens,"output_tokens":event.usage.output_tokens,"total_tokens":event.usage.total_tokens,"cached_input_tokens":event.usage.cached_input_tokens,"finish_reason":finish_reason,"max_tokens":event.max_tokens}));
         ModelTurnAction::Continue
     }
@@ -477,6 +487,9 @@ impl AgentHook for AgentTrace {
                     code = c.as_str();
                 }
             }
+            if invalid_sql_probe_failure(tool, succeeded, rendered.as_deref()) {
+                code = "invalid_sql";
+            }
             s.record_exposure(&exposed);
             detail.insert("call_id".into(), json!(id));
             detail.insert("tool".into(), json!(tool));
@@ -490,9 +503,37 @@ impl AgentHook for AgentTrace {
     }
 }
 
+fn invalid_sql_probe_failure(tool: &str, succeeded: bool, rendered: Option<&str>) -> bool {
+    tool == "probe" && !succeeded && rendered.is_some_and(|text| text.contains("invalid_sql:"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_sql_probe_code_is_scoped_and_value_free() {
+        assert!(invalid_sql_probe_failure(
+            "probe",
+            false,
+            Some("invalid_sql: use fixed grammar")
+        ));
+        assert!(!invalid_sql_probe_failure(
+            "probe",
+            true,
+            Some("invalid_sql: example")
+        ));
+        assert!(!invalid_sql_probe_failure(
+            "read_lines",
+            false,
+            Some("invalid_sql: example")
+        ));
+        assert!(!invalid_sql_probe_failure(
+            "probe",
+            false,
+            Some("repair tool denied request")
+        ));
+    }
     use crate::source_tools::{
         LineRange, OutlineTool, ReadLinesTool, SearchTextTool, SourceLimits, SourceSession,
     };

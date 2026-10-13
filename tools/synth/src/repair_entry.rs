@@ -61,7 +61,7 @@ pub struct RepairOptions {
 impl RepairOptions {
     pub fn default_settings() -> AttemptSettings {
         AttemptSettings {
-            investigator_prompt_version: "repair-investigator-v4".into(),
+            investigator_prompt_version: "repair-investigator-v5".into(),
             coder_prompt_version: "repair-coder-v2".into(),
             reviewer_prompt_version: "repair-reviewer-v2".into(),
             model: "neuralwatt".into(),
