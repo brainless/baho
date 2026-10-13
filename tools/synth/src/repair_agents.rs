@@ -19,6 +19,7 @@ use crate::anchored_edits::{
 };
 use crate::redaction::Redactor;
 use crate::repair::SuiteId;
+use crate::repair_http::RetryEvents;
 use crate::repair_live::LiveWorker;
 use crate::repair_progress::RepairProgress;
 use crate::repair_trace::AgentTrace;
@@ -209,6 +210,7 @@ pub struct RigRepairAgents {
     target_prompt: String,
     redactor: Redactor,
     progress: Option<RepairProgress>,
+    retry_events: RetryEvents,
     worker: Arc<Mutex<LiveWorker>>,
     reduced_csv: String,
     reduced_prompt: String,
@@ -237,6 +239,7 @@ impl RigRepairAgents {
             target_prompt,
             redactor,
             progress: None,
+            retry_events: RetryEvents::default(),
             worker,
             reduced_csv: String::new(),
             reduced_prompt: String::new(),
@@ -251,6 +254,11 @@ impl RigRepairAgents {
 
     pub fn with_progress(mut self, progress: RepairProgress) -> Self {
         self.progress = Some(progress);
+        self
+    }
+
+    pub fn with_retry_events(mut self, events: RetryEvents) -> Self {
+        self.retry_events = events;
         self
     }
 
@@ -307,6 +315,7 @@ impl RigRepairAgents {
             max_bytes: self.settings.max_output_bytes,
             api_request_timeout_seconds: self.settings.api_request_timeout_seconds,
             answer_shape: answer_shape(stage),
+            reserved_final_max_tokens: (stage == "coding").then_some(CODING_FINAL_MAX_TOKENS),
         };
         let hook = trace.clone();
         let run_trace = trace.clone();
@@ -333,6 +342,12 @@ impl RigRepairAgents {
             })
         });
         let (cause, limit) = finish_cause(&result);
+        for event in self.retry_events.drain() {
+            trace.event(
+                "provider_request_retry",
+                json!({"attempts":2,"transport_result":event.transport_result,"initial_http_status":event.initial_http_status,"final_http_status":event.final_http_status}),
+            );
+        }
         let logged = trace.finish(cause, limit, observer.calls_charged());
         if !logged {
             self.failure_reason = Some(format!("{stage}: logging_io_error; agent cause={cause}"));
@@ -351,14 +366,33 @@ impl RigRepairAgents {
                 Err(insufficient_outcome(stage))
             }
             Err((cause, limit)) => {
+                let status = matches!(cause, "http" | "api_request_timeout" | "provider_response")
+                    .then(|| {
+                        format!(
+                            "; http_status={}",
+                            trace
+                                .failure_http_status()
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "unknown".to_owned())
+                        )
+                    })
+                    .unwrap_or_default();
                 self.failure_reason = Some(format!(
-                    "{stage}: {cause}{}; tool_budget_exhausted={}",
+                    "{stage}: {cause}{}{status}; tool_budget_exhausted={}",
                     limit.map(|n| format!(" (limit={n})")).unwrap_or_default(),
                     observer.budget_denied()
                 ));
-                Err(Outcome::ModelExhausted)
+                Err(failure_outcome(cause))
             }
         }
+    }
+}
+
+fn failure_outcome(cause: &str) -> Outcome {
+    if matches!(cause, "http" | "api_request_timeout" | "provider_response") {
+        Outcome::EnvironmentFailure
+    } else {
+        Outcome::ModelExhausted
     }
 }
 
@@ -406,6 +440,7 @@ const MAX_OPEN_QUESTIONS: usize = 5;
 const MAX_QUESTION_CHARS: usize = 200;
 const INVESTIGATION_MAX_TOKENS: u64 = 16_384;
 const OTHER_STAGE_MAX_TOKENS: u64 = 8_192;
+const CODING_FINAL_MAX_TOKENS: u64 = 16_384;
 
 const CORE_SCOPE: &str = "crates/baho-core/src/";
 const INITIAL_MAP_MAX_BYTES: usize = 12 * 1024;
@@ -452,6 +487,7 @@ struct StageLimits {
     max_bytes: usize,
     api_request_timeout_seconds: u64,
     answer_shape: &'static str,
+    reserved_final_max_tokens: Option<u64>,
 }
 
 fn answer_shape(stage: &str) -> &'static str {
@@ -534,13 +570,15 @@ async fn run_stage<T: DeserializeOwned>(
             // Tools stay declared (some providers reject tool-call history
             // without them) but Rig's `ToolChoice::None` leaves no tool
             // callable for this run, so a tool call fails as unknown.
-            let finished = match agent
+            let mut final_run = agent
                 .prompt(FINAL_ANSWER_PROMPT)
                 .history(chat_history)
                 .tool_choice(ToolChoice::None)
-                .max_turns(1)
-                .await
-            {
+                .max_turns(1);
+            if let Some(max_tokens) = limits.reserved_final_max_tokens {
+                final_run = final_run.max_tokens(max_tokens);
+            }
+            let finished = match final_run.await {
                 Ok(response) => decode_answer(response.output(), limits.max_bytes, true),
                 Err(PromptError::UnknownToolCall { .. } | PromptError::MaxTurnsError { .. }) => {
                     Err(("final_answer_tool_call", None))
@@ -560,6 +598,14 @@ async fn run_stage<T: DeserializeOwned>(
 }
 
 fn stage_failure(error: &PromptError, limits: StageLimits, trace: &AgentTrace) -> Failure {
+    let status = match error {
+        PromptError::Report(report) => report.http_status,
+        PromptError::CompletionError(error) => {
+            rig::core::error::ErrorReport::from(error).http_status
+        }
+        _ => None,
+    };
+    trace.record_failure_http_status(status);
     // Rig returns an answerless length-truncated turn as CompletionError and
     // does not expose its accumulated history for a bounded final-answer call.
     if matches!(error, PromptError::CompletionError(_)) && trace.last_turn_hit_output_limit() {
@@ -877,6 +923,7 @@ mod tests {
         let model = MockCompletionModel::from_turns(turns);
         let agent = AgentBuilder::new(model.clone())
             .add_hook(trace.clone())
+            .max_tokens(OTHER_STAGE_MAX_TOKENS)
             .tool(OutlineTool(session.clone()))
             .tool(ReadLinesTool(session.clone()))
             .tool(SearchTextTool(session.clone()))
@@ -898,6 +945,7 @@ mod tests {
                 max_bytes: 4096,
                 api_request_timeout_seconds: 600,
                 answer_shape: answer_shape("review"),
+                reserved_final_max_tokens: None,
             };
             let result =
                 run_stage::<Value>(&self.agent, "private prompt".into(), limits, &self.trace).await;
@@ -948,6 +996,7 @@ mod tests {
             max_bytes: 100,
             api_request_timeout_seconds: 600,
             answer_shape: answer_shape("review"),
+            reserved_final_max_tokens: None,
         };
         let turns = run_stage::<Value>(&h.agent, "private prompt".into(), limits, &h.trace).await;
         assert_eq!(turns.err(), Some(("max_agent_turns", Some(0))));
@@ -1035,6 +1084,7 @@ mod tests {
                     max_bytes: 4096,
                     api_request_timeout_seconds: 600,
                     answer_shape: answer_shape("review"),
+                    reserved_final_max_tokens: None,
                 }
             ),
             ("api_request_timeout", Some(600))
@@ -1052,11 +1102,47 @@ mod tests {
                     max_bytes: 4096,
                     api_request_timeout_seconds: 600,
                     answer_shape: answer_shape("review"),
+                    reserved_final_max_tokens: None,
                 }
             ),
             ("http", None)
         );
+        assert_eq!(failure_outcome("http"), Outcome::EnvironmentFailure);
+        assert_eq!(
+            failure_outcome("api_request_timeout"),
+            Outcome::EnvironmentFailure
+        );
+        assert_eq!(failure_outcome("max_agent_turns"), Outcome::ModelExhausted);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn provider_response_status_is_sanitized_and_inconclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-events.jsonl");
+        let trace = AgentTrace::open(&path, "coding").unwrap();
+        let mut report = rig::core::error::ErrorReport::new(
+            ErrorKind::ProviderResponse,
+            "private provider body",
+        );
+        report.http_status = Some(503);
+        let failure = stage_failure(
+            &PromptError::Report(report),
+            StageLimits {
+                max_agent_turns: 12,
+                max_bytes: 4096,
+                api_request_timeout_seconds: 600,
+                answer_shape: answer_shape("coding"),
+                reserved_final_max_tokens: Some(CODING_FINAL_MAX_TOKENS),
+            },
+            &trace,
+        );
+        assert_eq!(failure, ("provider_response", None));
+        assert_eq!(trace.failure_http_status(), Some(503));
+        assert_eq!(failure_outcome(failure.0), Outcome::EnvironmentFailure);
+        let events = fs::read_to_string(path).unwrap();
+        assert!(events.contains("\"http_status\":503"));
+        assert!(!events.contains("private provider body"));
     }
 
     #[tokio::test]
@@ -1095,6 +1181,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coding_reserved_answer_uses_larger_cap_without_repeating_tools() {
+        let h = harness(turns_then(MockTurn::text(
+            "{\"edits\":[],\"new_files\":[]}",
+        )));
+        let limits = StageLimits {
+            max_agent_turns: 5,
+            max_bytes: 65_536,
+            api_request_timeout_seconds: 600,
+            answer_shape: answer_shape("coding"),
+            reserved_final_max_tokens: Some(CODING_FINAL_MAX_TOKENS),
+        };
+        let result = run_stage::<Value>(&h.agent, "private prompt".into(), limits, &h.trace)
+            .await
+            .unwrap();
+        assert!(matches!(result, Finish::Answer(_, true)));
+        let requests = h.model.requests();
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests[..4]
+                .iter()
+                .all(|request| request.max_tokens == Some(OTHER_STAGE_MAX_TOKENS))
+        );
+        assert_eq!(requests[4].max_tokens, Some(CODING_FINAL_MAX_TOKENS));
+        assert_eq!(requests[4].tool_choice, Some(ToolChoice::None));
+        let events = h.events();
+        assert_eq!(named(&events, "tool_call_finished").len(), 4);
+        assert_eq!(named(&events, "final_answer_finished").len(), 1);
+    }
+
+    #[tokio::test]
     async fn tool_enabled_run_is_capped_below_max_agent_turns() {
         // The model would keep calling tools; only max_agent_turns - 1 are served.
         let h = harness(turns_then(MockTurn::text("{}")));
@@ -1127,6 +1243,7 @@ mod tests {
             max_bytes: 4096,
             api_request_timeout_seconds: 600,
             answer_shape: answer_shape("review"),
+            reserved_final_max_tokens: None,
         };
         let result = run_stage::<ReviewAnswer>(&h.agent, "private prompt".into(), limits, &h.trace)
             .await
@@ -1165,6 +1282,7 @@ mod tests {
             max_bytes: 4096,
             api_request_timeout_seconds: 600,
             answer_shape: answer_shape("review"),
+            reserved_final_max_tokens: None,
         };
         let result =
             run_stage::<ReviewAnswer>(&h.agent, "private prompt".into(), limits, &h.trace).await;

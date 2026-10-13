@@ -229,6 +229,15 @@ pub fn repair_with_progress(
     options: &RepairOptions,
     progress: Option<RepairProgress>,
 ) -> Result<(Outcome, PathBuf), EntryError> {
+    repair_with_progress_and_retries(model, options, progress, Default::default())
+}
+
+pub fn repair_with_progress_and_retries(
+    model: DynModel<Completion>,
+    options: &RepairOptions,
+    progress: Option<RepairProgress>,
+    retries: crate::repair_http::RetryEvents,
+) -> Result<(Outcome, PathBuf), EntryError> {
     let (contract, cases, sanitized_prompt, redactor) = prepare(options)?;
     let mut record = AttemptRecord::reserve(&options.output, &contract)?;
     if let Some(progress) = &progress {
@@ -262,7 +271,8 @@ pub fn repair_with_progress(
         sanitized_prompt,
         redactor,
         worker.inner.clone(),
-    );
+    )
+    .with_retry_events(retries);
     if let Some(progress) = progress {
         agents = agents.with_progress(progress);
     }

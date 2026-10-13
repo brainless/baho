@@ -148,15 +148,16 @@ fn repair_command(
         std::env::var("NEURALWATT_API_KEY").ok(),
         std::fs::read_to_string(repo.join(".env")).ok().as_deref(),
     )?;
-    let (outcome, path) = synth::repair_entry::repair_with_progress(
-        neuralwatt_repair_model(
-            key,
-            REPAIR_MODEL,
-            options.settings.api_request_timeout_seconds,
-        )?
-        .into(),
+    let (model, retries) = neuralwatt_repair_model(
+        key,
+        REPAIR_MODEL,
+        options.settings.api_request_timeout_seconds,
+    )?;
+    let (outcome, path) = synth::repair_entry::repair_with_progress_and_retries(
+        model.into(),
         &options,
         Some(progress),
+        retries,
     )?;
     println!("{:?}: {}", outcome, path.display());
     let manifest =

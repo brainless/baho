@@ -6121,6 +6121,7 @@ dependencies = [
 name = "synth"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "csv",
  "futures",
  "proc-macro2",

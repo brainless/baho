@@ -1,4 +1,5 @@
 //! Developer-only, bounded generator. The provider never receives source paths or records.
+use crate::repair_http::{RepairHttpClient, RetryEvents};
 use crate::{
     dataset::LoadedDataset,
     sql::{QueryResult, SqlRunner, parse_role_query},
@@ -83,12 +84,14 @@ pub fn neuralwatt_repair_model(
     key: String,
     model: &str,
     request_timeout_seconds: u64,
-) -> Result<impl Into<DynModel<Completion>>, GenerateError> {
+) -> Result<(impl Into<DynModel<Completion>>, RetryEvents), GenerateError> {
     let http = repair_http_client(request_timeout_seconds)?;
-    Ok(OpenAIConfig::new(key)
+    let events = RetryEvents::default();
+    let model = OpenAIConfig::new(key)
         .with_base_url(BASE_URL)
-        .connect(http)
-        .chat(model))
+        .connect(RepairHttpClient::new(http, events.clone()))
+        .chat(model);
+    Ok((model, events))
 }
 
 fn repair_http_client(request_timeout_seconds: u64) -> Result<ReqwestClient, GenerateError> {

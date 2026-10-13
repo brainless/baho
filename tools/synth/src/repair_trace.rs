@@ -69,6 +69,7 @@ struct State {
     model_calls: u32,
     active_model: Option<Instant>,
     last_finish_reason: Option<FinishReason>,
+    failure_http_status: Option<u16>,
     tools: BTreeMap<String, Instant>,
     io_failed: bool,
     events: u32,
@@ -88,6 +89,7 @@ impl AgentTrace {
             model_calls: 0,
             active_model: None,
             last_finish_reason: None,
+            failure_http_status: None,
             tools: BTreeMap::new(),
             io_failed: false,
             events: 0,
@@ -116,6 +118,16 @@ impl AgentTrace {
             self.0.lock().unwrap().last_finish_reason,
             Some(FinishReason::Length)
         )
+    }
+    pub fn record_failure_http_status(&self, status: Option<u16>) {
+        if let Some(status) = status {
+            let mut state = self.0.lock().unwrap();
+            state.failure_http_status = Some(status);
+            state.write("provider_request_failed", json!({"http_status":status}));
+        }
+    }
+    pub fn failure_http_status(&self) -> Option<u16> {
+        self.0.lock().unwrap().failure_http_status
     }
     pub fn finish(&self, cause: &'static str, limit: Option<u64>, calls: u32) -> bool {
         let mut s = self.0.lock().unwrap();
