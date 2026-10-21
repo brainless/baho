@@ -256,6 +256,7 @@ struct State {
     /// Calls refused because the call budget was already spent.
     denied_calls: u32,
     exposed_bytes: usize,
+    read_ranges: Vec<Exposed>,
     parsed: HashMap<String, Arc<Parsed>>,
 }
 
@@ -282,6 +283,34 @@ impl SourceSession {
 
     pub fn exposed_bytes(&self) -> usize {
         self.lock().exposed_bytes
+    }
+
+    /// True only when read_lines served every line of this anchored range
+    /// without truncating any line, for the same baseline file hash.
+    pub fn was_read(&self, path: &str, sha256: &str, start: usize, end: usize) -> bool {
+        if start == 0 || end < start {
+            return false;
+        }
+        let state = self.lock();
+        let mut next = start;
+        loop {
+            let Some(covered_end) = state
+                .read_ranges
+                .iter()
+                .filter(|range| {
+                    range.path == path && range.file_sha256 == sha256 && range.start_line <= next
+                })
+                .map(|range| range.end_line)
+                .filter(|covered_end| *covered_end >= next)
+                .max()
+            else {
+                return false;
+            };
+            if covered_end >= end {
+                return true;
+            }
+            next = covered_end + 1;
+        }
     }
 
     /// A compact, deterministic map for the initial investigator prompt.
@@ -686,6 +715,25 @@ impl SourceSession {
             out.push(result);
         }
         self.spend(used);
+        {
+            let mut state = self.lock();
+            for range in &out {
+                if let Some(mut end) = range.served_end {
+                    if range.line_truncated {
+                        end = end.saturating_sub(1);
+                    }
+                    if range.start <= end {
+                        state.read_ranges.push(Exposed {
+                            path: name.clone(),
+                            file_sha256: file.sha256.clone(),
+                            start_line: range.start,
+                            end_line: end,
+                            bytes: range.text.len(),
+                        });
+                    }
+                }
+            }
+        }
         Ok(ReadLinesResponse {
             path: name,
             file_sha256: file.sha256.clone(),

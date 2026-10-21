@@ -62,12 +62,12 @@ impl RepairOptions {
     pub fn default_settings() -> AttemptSettings {
         AttemptSettings {
             investigator_prompt_version: "repair-investigator-v5".into(),
-            coder_prompt_version: "repair-coder-v2".into(),
+            coder_prompt_version: "repair-coder-v3".into(),
             reviewer_prompt_version: "repair-reviewer-v2".into(),
             model: "neuralwatt".into(),
             max_investigator_turns: 12,
-            max_agent_turns: 6,
-            max_tool_calls: 20,
+            max_agent_turns: 24,
+            max_tool_calls: 40,
             api_request_timeout_seconds: 600,
             process_timeout_seconds: 300,
             max_output_bytes: 64 * 1024,

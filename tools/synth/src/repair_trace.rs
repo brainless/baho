@@ -1,5 +1,5 @@
 //! Incremental repair-agent activity ledger. This sidecar has its own schema
-//! (v3, Epic 019); existing attempt manifests/contracts are unaffected.
+//! (v4, Epic 019); existing attempt manifests/contracts are unaffected.
 //!
 //! The ledger records what an agent asked for (a safe projection of tool
 //! arguments) and which source spans reached it (file hash, line span, byte
@@ -21,6 +21,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::anchored_edits::{Edit, NewFile};
 use crate::redaction::Redactor;
 use crate::repair_agents::{CheckArgs, ProbeArgs};
 use crate::repair_progress::RepairProgress;
@@ -29,13 +30,14 @@ use crate::source_tools::{
 };
 
 const MAX_ACTIVITY_EVENTS: u32 = 2000;
-/// V2 added the request and exposure ledger; v3 adds normalized finish reasons
-/// and applied output-token caps. Older traces remain readable by their version.
-pub(crate) const TRACE_SCHEMA_VERSION: u32 = 3;
+/// V2 added the request and exposure ledger; v3 added normalized finish reasons
+/// and output-token caps; v4 identifies staged coding tools and safe projections.
+pub(crate) const TRACE_SCHEMA_VERSION: u32 = 4;
 const MAX_VERBATIM_CHARS: usize = 256;
 // A validated contract allows 200 search matches, each with an excerpt and
 // an enclosing item label exposure.
 const MAX_EXPOSED_PER_CALL: usize = 400;
+const CODING_TOOL_NAMES: [&str; 3] = ["stage_edit", "stage_new_file", "submit_staged"];
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -208,7 +210,8 @@ impl State {
 }
 fn tool_name(name: &str) -> &str {
     match name {
-        "outline" | "read_lines" | "search_text" | "probe" | "run_checks" => name,
+        "outline" | "read_lines" | "search_text" | "probe" | "run_checks" | "stage_edit"
+        | "stage_new_file" | "submit_staged" => name,
         _ => "unknown",
     }
 }
@@ -317,6 +320,23 @@ fn project_args(tool: &str, args: &str, redactor: Option<&Redactor>) -> Value {
                 p.put("suite", json!(a.suite));
             })
             .is_ok(),
+        "stage_edit" => serde_json::from_str::<Edit>(args)
+            .map(|a| {
+                p.verbatim("path", &a.path);
+                p.put("baseline_sha256", json!(a.baseline_sha256));
+                p.put("start_line", json!(a.start_line));
+                p.put("end_line", json!(a.end_line));
+                p.opaque("old", &a.old);
+                p.opaque("new", &a.new);
+            })
+            .is_ok(),
+        "stage_new_file" => serde_json::from_str::<NewFile>(args)
+            .map(|a| {
+                p.verbatim("path", &a.path);
+                p.opaque("content", &a.content);
+            })
+            .is_ok(),
+        "submit_staged" => args.trim() == "{}",
         _ => false,
     };
     if !ok {
@@ -341,6 +361,11 @@ fn project_outcome(tool: &str, response: &Value) -> (Map<String, Value>, Vec<Exp
         "bytes",
         "files_skipped",
         "files_searched",
+        "staged_edits",
+        "staged_new_files",
+        "submitted",
+        "edits",
+        "new_files",
     ] {
         copy(key);
     }
@@ -468,7 +493,7 @@ impl AgentHook for AgentTrace {
             let mut detail = Map::new();
             let mut code = if succeeded { "ok" } else { "tool_error" };
             let mut exposed = Vec::new();
-            if SOURCE_TOOL_NAMES.contains(&tool) {
+            if SOURCE_TOOL_NAMES.contains(&tool) || CODING_TOOL_NAMES.contains(&tool) {
                 if succeeded {
                     if let Some(response) = rendered
                         .as_deref()
@@ -1067,6 +1092,23 @@ mod tests {
     }
 
     #[test]
+    fn staged_tool_trace_identifies_calls_without_recording_patch_text() {
+        assert_eq!(tool_name("stage_edit"), "stage_edit");
+        assert_eq!(tool_name("stage_new_file"), "stage_new_file");
+        assert_eq!(tool_name("submit_staged"), "submit_staged");
+        let args = json!({"path":"crates/baho-core/src/intent.rs","baseline_sha256":"abc","start_line":2,"end_line":3,"old":"private old text","new":"private new text"}).to_string();
+        let projected = project_args("stage_edit", &args, Some(&Redactor::new(["zzz"]).unwrap()));
+        assert_eq!(projected["start_line"], 2);
+        assert_eq!(projected["end_line"], 3);
+        assert_eq!(projected["old"]["bytes"], 16);
+        let text = projected.to_string();
+        assert!(!text.contains("private old text"));
+        assert!(!text.contains("private new text"));
+        let submitted = project_args("submit_staged", "{}", None);
+        assert_eq!(submitted, json!({}));
+    }
+
+    #[test]
     fn trace_reader_requires_matching_schema_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent-events.jsonl");
@@ -1081,18 +1123,25 @@ mod tests {
         assert_eq!(
             read_event(&line, 1),
             Err(TraceReadError::UnsupportedSchema {
-                found: 3,
+                found: 4,
                 supported: 1
             })
         );
         assert_eq!(
             read_event(&line, 2),
             Err(TraceReadError::UnsupportedSchema {
-                found: 3,
+                found: 4,
                 supported: 2
             })
         );
-        assert!(read_event(&line, 3).is_ok());
+        assert_eq!(
+            read_event(&line, 3),
+            Err(TraceReadError::UnsupportedSchema {
+                found: 4,
+                supported: 3
+            })
+        );
+        assert!(read_event(&line, 4).is_ok());
         assert!(read_event(r#"{"schema_version":2,"name":"agent_finished"}"#, 2).is_ok());
         assert_eq!(read_event("not json", 3), Err(TraceReadError::Malformed));
     }

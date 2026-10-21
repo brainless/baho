@@ -9,16 +9,23 @@ use rig::http_client::{
     Error, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
 };
 
-const RETRY_DELAY: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+#[cfg(test)]
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(1), Duration::from_millis(2)];
 
 #[derive(Clone, Debug, Default)]
 pub struct RetryEvents(Arc<Mutex<Vec<RetryEvent>>>);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RetryEvent {
+    pub attempts: u8,
     pub transport_result: &'static str,
     pub initial_http_status: Option<u16>,
     pub final_http_status: Option<u16>,
+    /// One entry per wire attempt; null means a transport error or success.
+    pub attempt_http_statuses: Vec<Option<u16>>,
+    pub request_body_bytes: usize,
 }
 
 impl RetryEvents {
@@ -66,6 +73,83 @@ fn retryable(error: &Error) -> bool {
     }
 }
 
+async fn with_retries<T, F, Fut>(
+    mut send: F,
+    events: RetryEvents,
+    request_body_bytes: usize,
+) -> Result<T, Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, Error>>,
+{
+    let mut initial_http_status = None;
+    let mut attempt_http_statuses = Vec::with_capacity(RETRY_DELAYS.len() + 1);
+    for (index, delay) in RETRY_DELAYS.into_iter().enumerate() {
+        match send().await {
+            Err(error) if retryable(&error) => {
+                attempt_http_statuses.push(error.non_success_status().map(|s| s.as_u16()));
+                if index == 0 {
+                    initial_http_status = error.non_success_status().map(|s| s.as_u16());
+                }
+                tokio::time::sleep(delay).await;
+            }
+            result => {
+                attempt_http_statuses.push(
+                    result
+                        .as_ref()
+                        .err()
+                        .and_then(Error::non_success_status)
+                        .map(|s| s.as_u16()),
+                );
+                if index > 0 {
+                    events.push(RetryEvent {
+                        attempts: index as u8 + 1,
+                        transport_result: if result.is_ok() {
+                            "response_received"
+                        } else {
+                            "request_failed"
+                        },
+                        initial_http_status,
+                        final_http_status: result
+                            .as_ref()
+                            .err()
+                            .and_then(Error::non_success_status)
+                            .map(|s| s.as_u16()),
+                        attempt_http_statuses,
+                        request_body_bytes,
+                    });
+                }
+                return result;
+            }
+        }
+    }
+    let result = send().await;
+    attempt_http_statuses.push(
+        result
+            .as_ref()
+            .err()
+            .and_then(Error::non_success_status)
+            .map(|s| s.as_u16()),
+    );
+    events.push(RetryEvent {
+        attempts: RETRY_DELAYS.len() as u8 + 1,
+        transport_result: if result.is_ok() {
+            "response_received"
+        } else {
+            "request_failed"
+        },
+        initial_http_status,
+        final_http_status: result
+            .as_ref()
+            .err()
+            .and_then(Error::non_success_status)
+            .map(|s| s.as_u16()),
+        attempt_http_statuses,
+        request_body_bytes,
+    });
+    result
+}
+
 impl HttpClientExt for RepairHttpClient {
     fn send<T, U>(
         &self,
@@ -79,28 +163,13 @@ impl HttpClientExt for RepairHttpClient {
         let events = self.events.clone();
         let req = req.map(Into::into);
         async move {
-            match inner.send::<_, U>(replay_request(&req)).await {
-                Err(error) if retryable(&error) => {
-                    let initial_http_status = error.non_success_status().map(|s| s.as_u16());
-                    tokio::time::sleep(RETRY_DELAY).await;
-                    let result = inner.send::<_, U>(req).await;
-                    events.push(RetryEvent {
-                        transport_result: if result.is_ok() {
-                            "response_received"
-                        } else {
-                            "request_failed"
-                        },
-                        initial_http_status,
-                        final_http_status: result
-                            .as_ref()
-                            .err()
-                            .and_then(Error::non_success_status)
-                            .map(|s| s.as_u16()),
-                    });
-                    result
-                }
-                result => result,
-            }
+            let request_body_bytes = req.body().len();
+            with_retries(
+                || inner.send::<_, U>(replay_request(&req)),
+                events,
+                request_body_bytes,
+            )
+            .await
         }
     }
 
@@ -125,28 +194,13 @@ impl HttpClientExt for RepairHttpClient {
         let events = self.events.clone();
         async move {
             let req = req.map(Into::into);
-            match inner.send_streaming(replay_request(&req)).await {
-                Err(error) if retryable(&error) => {
-                    let initial_http_status = error.non_success_status().map(|s| s.as_u16());
-                    tokio::time::sleep(RETRY_DELAY).await;
-                    let result = inner.send_streaming(req).await;
-                    events.push(RetryEvent {
-                        transport_result: if result.is_ok() {
-                            "response_received"
-                        } else {
-                            "request_failed"
-                        },
-                        initial_http_status,
-                        final_http_status: result
-                            .as_ref()
-                            .err()
-                            .and_then(Error::non_success_status)
-                            .map(|s| s.as_u16()),
-                    });
-                    result
-                }
-                result => result,
-            }
+            let request_body_bytes = req.body().len();
+            with_retries(
+                || inner.send_streaming(replay_request(&req)),
+                events,
+                request_body_bytes,
+            )
+            .await
         }
     }
 }
@@ -207,11 +261,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stops_after_one_retry_when_transport_still_fails() {
+    async fn stops_after_two_retries_when_transport_still_fails() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut buf = [0; 1024];
                 let _ = stream.read(&mut buf).unwrap();
@@ -228,6 +282,7 @@ mod tests {
         server.join().unwrap();
         let recorded = events.drain();
         assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].attempts, 3);
         assert_eq!(recorded[0].transport_result, "request_failed");
     }
 
@@ -299,6 +354,7 @@ mod tests {
             assert_eq!(requests.len(), 2);
             assert_eq!(requests[0], requests[1]);
             assert_eq!(events.len(), 1);
+            assert_eq!(events[0].attempts, 2);
             assert_eq!(events[0].initial_http_status, Some(status));
             assert_eq!(events[0].final_http_status, None);
             assert_eq!(events[0].transport_result, "response_received");
@@ -317,17 +373,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stops_after_repeated_503_and_records_statuses() {
-        let (result, requests, events) = status_case(&[503, 503]).await;
+    async fn third_attempt_recovers_from_two_500_responses() {
+        let (result, requests, events) = status_case(&[500, 500, 200]).await;
+        assert_eq!(result.unwrap(), b"ok");
+        assert_eq!(requests.len(), 3);
+        assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].attempts, 3);
+        assert_eq!(
+            events[0].attempt_http_statuses,
+            [Some(500), Some(500), None]
+        );
+        assert_eq!(events[0].request_body_bytes, b"opaque-turn".len());
+        assert_eq!(events[0].initial_http_status, Some(500));
+        assert_eq!(events[0].final_http_status, None);
+        assert_eq!(events[0].transport_result, "response_received");
+    }
+
+    #[tokio::test]
+    async fn stops_after_repeated_500_and_records_statuses() {
+        let (result, requests, events) = status_case(&[500, 500, 500]).await;
         assert_eq!(
             result.unwrap_err().non_success_status().unwrap().as_u16(),
-            503
+            500
         );
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests.len(), 3);
+        assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].initial_http_status, Some(503));
-        assert_eq!(events[0].final_http_status, Some(503));
+        assert_eq!(events[0].attempts, 3);
+        assert_eq!(events[0].attempt_http_statuses, [Some(500); 3]);
+        assert_eq!(events[0].request_body_bytes, b"opaque-turn".len());
+        assert_eq!(events[0].initial_http_status, Some(500));
+        assert_eq!(events[0].final_http_status, Some(500));
         assert_eq!(events[0].transport_result, "request_failed");
     }
 }

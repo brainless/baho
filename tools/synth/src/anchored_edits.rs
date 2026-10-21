@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Bound on one new file's content; larger additions must be split.
@@ -22,7 +22,7 @@ pub const ANCHOR_MISMATCH: &str = "edit_anchor_mismatch";
 pub const NEW_FILE_REJECTED: &str = "new_file_rejected";
 pub const EDIT_SET_INVALID: &str = "edit_set_invalid";
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Edit {
     pub path: String,
@@ -34,7 +34,7 @@ pub struct Edit {
     pub new: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewFile {
     pub path: String,
@@ -42,7 +42,7 @@ pub struct NewFile {
 }
 
 /// The coder's answer. A whole-file `{"files": [...]}` answer does not parse.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodeAnswer {
     pub edits: Vec<Edit>,
