@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+use crate::anchored_edits::{Planned, apply};
 use crate::cli_run::parse_run;
 use crate::contracts::{PlanComparison, PlanEvidence, compare_plan};
 use crate::probe::{OracleObservation, ProbeObservation, selected_body_rows, validate_synthetic};
@@ -82,6 +83,37 @@ pub struct LiveWorker {
     builds: BTreeMap<String, (PathBuf, PathBuf)>,
     identities: BTreeMap<String, BuildIdentity>,
     cases: BTreeMap<(String, String), PrivateCase>,
+    staged_checks: u32,
+}
+
+const MAX_STAGED_CHECKS: u32 = 4;
+
+pub struct StagedCheckResult {
+    pub tree_sha256: String,
+    pub check: CheckResult,
+}
+
+fn staged_preview_tree(
+    source: &IsolatedSource,
+    destination: &Path,
+    regression: &Path,
+    planned: &Planned,
+) -> Result<(PathBuf, String), Outcome> {
+    let protected_path = Path::new("crates/baho-core/tests/repair_regression.rs");
+    if planned.files.iter().any(|file| file.path == protected_path)
+        || planned
+            .new_files
+            .iter()
+            .any(|(path, _)| path == protected_path)
+    {
+        return Err(Outcome::InvalidInput);
+    }
+    let tree = source
+        .fresh_build(destination, Some(regression))
+        .map_err(map_build)?;
+    apply(&tree, planned).map_err(|_| Outcome::EnvironmentFailure)?;
+    let tree_sha256 = tree_digest(&tree).map_err(map_build)?;
+    Ok((tree, tree_sha256))
 }
 
 impl LiveWorker {
@@ -123,6 +155,7 @@ impl LiveWorker {
             builds: BTreeMap::new(),
             identities: BTreeMap::new(),
             cases: keyed,
+            staged_checks: 0,
         })
     }
 
@@ -250,6 +283,44 @@ impl ConfinedWorker for SharedLiveWorker {
 }
 
 impl LiveWorker {
+    pub fn check_staged(
+        &mut self,
+        planned: &Planned,
+        suite: SuiteId,
+    ) -> Result<StagedCheckResult, Outcome> {
+        if self.staged_checks >= MAX_STAGED_CHECKS {
+            return Err(Outcome::ModelExhausted);
+        }
+        self.staged_checks += 1;
+        let source = self.source.as_ref().ok_or(Outcome::EnvironmentFailure)?;
+        let regression = self.attempt.join("protected/repair_regression.rs");
+        if !regression.is_file() {
+            return Err(Outcome::EnvironmentFailure);
+        }
+        let destination = self
+            .sandbox
+            .build_root
+            .join(format!("staged-check-{:04}", self.staged_checks));
+        let (tree, tree_sha256) = staged_preview_tree(source, &destination, &regression, planned)?;
+        let result = self
+            .sandbox
+            .fixed_cargo(suite, &tree, self.timeout)
+            .map_err(map_build)?;
+        Ok(StagedCheckResult {
+            tree_sha256,
+            check: CheckResult {
+                suite,
+                command: suite.command().iter().map(|x| (*x).into()).collect(),
+                exit_code: result.exit_code,
+                timed_out: result.timed_out,
+                output_excerpt: format!("{}{}", result.stdout, result.stderr)
+                    .chars()
+                    .take(4096)
+                    .collect(),
+            },
+        })
+    }
+
     pub fn has_issued_build_id(&self, build_id: &str) -> bool {
         self.identities.contains_key(build_id)
     }
@@ -488,6 +559,7 @@ impl ConfinedWorker for LiveWorker {
 #[cfg(test)]
 mod smoke_tests {
     use super::*;
+    use crate::anchored_edits::Planned;
     use crate::contracts::{PlanLiteral, PlanOperator, TextMatchPolicy};
     use std::process::Command;
 
@@ -571,6 +643,68 @@ mod smoke_tests {
         assert!(!generated_regression_failed(&result));
     }
 
+    #[test]
+    fn staged_preview_contains_draft_and_leaves_checkout_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let tests = checkout.join("crates/baho-core/tests");
+        fs::create_dir_all(&tests).unwrap();
+        fs::write(
+            checkout.join("crates/baho-core/tests/existing.rs"),
+            "#[test] fn existing() {}\n",
+        )
+        .unwrap();
+        let source = IsolatedSource {
+            revision: "test".into(),
+            checkout: checkout.clone(),
+            tree_sha256: tree_digest(&checkout).unwrap(),
+        };
+        let regression = temp.path().join("frozen.rs");
+        fs::write(&regression, "#[test] fn frozen() {}\n").unwrap();
+        let planned = Planned {
+            files: vec![],
+            new_files: vec![(
+                PathBuf::from("crates/baho-core/tests/staged.rs"),
+                "use baho_core::missing_import;\n".into(),
+            )],
+        };
+        let (preview, hash) =
+            staged_preview_tree(&source, &temp.path().join("preview"), &regression, &planned)
+                .unwrap();
+        assert_eq!(hash, tree_digest(&preview).unwrap());
+        assert!(preview.join("crates/baho-core/tests/staged.rs").is_file());
+        assert!(
+            preview
+                .join("crates/baho-core/tests/repair_regression.rs")
+                .is_file()
+        );
+        assert!(!checkout.join("crates/baho-core/tests/staged.rs").exists());
+        assert!(
+            !checkout
+                .join("crates/baho-core/tests/repair_regression.rs")
+                .exists()
+        );
+        assert_eq!(source.tree_sha256, tree_digest(&checkout).unwrap());
+        assert_ne!(source.tree_sha256, hash);
+        let protected_draft = Planned {
+            files: vec![],
+            new_files: vec![(
+                PathBuf::from("crates/baho-core/tests/repair_regression.rs"),
+                "#[test] fn replacement() {}\n".into(),
+            )],
+        };
+        assert!(matches!(
+            staged_preview_tree(
+                &source,
+                &temp.path().join("rejected"),
+                &regression,
+                &protected_draft
+            ),
+            Err(Outcome::InvalidInput)
+        ));
+        assert!(!temp.path().join("rejected").exists());
+    }
+
     /// Run explicitly before a live agent trial. This uses real pinned source,
     /// confined Cargo builds, and public CLI artifacts without a provider.
     #[test]
@@ -612,16 +746,33 @@ mod smoke_tests {
         let baseline = worker.baseline(revision).unwrap();
         let before = worker.probe(&baseline, &case).unwrap();
         let checkout = worker.checkout().to_path_buf();
-        let changed = checkout.join("crates/baho-core/src/intent.rs");
-        let mut source = fs::read_to_string(&changed).unwrap();
-        source.push_str("\n// Deterministic repair worker smoke patch.\n");
-        fs::write(changed, source).unwrap();
         let regression = protected.join("repair_regression.rs");
         fs::write(
             &regression,
             "#[test] fn frozen_role_equality_regression() { assert!(true); }\n",
         )
         .unwrap();
+        let bad_draft = Planned {
+            files: vec![],
+            new_files: vec![(
+                PathBuf::from("crates/baho-core/tests/staged_invalid.rs"),
+                "use baho_core::missing_import;\n#[test] fn staged_invalid() {}\n".into(),
+            )],
+        };
+        let preview = worker
+            .check_staged(&bad_draft, SuiteId::AdditiveTests)
+            .unwrap();
+        assert_ne!(preview.check.exit_code, Some(0));
+        assert!(preview.check.output_excerpt.contains("missing_import"));
+        assert!(
+            !checkout
+                .join("crates/baho-core/tests/staged_invalid.rs")
+                .exists()
+        );
+        let changed = checkout.join("crates/baho-core/src/intent.rs");
+        let mut source = fs::read_to_string(&changed).unwrap();
+        source.push_str("\n// Deterministic repair worker smoke patch.\n");
+        fs::write(changed, source).unwrap();
         let candidate = worker.candidate("smoke-patch", &regression).unwrap();
         let after = worker.probe(&candidate, &case).unwrap();
         assert_ne!(baseline.tree_sha256, candidate.tree_sha256);

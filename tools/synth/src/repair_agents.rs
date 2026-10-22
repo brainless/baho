@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use rig::agent::{AgentHook, CompletionCallAction, CompletionCallEvent, HookContext};
+use rig::completion::Message;
 use rig::completion::message::ToolChoice;
 use rig::core::error::{ErrorKind, ProviderError};
 use rig::http_client::Error as HttpError;
@@ -10,7 +12,7 @@ use rig::prelude::PromptError;
 use rig::tool::PortableTool;
 use rig::{Agent, AgentBuilder, DynModel, operation::Completion};
 use serde::{Deserialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::anchored_edits::{
@@ -35,6 +37,12 @@ enum ToolDenied {
     ReadBeforeEdit,
     #[error("draft_rejected: {0}")]
     DraftRejected(String),
+    #[error("staged_check_limit: at most four staged checks per coding attempt")]
+    StagedCheckLimit,
+    #[error(
+        "unchecked_draft: run check_staged(additive_tests) successfully on the current draft before submission"
+    )]
+    UncheckedDraft,
     #[error(
         "invalid_build_id: use the exact build_id issued in the stage prompt or a prior build result; do not derive or shorten it"
     )]
@@ -73,6 +81,28 @@ struct DraftTools {
 struct DraftState {
     answer: CodeAnswer,
     submitted: bool,
+    additive_check_sha256: Option<String>,
+    require_additive_check: bool,
+}
+
+impl DraftState {
+    fn record_staged_check(&mut self, sha256: &str, suite: SuiteId, passed: bool) -> bool {
+        let current = !self.submitted
+            && serde_json::to_vec(&self.answer)
+                .ok()
+                .is_some_and(|bytes| digest(bytes) == sha256);
+        if current && passed && suite == SuiteId::AdditiveTests {
+            self.additive_check_sha256 = Some(sha256.to_owned());
+        }
+        current
+    }
+
+    fn checked_current_draft(&self) -> bool {
+        !self.require_additive_check
+            || serde_json::to_vec(&self.answer).ok().is_some_and(|bytes| {
+                self.additive_check_sha256.as_deref() == Some(digest(bytes).as_str())
+            })
+    }
 }
 
 impl DraftTools {
@@ -112,6 +142,7 @@ impl DraftTools {
         })?;
         let result = json!({"staged_edits":proposed.edits.len(),"staged_new_files":proposed.new_files.len()});
         draft.answer = proposed;
+        draft.additive_check_sha256 = None;
         Ok(result)
     }
 }
@@ -125,7 +156,7 @@ impl PortableTool for SubmitStagedTool {
     type Output = Value;
     type Error = ToolDenied;
     fn description(&self) -> String {
-        "Submit the complete staged patch. The harness validates it before any checkout write. Call this once after all stage_edit and stage_new_file calls, or return {\"submit_staged\":true as the final answer.".into()
+        "Submit the complete staged patch after check_staged(additive_tests) passes for this exact draft. The harness validates it before any checkout write. Call this once after all stage calls, or return {\"submit_staged\":true} as the final answer.".into()
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{},"additionalProperties":false})
@@ -142,6 +173,9 @@ impl PortableTool for SubmitStagedTool {
         plan(&self.0.checkout, &draft.answer, allowed).map_err(|rejection| {
             ToolDenied::DraftRejected(format!("{} ({})", rejection.code, rejection.detail))
         })?;
+        if !draft.checked_current_draft() {
+            return Err(ToolDenied::UncheckedDraft);
+        }
         draft.submitted = true;
         Ok(
             json!({"submitted":true,"edits":draft.answer.edits.len(),"new_files":draft.answer.new_files.len()}),
@@ -158,14 +192,24 @@ impl PortableTool for StageEditTool {
     type Output = Value;
     type Error = ToolDenied;
     fn description(&self) -> String {
-        "Stage one anchored edit in memory. The entire draft is validated against the unchanged baseline after each call. Nothing is written until the patch is submitted.".into()
+        "Stage or replace one anchored edit in memory. Reuse the same path, baseline hash, and line range to correct an earlier staged edit. The entire draft is validated against the unchanged baseline after each call. Nothing is written until the patch is submitted.".into()
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"baseline_sha256":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","baseline_sha256","start_line","end_line","old","new"],"additionalProperties":false})
     }
     async fn call(&self, edit: Edit) -> Result<Value, ToolDenied> {
-        self.0
-            .stage(Some(&edit), |draft| draft.edits.push(edit.clone()))
+        self.0.stage(Some(&edit), |draft| {
+            if let Some(existing) = draft.edits.iter_mut().find(|existing| {
+                existing.path == edit.path
+                    && existing.baseline_sha256 == edit.baseline_sha256
+                    && existing.start_line == edit.start_line
+                    && existing.end_line == edit.end_line
+            }) {
+                *existing = edit.clone();
+            } else {
+                draft.edits.push(edit.clone());
+            }
+        })
     }
 }
 
@@ -179,14 +223,24 @@ impl PortableTool for StageNewFileTool {
     type Error = ToolDenied;
     fn description(&self) -> String {
         format!(
-            "Stage one new Rust test file in memory, at most {MAX_NEW_FILE_BYTES} bytes. The checkout stays unchanged until final submission."
+            "Stage or replace one new Rust test file in memory, at most {MAX_NEW_FILE_BYTES} bytes. Reuse the same path to correct a staged file. The checkout stays unchanged until final submission."
         )
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false})
     }
     async fn call(&self, file: NewFile) -> Result<Value, ToolDenied> {
-        self.0.stage(None, |draft| draft.new_files.push(file))
+        self.0.stage(None, |draft| {
+            if let Some(existing) = draft
+                .new_files
+                .iter_mut()
+                .find(|existing| existing.path == file.path)
+            {
+                *existing = file;
+            } else {
+                draft.new_files.push(file);
+            }
+        })
     }
 }
 
@@ -290,6 +344,64 @@ struct RunChecksTool {
     tools: SourceTools,
     worker: Arc<Mutex<LiveWorker>>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StagedCheckArgs {
+    pub(crate) suite: SuiteId,
+}
+
+#[derive(Clone)]
+struct CheckStagedTool {
+    draft: DraftTools,
+    worker: Arc<Mutex<LiveWorker>>,
+}
+
+impl PortableTool for CheckStagedTool {
+    const NAME: &'static str = "check_staged";
+    type Args = StagedCheckArgs;
+    type Output = Value;
+    type Error = ToolDenied;
+    fn description(&self) -> String {
+        "Run one fixed check suite against a private confined copy of the current staged patch and frozen regression. The response identifies the exact draft and tree checked; later stage calls invalidate that result. At most four staged checks are allowed. No authoritative checkout files are changed.".into()
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"suite":{"type":"string","enum":["protected_compatibility","additive_tests","owning_crate","workspace_format","workspace_check","workspace_tests"]}},"required":["suite"],"additionalProperties":false})
+    }
+    async fn call(&self, args: StagedCheckArgs) -> Result<Value, ToolDenied> {
+        self.draft.tools.charge()?;
+        let answer = {
+            let draft = self.draft.draft.lock().map_err(|_| ToolDenied::Denied)?;
+            if draft.submitted {
+                return Err(ToolDenied::Denied);
+            }
+            draft.answer.clone()
+        };
+        let planned = plan(&self.draft.checkout, &answer, allowed).map_err(|rejection| {
+            ToolDenied::DraftRejected(format!("{} ({})", rejection.code, rejection.detail))
+        })?;
+        let draft_sha256 = digest(serde_json::to_vec(&answer).map_err(|_| ToolDenied::Denied)?);
+        let mut worker = self.worker.lock().map_err(|_| ToolDenied::Denied)?;
+        let preview = worker
+            .check_staged(&planned, args.suite)
+            .map_err(|outcome| {
+                if outcome == Outcome::ModelExhausted {
+                    ToolDenied::StagedCheckLimit
+                } else {
+                    ToolDenied::Denied
+                }
+            })?;
+        let check = preview.check;
+        let passed = check.passed(args.suite);
+        let draft_current = {
+            let mut draft = self.draft.draft.lock().map_err(|_| ToolDenied::Denied)?;
+            draft.record_staged_check(&draft_sha256, args.suite, passed)
+        };
+        Ok(
+            json!({"draft_sha256":draft_sha256,"tree_sha256":preview.tree_sha256,"draft_current":draft_current,"suite":check.suite,"command":check.command,"exit_code":check.exit_code,"timed_out":check.timed_out,"passed":passed,"output_excerpt":check.output_excerpt}),
+        )
+    }
+}
 impl PortableTool for RunChecksTool {
     const NAME: &'static str = "run_checks";
     type Args = CheckArgs;
@@ -330,6 +442,49 @@ struct InvestigationAnswer {
     reduction: SyntheticReduction,
 }
 
+#[derive(Clone)]
+struct SubmitInvestigationTool {
+    tools: SourceTools,
+    submitted: Arc<Mutex<Option<Value>>>,
+    max_bytes: usize,
+}
+
+impl PortableTool for SubmitInvestigationTool {
+    const NAME: &'static str = "submit_investigation";
+    type Args = Value;
+    type Output = Value;
+    type Error = ToolDenied;
+
+    fn description(&self) -> String {
+        "Submit the complete investigation handoff with result_ids, causal_hypothesis, mechanism, allowed_files, compatibility_checks, and reduction. This is the final handoff; the harness checks its evidence and scope.".into()
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"result_ids":{"type":"array","items":{"type":"string"}},"causal_hypothesis":{"type":"string"},"mechanism":{"type":"string"},"allowed_files":{"type":"array","items":{"type":"string"}},"compatibility_checks":{"type":"array","items":{"type":"string"}},"reduction":{"type":"object","properties":{"csv":{"type":"string"},"prompt":{"type":"string"},"sql":{"type":"string"}},"required":["csv","prompt","sql"],"additionalProperties":false}},"required":["result_ids","causal_hypothesis","mechanism","allowed_files","compatibility_checks","reduction"],"additionalProperties":false})
+    }
+
+    async fn call(&self, args: Value) -> Result<Value, ToolDenied> {
+        self.tools.charge()?;
+        if serde_json::to_vec(&args)
+            .map_err(|_| ToolDenied::Denied)?
+            .len()
+            > self.max_bytes
+        {
+            return Err(ToolDenied::DraftRejected(
+                "handoff exceeds output byte limit".into(),
+            ));
+        }
+        serde_json::from_value::<InvestigationAnswer>(args.clone())
+            .map_err(|_| ToolDenied::DraftRejected("handoff fields are invalid".into()))?;
+        let mut submitted = self.submitted.lock().map_err(|_| ToolDenied::Denied)?;
+        if submitted.is_some() {
+            return Err(ToolDenied::Denied);
+        }
+        *submitted = Some(args);
+        Ok(json!({"submitted":true}))
+    }
+}
+
 #[derive(Deserialize)]
 struct ReviewAnswer {
     pass: bool,
@@ -367,6 +522,7 @@ pub struct RigRepairAgents {
     open_questions: Vec<String>,
     /// The verified edit plan applied by `code`, kept so review can show a diff.
     applied: Option<Planned>,
+    require_staged_check: bool,
 }
 
 impl RigRepairAgents {
@@ -395,6 +551,7 @@ impl RigRepairAgents {
             completed_after_budget_stages: Vec::new(),
             open_questions: Vec::new(),
             applied: None,
+            require_staged_check: true,
         }
     }
 
@@ -452,6 +609,8 @@ impl RigRepairAgents {
             prompt
         };
         let tools = SourceTools { nav: nav.clone() };
+        let submitted_investigation =
+            (stage == "investigation").then(|| Arc::new(Mutex::new(None::<Value>)));
         let probe = ProbeTool {
             tools: tools.clone(),
             worker: self.worker.clone(),
@@ -473,33 +632,86 @@ impl RigRepairAgents {
             api_request_timeout_seconds: self.settings.api_request_timeout_seconds,
             answer_shape: answer_shape(stage),
             reserved_final_max_tokens: (stage == "coding").then_some(CODING_FINAL_MAX_TOKENS),
+            recover_output_limit: stage == "coding",
         };
+        if stage == "coding" {
+            trace.event("model_reasoning_effort", json!({"value":"low"}));
+        }
         let hook = trace.clone();
         let run_trace = trace.clone();
         let observer = nav.clone();
+        let recovery_draft = coding_draft.clone();
+        let staged_worker = self.worker.clone();
+        let investigation_handoff = submitted_investigation.clone();
         let mut result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                let base = AgentBuilder::new(model)
+                let snapshot = RequestSnapshot::default();
+                let base = coding_reasoning_effort(AgentBuilder::new(model), stage)
                     .preamble(role)
                     .add_hook(hook)
+                    .add_hook(snapshot.clone())
                     .temperature(0.2)
                     .max_tokens(stage_max_tokens(stage));
                 let mut builder = base
                     .tool(OutlineTool(nav.clone()))
                     .tool(ReadLinesTool(nav.clone()))
                     .tool(SearchTextTool(nav))
-                    .tool(probe)
-                    .tool(checks);
+                    .tool(probe);
+                if stage != "coding" {
+                    builder = builder.tool(checks);
+                }
                 if let Some(draft_tools) = draft_tools {
                     builder = builder
                         .tool(StageEditTool(draft_tools.clone()))
                         .tool(StageNewFileTool(draft_tools.clone()))
+                        .tool(CheckStagedTool {
+                            draft: draft_tools.clone(),
+                            worker: staged_worker,
+                        })
                         .tool(SubmitStagedTool(draft_tools));
                 }
+                if let Some(submitted) = investigation_handoff {
+                    builder = builder.tool(SubmitInvestigationTool {
+                        tools: tools.clone(),
+                        submitted,
+                        max_bytes: limits.max_bytes,
+                    });
+                }
                 let agent = builder.build();
-                run_stage::<T>(&agent, prompt, limits, &run_trace).await
+                run_stage::<T>(
+                    &agent,
+                    prompt,
+                    limits,
+                    &run_trace,
+                    Some(&snapshot),
+                    recovery_draft.as_ref(),
+                )
+                .await
             })
         });
+        if (matches!(result, Ok(Finish::Answer(..) | Finish::Insufficient(_)))
+            || matches!(
+                result,
+                Err((
+                    "invalid_final_json"
+                        | "output_token_limit"
+                        | "max_agent_turns"
+                        | "final_answer_tool_call",
+                    _
+                ))
+            ))
+            && let Some(value) = submitted_investigation
+                .as_ref()
+                .and_then(|slot| slot.lock().ok())
+                .and_then(|slot| slot.clone())
+            && let Ok(answer) = serde_json::from_value::<T>(value)
+        {
+            trace.event(
+                "submitted_investigation_used",
+                json!({"prior_cause":result.as_ref().err().map(|failure| failure.0)}),
+            );
+            result = Ok(Finish::Answer(answer, false));
+        }
         let submitted = coding_draft
             .as_ref()
             .and_then(|draft| draft.lock().ok())
@@ -568,6 +780,18 @@ impl RigRepairAgents {
     }
 }
 
+fn coding_reasoning_effort(builder: AgentBuilder, stage: &str) -> AgentBuilder {
+    if stage == "coding" {
+        builder.additional_params(json!({"reasoning_effort":"low"}))
+    } else {
+        builder
+    }
+}
+
+fn json_object_params() -> Map<String, Value> {
+    Map::from_iter([("response_format".into(), json!({"type":"json_object"}))])
+}
+
 fn failure_outcome(cause: &str) -> Outcome {
     if matches!(cause, "http" | "api_request_timeout" | "provider_response") {
         Outcome::EnvironmentFailure
@@ -616,7 +840,7 @@ fn navigation_note(s: &AttemptSettings, stage: &str, paths: &str) -> String {
 /// Instruction for the reserved call made after the tool-enabled run ends at
 /// its turn limit. It grants no authority beyond the stage's normal answer.
 const FINAL_ANSWER_PROMPT: &str = "The turn budget is exhausted and tools are no longer available. Return the final JSON answer now, using only what you have already seen. If the evidence is insufficient, return {\"insufficient_evidence\":true,\"open_questions\":[up to 5 short strings without data values]} instead. Do not call tools.";
-const CODING_FINAL_ANSWER_PROMPT: &str = "The turn budget is exhausted. If the staged patch is complete, return only {\"submit_staged\":true} to submit it. If it is incomplete, return {\"insufficient_evidence\":true,\"open_questions\":[\"patch was not complete\"]}. Do not call tools or repeat staged content.";
+const CODING_FINAL_ANSWER_PROMPT: &str = "The turn budget is exhausted. If the current staged patch is complete and check_staged(additive_tests) passed for this exact draft, return only {\"submit_staged\":true} to submit it. Otherwise return {\"insufficient_evidence\":true,\"open_questions\":[\"patch was not checked or complete\"]}. Do not call tools or repeat staged content.";
 const MAX_OPEN_QUESTIONS: usize = 5;
 const MAX_QUESTION_CHARS: usize = 200;
 /// Reasoning models spend many output tokens before answering, so the
@@ -654,7 +878,7 @@ fn investigation_prompt(
     settings: &AttemptSettings,
 ) -> String {
     format!(
-        "Investigate this reproduced Role text-equality mismatch. Return only JSON with result_ids, causal_hypothesis, mechanism, allowed_files, compatibility_checks, reduction. Reduction has csv, prompt, sql fields only; use a small neutral synthetic CSV. The only supported SQL is {PROBE_SQL_TEMPLATE}; replace VALUE with a value present in the synthetic Role column, double embedded single quotes, and add no semicolon or clauses. The harness computes expected rows. The result_ids must include the observed result. Target prompt: {target_prompt:?}. Baseline result ID: {}. Baseline build_id: {}. Pass this exact build_id to probe and run_checks; it is an issued opaque identifier, so do not derive it from the revision, result ID, or binary hash and do not shorten it. Baseline plan: {:?}. Allowed production scope: crates/baho-core/src/. {}",
+        "Investigate this reproduced Role text-equality mismatch. Submit the completed handoff with submit_investigation; alternatively return one JSON object with result_ids, causal_hypothesis, mechanism, allowed_files, compatibility_checks, reduction. Reduction has csv, prompt, sql fields only; use a small neutral synthetic CSV. The only supported SQL is {PROBE_SQL_TEMPLATE}; replace VALUE with a value present in the synthetic Role column, double embedded single quotes, and add no semicolon or clauses. The harness computes expected rows. The result_ids must include the observed result. Target prompt: {target_prompt:?}. Baseline result ID: {}. Baseline build_id: {}. Pass this exact build_id to probe and run_checks; it is an issued opaque identifier, so do not derive it from the revision, result ID, or binary hash and do not shorten it. Baseline plan: {:?}. Allowed production scope: crates/baho-core/src/. {}",
         target.result_id,
         target.build_id,
         target.plan,
@@ -680,7 +904,34 @@ struct StageLimits {
     api_request_timeout_seconds: u64,
     answer_shape: &'static str,
     reserved_final_max_tokens: Option<u64>,
+    recover_output_limit: bool,
 }
+
+#[derive(Clone, Default)]
+struct RequestSnapshot(Arc<Mutex<Option<(Vec<Message>, usize)>>>);
+
+impl RequestSnapshot {
+    fn take(&self) -> Option<(Vec<Message>, usize)> {
+        self.0.lock().ok()?.take()
+    }
+}
+
+impl AgentHook for RequestSnapshot {
+    async fn on_completion_call(
+        &self,
+        _: &HookContext,
+        event: CompletionCallEvent<'_>,
+    ) -> CompletionCallAction {
+        if let Ok(mut slot) = self.0.lock() {
+            let mut history = event.history.to_vec();
+            history.push(event.prompt.clone());
+            *slot = Some((history, event.turn));
+        }
+        CompletionCallAction::Continue
+    }
+}
+
+const CODING_LENGTH_RECOVERY_PROMPT: &str = "Your last response reached the output token limit before producing an answer. Continue from the previous tool results. Stage a concrete edit or test with the available tools, then submit the staged patch. Keep tool arguments small. If you cannot safely complete the patch within the remaining budget, return {\"insufficient_evidence\":true,\"open_questions\":[\"patch was not complete\"]}. Do not repeat source text or draft a patch in prose.";
 
 fn answer_shape(stage: &str) -> &'static str {
     match stage {
@@ -706,6 +957,8 @@ async fn run_stage<T: DeserializeOwned>(
     prompt: String,
     limits: StageLimits,
     trace: &AgentTrace,
+    snapshot: Option<&RequestSnapshot>,
+    coding_draft: Option<&Arc<Mutex<DraftState>>>,
 ) -> Result<Finish<T>, Failure> {
     let reserve = limits.max_agent_turns > 0;
     let tool_turns = limits.max_agent_turns.saturating_sub(usize::from(reserve));
@@ -716,6 +969,7 @@ async fn run_stage<T: DeserializeOwned>(
                 return decoded;
             }
             let correction = correction_prompt(response.output(), limits.answer_shape);
+            let validation = invalid_answer_category(response.output());
             // The tool-enabled run uses at most max_agent_turns - 1 calls.
             // Reuse its transcript for one corrective call, without tools.
             let Some(history) = response.messages else {
@@ -726,20 +980,26 @@ async fn run_stage<T: DeserializeOwned>(
             }
             trace.event(
                 "final_answer_correction_requested",
-                json!({"cause":"invalid_final_json","tool_choice":"none"}),
+                json!({"cause":"invalid_final_json","validation":validation,"tool_choice":"none","response_format":"json_object"}),
             );
-            let corrected = match agent
+            let (corrected, corrected_validation) = match agent
                 .prompt(correction)
                 .history(history)
                 .tool_choice(ToolChoice::None)
+                .merge_additional_params(json_object_params())
                 .max_turns(1)
                 .await
             {
-                Ok(answer) => decode_answer(answer.output(), limits.max_bytes, false),
-                Err(PromptError::UnknownToolCall { .. } | PromptError::MaxTurnsError { .. }) => {
-                    Err(("final_answer_tool_call", None))
+                Ok(answer) => {
+                    let decoded = decode_answer(answer.output(), limits.max_bytes, false);
+                    let validation = matches!(decoded, Err(("invalid_final_json", _)))
+                        .then(|| invalid_answer_category(answer.output()));
+                    (decoded, validation)
                 }
-                Err(error) => Err(stage_failure(&error, limits, trace)),
+                Err(PromptError::UnknownToolCall { .. } | PromptError::MaxTurnsError { .. }) => {
+                    (Err(("final_answer_tool_call", None)), None)
+                }
+                Err(error) => (Err(stage_failure(&error, limits, trace)), None),
             };
             let outcome = match &corrected {
                 Ok(Finish::Answer(..)) => "answer",
@@ -748,7 +1008,7 @@ async fn run_stage<T: DeserializeOwned>(
             };
             trace.event(
                 "final_answer_correction_finished",
-                json!({"outcome":outcome}),
+                json!({"outcome":outcome,"validation":corrected_validation}),
             );
             corrected
         }
@@ -768,6 +1028,7 @@ async fn run_stage<T: DeserializeOwned>(
                 })
                 .history(chat_history)
                 .tool_choice(ToolChoice::None)
+                .merge_additional_params(json_object_params())
                 .max_turns(1);
             if let Some(max_tokens) = limits.reserved_final_max_tokens {
                 final_run = final_run.max_tokens(max_tokens);
@@ -787,7 +1048,66 @@ async fn run_stage<T: DeserializeOwned>(
             trace.event("final_answer_finished", json!({"outcome":outcome}));
             finished
         }
-        Err(error) => Err(stage_failure(&error, limits, trace)),
+        Err(error) => {
+            let failure = stage_failure(&error, limits, trace);
+            if failure.0 != "output_token_limit" || !limits.recover_output_limit {
+                return Err(failure);
+            }
+            if coding_draft
+                .and_then(|draft| draft.lock().ok())
+                .is_some_and(|draft| draft.submitted)
+            {
+                return Err(failure);
+            }
+            let Some((history, used_turns)) = snapshot.and_then(RequestSnapshot::take) else {
+                return Err(failure);
+            };
+            let remaining = limits.max_agent_turns.saturating_sub(used_turns);
+            if remaining == 0 {
+                return Err(failure);
+            }
+            trace.event(
+                "output_limit_recovery_requested",
+                json!({"cause":"output_token_limit","history_messages":history.len(),"remaining_model_calls":remaining}),
+            );
+            let recovered = match agent
+                .prompt(CODING_LENGTH_RECOVERY_PROMPT)
+                .history(history)
+                .max_turns(remaining.saturating_sub(1))
+                .await
+            {
+                Ok(response) => decode_answer(response.output(), limits.max_bytes, false),
+                Err(PromptError::MaxTurnsError { chat_history, .. }) => {
+                    trace.event(
+                        "final_answer_requested",
+                        json!({"cause":"max_agent_turns","history_messages":chat_history.len(),"tool_choice":"none","after_output_limit_recovery":true}),
+                    );
+                    let final_run = agent
+                        .prompt(CODING_FINAL_ANSWER_PROMPT)
+                        .history(chat_history)
+                        .tool_choice(ToolChoice::None)
+                        .merge_additional_params(json_object_params())
+                        .max_tokens(CODING_FINAL_MAX_TOKENS)
+                        .max_turns(1)
+                        .await;
+                    match final_run {
+                        Ok(response) => decode_answer(response.output(), limits.max_bytes, true),
+                        Err(
+                            PromptError::UnknownToolCall { .. } | PromptError::MaxTurnsError { .. },
+                        ) => Err(("final_answer_tool_call", None)),
+                        Err(error) => Err(stage_failure(&error, limits, trace)),
+                    }
+                }
+                Err(error) => Err(stage_failure(&error, limits, trace)),
+            };
+            let outcome = match &recovered {
+                Ok(Finish::Answer(..)) => "answer",
+                Ok(Finish::Insufficient(_)) => "insufficient_evidence",
+                Err((cause, _)) => cause,
+            };
+            trace.event("output_limit_recovery_finished", json!({"outcome":outcome}));
+            recovered
+        }
     }
 }
 
@@ -866,6 +1186,14 @@ fn decode_answer<T: DeserializeOwned>(
         .map_err(|_| ("invalid_final_json", None))
 }
 
+fn invalid_answer_category(output: &str) -> &'static str {
+    if serde_json::from_str::<Value>(output).is_ok() {
+        "answer_shape"
+    } else {
+        "json_syntax"
+    }
+}
+
 fn correction_prompt(output: &str, shape: &str) -> String {
     let feedback = match serde_json::from_str::<Value>(output) {
         Ok(_) => "The JSON object did not match the required fields or field types.".to_owned(),
@@ -911,7 +1239,10 @@ fn allowed(path: &Path, present: bool) -> bool {
     }
     let text = path.to_string_lossy();
     text.starts_with("crates/baho-core/src/")
-        || (!present && text.starts_with("crates/baho-core/tests/") && text.ends_with(".rs"))
+        || (!present
+            && text.starts_with("crates/baho-core/tests/")
+            && text.ends_with(".rs")
+            && text != "crates/baho-core/tests/repair_regression.rs")
 }
 
 fn verified_patch_hash(patch_sha256: &str, patch: &[PatchFile]) -> Result<(), Outcome> {
@@ -971,7 +1302,7 @@ impl Agents for RigRepairAgents {
         }
         let handoff = self.hypothesis.as_ref().ok_or(Outcome::NeedsDesign)?;
         let prompt = format!(
-            "Fix the frozen Role text-equality regression by anchored line-range edits; you never receive or return whole files. Read the lines you edit with read_lines first. Call stage_edit with {{\"path\":\"crates/baho-core/src/...\",\"baseline_sha256\":\"file_sha256 from read_lines\",\"start_line\":N,\"end_line\":M,\"old\":\"exact current text of lines N..M without the final line break\",\"new\":\"replacement text\"}} for each edit. Call stage_new_file with {{\"path\":\"crates/baho-core/tests/<name>.rs\",\"content\":\"...\"}} for each new test. Once all edits and files are staged, call submit_staged({{}}), or return only {{\"submit_staged\":true}} as your final answer. Both submit the staged patch for harness validation. Lines are 1-based inclusive; edits in one file must not overlap. At most {MAX_EDITS} edits and {MAX_NEW_FILES} new files of {MAX_NEW_FILE_BYTES} bytes each. The harness rejects the whole patch if any hash, old text, or range differs. One submitted patch ends this stage. Hypothesis: {}. Mechanism: {}. Compatibility: {:?}. Allowed files: {:?}. Reduced CSV: {:?}. Prompt: {:?}. SQL: {:?}. {}",
+            "Fix the frozen Role text-equality regression by anchored line-range edits; you never receive or return whole files. Read the lines you edit with read_lines first. Call stage_edit with {{\"path\":\"crates/baho-core/src/...\",\"baseline_sha256\":\"file_sha256 from read_lines\",\"start_line\":N,\"end_line\":M,\"old\":\"exact current text of lines N..M without the final line break\",\"new\":\"replacement text\"}} for each edit. Call stage_new_file with {{\"path\":\"crates/baho-core/tests/<name>.rs\",\"content\":\"...\"}} for each new test. You must get a passing check_staged({{\"suite\":\"additive_tests\"}}) for the exact current draft before submission; it checks the staged code in a confined copy and returns a draft hash. Fix compile errors by calling stage_edit again with the same anchor or stage_new_file again with the same path to replace staged content, then recheck the changed draft. Baseline run_checks results do not validate staged code. Once all edits and files are staged, call submit_staged({{}}), or return only {{\"submit_staged\":true}} as your final answer. Both submit the staged patch for harness validation. Lines are 1-based inclusive; edits in one file must not overlap. At most {MAX_EDITS} edits and {MAX_NEW_FILES} new files of {MAX_NEW_FILE_BYTES} bytes each. The harness rejects the whole patch if any hash, old text, or range differs. One submitted patch ends this stage. Hypothesis: {}. Mechanism: {}. Compatibility: {:?}. Allowed files: {:?}. Reduced CSV: {:?}. Prompt: {:?}. SQL: {:?}. {}",
             handoff.causal_hypothesis,
             handoff.mechanism,
             handoff.compatibility_checks,
@@ -981,16 +1312,29 @@ impl Agents for RigRepairAgents {
             self.reduced_sql,
             navigation_note(&self.settings, "coding", CORE_PATHS),
         );
-        let draft = Arc::new(Mutex::new(DraftState::default()));
-        let answer: CodingAnswer = self.ask("coding", "You are the repair coder. Edit only the allowed core source files by anchored line ranges and add tests under crates/baho-core/tests/. Do not alter expectations or protected files. Navigate with outline, read_lines, and search_text; stage edits and submit once complete. Return short JSON only.", prompt, checkout.to_path_buf(), &[CORE_SCOPE, CORE_TESTS_SCOPE], Some(draft.clone()))?;
+        let draft = Arc::new(Mutex::new(DraftState {
+            require_additive_check: self.require_staged_check,
+            ..DraftState::default()
+        }));
+        let answer: CodingAnswer = self.ask("coding", "You are the repair coder. Edit only the allowed core source files by anchored line ranges and add tests under crates/baho-core/tests/. Do not alter expectations or protected files. Navigate with outline, read_lines, and search_text; stage edits, use check_staged to test the current draft, and submit once complete. Return short JSON only.", prompt, checkout.to_path_buf(), &[CORE_SCOPE, CORE_TESTS_SCOPE], Some(draft.clone()))?;
         let answer = {
             let state = draft.lock().map_err(|_| Outcome::EnvironmentFailure)?;
             if state.submitted {
                 state.answer.clone()
             } else {
                 match answer {
-                    CodingAnswer::Inline(answer) => answer,
-                    CodingAnswer::Staged(marker) if marker.submit_staged => state.answer.clone(),
+                    CodingAnswer::Inline(answer) if !self.require_staged_check => answer,
+                    CodingAnswer::Inline(_) => {
+                        self.failure_reason = Some("coding: inline_patch_requires_staging".into());
+                        return Err(Outcome::Rejected);
+                    }
+                    CodingAnswer::Staged(marker) if marker.submit_staged => {
+                        if !state.checked_current_draft() {
+                            self.failure_reason = Some("coding: unchecked_draft".into());
+                            return Err(Outcome::Rejected);
+                        }
+                        state.answer.clone()
+                    }
                     CodingAnswer::Staged(_) => {
                         self.failure_reason = Some("coding: staged_patch_not_submitted".into());
                         return Err(Outcome::Rejected);
@@ -1102,6 +1446,7 @@ mod tests {
         session: SourceSession,
         model: MockCompletionModel,
         agent: Agent,
+        snapshot: RequestSnapshot,
     }
 
     fn harness(turns: impl IntoIterator<Item = MockTurn>) -> Harness {
@@ -1131,8 +1476,10 @@ mod tests {
             },
         );
         let model = MockCompletionModel::from_turns(turns);
+        let snapshot = RequestSnapshot::default();
         let agent = AgentBuilder::new(model.clone())
             .add_hook(trace.clone())
+            .add_hook(snapshot.clone())
             .max_tokens(OTHER_STAGE_MAX_TOKENS)
             .tool(OutlineTool(session.clone()))
             .tool(ReadLinesTool(session.clone()))
@@ -1145,6 +1492,7 @@ mod tests {
             session,
             model,
             agent,
+            snapshot,
         }
     }
 
@@ -1156,9 +1504,17 @@ mod tests {
                 api_request_timeout_seconds: 600,
                 answer_shape: answer_shape("review"),
                 reserved_final_max_tokens: None,
+                recover_output_limit: false,
             };
-            let result =
-                run_stage::<Value>(&self.agent, "private prompt".into(), limits, &self.trace).await;
+            let result = run_stage::<Value>(
+                &self.agent,
+                "private prompt".into(),
+                limits,
+                &self.trace,
+                None,
+                None,
+            )
+            .await;
             let (cause, limit) = finish_cause(&result);
             assert!(
                 self.trace
@@ -1207,8 +1563,17 @@ mod tests {
             api_request_timeout_seconds: 600,
             answer_shape: answer_shape("review"),
             reserved_final_max_tokens: None,
+            recover_output_limit: false,
         };
-        let turns = run_stage::<Value>(&h.agent, "private prompt".into(), limits, &h.trace).await;
+        let turns = run_stage::<Value>(
+            &h.agent,
+            "private prompt".into(),
+            limits,
+            &h.trace,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(turns.err(), Some(("max_agent_turns", Some(0))));
         let h = harness([MockTurn::error("secret provider body")]);
         let provider = h.run(3).await.err().unwrap();
@@ -1241,6 +1606,280 @@ mod tests {
             "output_token_limit"
         );
         assert_eq!(h.model.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn coding_length_recovery_keeps_history_and_remaining_tool_budget() {
+        let h = harness([
+            MockTurn::tool_call(
+                "before",
+                "outline",
+                json!({"path":"crates/baho-core/src/big.rs"}),
+            ),
+            MockTurn::text("").with_finish_reason(rig::completion::FinishReason::Length),
+            MockTurn::tool_call("after", "search_text", json!({"query":"item_3"})),
+            MockTurn::text("{\"submit_staged\":true}"),
+        ]);
+        let limits = StageLimits {
+            max_agent_turns: 4,
+            max_bytes: 4096,
+            api_request_timeout_seconds: 600,
+            answer_shape: answer_shape("coding"),
+            reserved_final_max_tokens: Some(CODING_FINAL_MAX_TOKENS),
+            recover_output_limit: true,
+        };
+        let result = run_stage::<Value>(
+            &h.agent,
+            "private prompt".into(),
+            limits,
+            &h.trace,
+            Some(&h.snapshot),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Finish::Answer(_, true)));
+        let requests = h.model.requests();
+        assert_eq!(requests.len(), 4);
+        let history = serde_json::to_string(&requests[2].chat_history).unwrap();
+        assert!(history.contains("private prompt"));
+        assert!(history.contains("outline_kind"));
+        assert_eq!(h.session.calls_charged(), 2);
+        let events = h.events();
+        assert_eq!(named(&events, "output_limit_recovery_requested").len(), 1);
+        assert_eq!(
+            named(&events, "output_limit_recovery_finished")[0]["detail"]["outcome"],
+            "answer"
+        );
+        assert!(
+            !fs::read_to_string(&h.trace_path)
+                .unwrap()
+                .contains("private prompt")
+        );
+    }
+
+    #[tokio::test]
+    async fn coding_length_recovery_stops_after_second_truncation() {
+        let h = harness([
+            MockTurn::text("").with_finish_reason(rig::completion::FinishReason::Length),
+            MockTurn::text("").with_finish_reason(rig::completion::FinishReason::Length),
+        ]);
+        let limits = StageLimits {
+            max_agent_turns: 4,
+            max_bytes: 4096,
+            api_request_timeout_seconds: 600,
+            answer_shape: answer_shape("coding"),
+            reserved_final_max_tokens: Some(CODING_FINAL_MAX_TOKENS),
+            recover_output_limit: true,
+        };
+        let result = run_stage::<Value>(
+            &h.agent,
+            "private prompt".into(),
+            limits,
+            &h.trace,
+            Some(&h.snapshot),
+            None,
+        )
+        .await;
+        assert_eq!(result.err(), Some(("output_token_limit", None)));
+        assert_eq!(h.model.requests().len(), 2);
+        assert_eq!(
+            named(&h.events(), "output_limit_recovery_requested").len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn coding_length_recovery_submits_the_same_staged_draft() {
+        let h = harness([
+            MockTurn::tool_call(
+                "before",
+                "outline",
+                json!({"path":"crates/baho-core/src/big.rs"}),
+            ),
+            MockTurn::text("").with_finish_reason(rig::completion::FinishReason::Length),
+            MockTurn::tool_call(
+                "stage",
+                "stage_new_file",
+                json!({"path":"crates/baho-core/tests/recovery.rs","content":"#[test]\nfn recovery() {}\n"}),
+            ),
+            MockTurn::tool_call("submit", "submit_staged", json!({})),
+            MockTurn::text("{\"submit_staged\":true}"),
+        ]);
+        let draft = Arc::new(Mutex::new(DraftState::default()));
+        let draft_tools = DraftTools {
+            tools: SourceTools {
+                nav: h.session.clone(),
+            },
+            checkout: h._dir.path().to_path_buf(),
+            draft: draft.clone(),
+            max_bytes: 4096,
+        };
+        let snapshot = RequestSnapshot::default();
+        let agent = AgentBuilder::new(h.model.clone())
+            .add_hook(h.trace.clone())
+            .add_hook(snapshot.clone())
+            .tool(OutlineTool(h.session.clone()))
+            .tool(StageNewFileTool(draft_tools.clone()))
+            .tool(SubmitStagedTool(draft_tools))
+            .build();
+        let limits = StageLimits {
+            max_agent_turns: 5,
+            max_bytes: 4096,
+            api_request_timeout_seconds: 600,
+            answer_shape: answer_shape("coding"),
+            reserved_final_max_tokens: Some(CODING_FINAL_MAX_TOKENS),
+            recover_output_limit: true,
+        };
+        let result = run_stage::<CodingAnswer>(
+            &agent,
+            "private prompt".into(),
+            limits,
+            &h.trace,
+            Some(&snapshot),
+            Some(&draft),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Finish::Answer(CodingAnswer::Staged(_), true)
+        ));
+        let state = draft.lock().unwrap();
+        assert!(state.submitted);
+        assert_eq!(state.answer.new_files.len(), 1);
+        assert_eq!(h.session.calls_charged(), 3);
+        assert_eq!(
+            named(&h.events(), "output_limit_recovery_requested")[0]["detail"]["remaining_model_calls"],
+            3
+        );
+        let requests = h.model.requests();
+        assert_eq!(requests.len(), 5);
+        let final_request = &requests[4];
+        assert_eq!(final_request.tool_choice, Some(ToolChoice::None));
+        let history = serde_json::to_string(&final_request.chat_history).unwrap();
+        assert!(history.contains("stage_new_file"));
+        assert!(history.contains("submit_staged"));
+    }
+
+    #[tokio::test]
+    async fn failed_staged_check_can_be_corrected_before_submission() {
+        let h = harness([]);
+        let draft = Arc::new(Mutex::new(DraftState {
+            require_additive_check: true,
+            ..DraftState::default()
+        }));
+        let tools = DraftTools {
+            tools: SourceTools {
+                nav: h.session.clone(),
+            },
+            checkout: h._dir.path().to_path_buf(),
+            draft: draft.clone(),
+            max_bytes: 4096,
+        };
+        let stage = StageNewFileTool(tools.clone());
+        let submit = SubmitStagedTool(tools);
+        let path = "crates/baho-core/tests/staged.rs";
+        stage
+            .call(NewFile {
+                path: path.into(),
+                content: "use baho_core::missing_import;\n".into(),
+            })
+            .await
+            .unwrap();
+        let failed_sha = digest(serde_json::to_vec(&draft.lock().unwrap().answer).unwrap());
+        assert!(draft.lock().unwrap().record_staged_check(
+            &failed_sha,
+            SuiteId::AdditiveTests,
+            false
+        ));
+        assert_eq!(
+            submit.call(json!({})).await.unwrap_err().to_string(),
+            ToolDenied::UncheckedDraft.to_string()
+        );
+        stage
+            .call(NewFile {
+                path: path.into(),
+                content: "#[test] fn staged() {}\n".into(),
+            })
+            .await
+            .unwrap();
+        let corrected_sha = digest(serde_json::to_vec(&draft.lock().unwrap().answer).unwrap());
+        assert_ne!(failed_sha, corrected_sha);
+        assert!(!draft.lock().unwrap().record_staged_check(
+            &failed_sha,
+            SuiteId::AdditiveTests,
+            true
+        ));
+        assert_eq!(
+            submit.call(json!({})).await.unwrap_err().to_string(),
+            ToolDenied::UncheckedDraft.to_string()
+        );
+        assert!(draft.lock().unwrap().record_staged_check(
+            &corrected_sha,
+            SuiteId::AdditiveTests,
+            true
+        ));
+        assert_eq!(submit.call(json!({})).await.unwrap()["submitted"], true);
+        let state = draft.lock().unwrap();
+        assert_eq!(state.answer.new_files.len(), 1);
+        assert_eq!(
+            state.answer.new_files[0].content,
+            "#[test] fn staged() {}\n"
+        );
+        assert!(state.submitted);
+        assert!(!h._dir.path().join(path).exists());
+    }
+
+    #[tokio::test]
+    async fn staged_edit_replacement_keeps_one_anchor_and_invalidates_check() {
+        let h = harness([]);
+        let path = "crates/baho-core/src/big.rs";
+        h.session
+            .read_lines(path, &[crate::source_tools::LineRange { start: 1, end: 1 }])
+            .unwrap();
+        let baseline_sha256 = digest(fs::read(h._dir.path().join(path)).unwrap());
+        let draft = Arc::new(Mutex::new(DraftState {
+            require_additive_check: true,
+            ..DraftState::default()
+        }));
+        let stage = StageEditTool(DraftTools {
+            tools: SourceTools {
+                nav: h.session.clone(),
+            },
+            checkout: h._dir.path().to_path_buf(),
+            draft: draft.clone(),
+            max_bytes: 4096,
+        });
+        let edit = Edit {
+            path: path.into(),
+            baseline_sha256,
+            start_line: 1,
+            end_line: 1,
+            old: "pub fn item_0(x: u32) -> u32 {".into(),
+            new: "pub fn first(x: u32) -> u32 {".into(),
+        };
+        stage.call(edit.clone()).await.unwrap();
+        let first_sha = digest(serde_json::to_vec(&draft.lock().unwrap().answer).unwrap());
+        assert!(draft.lock().unwrap().record_staged_check(
+            &first_sha,
+            SuiteId::AdditiveTests,
+            true
+        ));
+        let mut replacement = edit;
+        replacement.new = "pub fn corrected(x: u32) -> u32 {".into();
+        stage.call(replacement).await.unwrap();
+        let state = draft.lock().unwrap();
+        assert_eq!(state.answer.edits.len(), 1);
+        assert_eq!(
+            state.answer.edits[0].new,
+            "pub fn corrected(x: u32) -> u32 {"
+        );
+        assert!(!state.checked_current_draft());
+        assert!(!allowed(
+            Path::new("crates/baho-core/tests/repair_regression.rs"),
+            false
+        ));
     }
 
     #[test]
@@ -1295,6 +1934,7 @@ mod tests {
                     api_request_timeout_seconds: 600,
                     answer_shape: answer_shape("review"),
                     reserved_final_max_tokens: None,
+                    recover_output_limit: false,
                 }
             ),
             ("api_request_timeout", Some(600))
@@ -1313,6 +1953,7 @@ mod tests {
                     api_request_timeout_seconds: 600,
                     answer_shape: answer_shape("review"),
                     reserved_final_max_tokens: None,
+                    recover_output_limit: false,
                 }
             ),
             ("http", None)
@@ -1344,6 +1985,7 @@ mod tests {
                 api_request_timeout_seconds: 600,
                 answer_shape: answer_shape("coding"),
                 reserved_final_max_tokens: Some(CODING_FINAL_MAX_TOKENS),
+                recover_output_limit: false,
             },
             &trace,
         );
@@ -1369,6 +2011,10 @@ mod tests {
         assert!(requests[..4].iter().all(|r| r.tool_choice.is_none()));
         let last = &requests[4];
         assert_eq!(last.tool_choice, Some(ToolChoice::None));
+        assert_eq!(
+            last.additional_params.as_ref().unwrap()["response_format"],
+            json!({"type":"json_object"})
+        );
         assert!(!last.tools.is_empty(), "tools stay declared");
         let history = serde_json::to_string(&last.chat_history).unwrap();
         for id in ["c1", "c2", "c3", "c4"] {
@@ -1399,6 +2045,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coding_requests_low_reasoning_effort() {
+        let model = MockCompletionModel::from_turns([MockTurn::text("done")]);
+        let agent = coding_reasoning_effort(AgentBuilder::new(model.clone()), "coding").build();
+        agent.prompt("code").await.unwrap();
+        assert_eq!(
+            model.requests()[0].additional_params,
+            Some(json!({"reasoning_effort":"low"}))
+        );
+
+        let model = MockCompletionModel::from_turns([MockTurn::text("done")]);
+        let agent = coding_reasoning_effort(AgentBuilder::new(model.clone()), "review").build();
+        agent.prompt("review").await.unwrap();
+        assert_eq!(model.requests()[0].additional_params, None);
+    }
+
+    #[tokio::test]
     async fn coding_reserved_answer_uses_larger_cap_without_repeating_tools() {
         let h = harness(turns_then(MockTurn::text(
             "{\"edits\":[],\"new_files\":[]}",
@@ -1409,10 +2071,18 @@ mod tests {
             api_request_timeout_seconds: 600,
             answer_shape: answer_shape("coding"),
             reserved_final_max_tokens: Some(CODING_FINAL_MAX_TOKENS),
+            recover_output_limit: false,
         };
-        let result = run_stage::<Value>(&h.agent, "private prompt".into(), limits, &h.trace)
-            .await
-            .unwrap();
+        let result = run_stage::<Value>(
+            &h.agent,
+            "private prompt".into(),
+            limits,
+            &h.trace,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(matches!(result, Finish::Answer(_, true)));
         let requests = h.model.requests();
         assert_eq!(requests.len(), 5);
@@ -1462,10 +2132,18 @@ mod tests {
             api_request_timeout_seconds: 600,
             answer_shape: answer_shape("review"),
             reserved_final_max_tokens: None,
+            recover_output_limit: false,
         };
-        let result = run_stage::<ReviewAnswer>(&h.agent, "private prompt".into(), limits, &h.trace)
-            .await
-            .unwrap();
+        let result = run_stage::<ReviewAnswer>(
+            &h.agent,
+            "private prompt".into(),
+            limits,
+            &h.trace,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let Finish::Answer(answer, false) = result else {
             panic!("expected corrected review answer");
         };
@@ -1474,10 +2152,18 @@ mod tests {
         let requests = h.model.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].tool_choice, Some(ToolChoice::None));
+        assert_eq!(
+            requests[1].additional_params.as_ref().unwrap()["response_format"],
+            json!({"type":"json_object"})
+        );
         let history = serde_json::to_string(&requests[1].chat_history).unwrap();
         assert!(history.contains("pass"));
         let events = h.events();
         assert_eq!(named(&events, "final_answer_correction_requested").len(), 1);
+        assert_eq!(
+            named(&events, "final_answer_correction_requested")[0]["detail"]["validation"],
+            "json_syntax"
+        );
         assert_eq!(
             named(&events, "final_answer_correction_finished")[0]["detail"]["outcome"],
             "answer"
@@ -1501,9 +2187,17 @@ mod tests {
             api_request_timeout_seconds: 600,
             answer_shape: answer_shape("review"),
             reserved_final_max_tokens: None,
+            recover_output_limit: false,
         };
-        let result =
-            run_stage::<ReviewAnswer>(&h.agent, "private prompt".into(), limits, &h.trace).await;
+        let result = run_stage::<ReviewAnswer>(
+            &h.agent,
+            "private prompt".into(),
+            limits,
+            &h.trace,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(result.err(), Some(("invalid_final_json", None)));
         assert_eq!(h.model.requests().len(), 2);
         let requests = h.model.requests();
@@ -1512,6 +2206,10 @@ mod tests {
         assert_eq!(
             named(&h.events(), "final_answer_correction_finished")[0]["detail"]["outcome"],
             "invalid_final_json"
+        );
+        assert_eq!(
+            named(&h.events(), "final_answer_correction_finished")[0]["detail"]["validation"],
+            "answer_shape"
         );
     }
 
@@ -1698,10 +2396,10 @@ mod tests {
         assert_eq!(settings.max_tool_calls, 40);
         assert_eq!(
             settings.investigator_prompt_version,
-            "repair-investigator-v5"
+            "repair-investigator-v6"
         );
         assert_eq!(settings.reviewer_prompt_version, "repair-reviewer-v2");
-        assert_eq!(settings.coder_prompt_version, "repair-coder-v3");
+        assert_eq!(settings.coder_prompt_version, "repair-coder-v4");
         let note = navigation_note(&settings, "investigation", CORE_PATHS);
         for needle in [
             "11 tool-using",
@@ -1891,6 +2589,9 @@ mod tests {
             Redactor::new(["zebra_literal"]).unwrap(),
             Arc::new(Mutex::new(worker)),
         );
+        // These mock turns exercise staging and final-answer mechanics without
+        // a confined source build; staged-check behavior has separate tests.
+        agents.require_staged_check = false;
         agents.hypothesis = Some(Investigation {
             result_ids: vec!["r".into()],
             causal_hypothesis: "operator mismatch".into(),
@@ -1900,6 +2601,67 @@ mod tests {
             reduction: None,
         });
         Some((dir, agents, model))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submitted_investigation_survives_malformed_final_answer() {
+        let handoff = json!({
+            "result_ids":["result-1"],
+            "causal_hypothesis":"operator recognition missed a phrase",
+            "mechanism":"recognize the phrase before filtering",
+            "allowed_files":["crates/baho-core/src/intent.rs"],
+            "compatibility_checks":["existing equality filters"],
+            "reduction":{"csv":"Role\nZzaa\n","prompt":"Role is Zzaa","sql":"SELECT _row FROM data WHERE lower(\"Role\") = lower('Zzaa') ORDER BY _row"}
+        });
+        let Some((_dir, mut agents, model)) = stage_agents([
+            MockTurn::tool_call("submit", "submit_investigation", handoff),
+            MockTurn::text("malformed final answer"),
+            MockTurn::text("still malformed"),
+        ]) else {
+            return;
+        };
+        let answer: InvestigationAnswer = agents
+            .ask(
+                "investigation",
+                "investigate",
+                "private prompt".into(),
+                agents.checkout.clone(),
+                &[CORE_SCOPE],
+                None,
+            )
+            .unwrap();
+        assert_eq!(answer.result_ids, ["result-1"]);
+        assert_eq!(model.requests().len(), 3);
+        let trace =
+            fs::read_to_string(agents.checkout.parent().unwrap().join("agent-events.jsonl"))
+                .unwrap();
+        assert!(trace.contains("submitted_investigation_used"));
+        assert!(!trace.contains("operator recognition missed a phrase"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submitted_investigation_does_not_hide_provider_failure() {
+        let handoff = json!({"result_ids":["result-1"],"causal_hypothesis":"hypothesis","mechanism":"mechanism","allowed_files":["crates/baho-core/src/intent.rs"],"compatibility_checks":[],"reduction":{"csv":"Role\nZzaa\n","prompt":"Role is Zzaa","sql":"SELECT _row FROM data WHERE lower(\"Role\") = lower('Zzaa') ORDER BY _row"}});
+        let Some((_dir, mut agents, _model)) = stage_agents([
+            MockTurn::tool_call("submit", "submit_investigation", handoff),
+            MockTurn::error("private provider failure"),
+        ]) else {
+            return;
+        };
+        let result: Result<InvestigationAnswer, _> = agents.ask(
+            "investigation",
+            "investigate",
+            "private prompt".into(),
+            agents.checkout.clone(),
+            &[CORE_SCOPE],
+            None,
+        );
+        assert!(result.is_err());
+        let trace =
+            fs::read_to_string(agents.checkout.parent().unwrap().join("agent-events.jsonl"))
+                .unwrap();
+        assert!(!trace.contains("submitted_investigation_used"));
+        assert!(!trace.contains("private provider failure"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2116,7 +2878,7 @@ mod tests {
         let path = "crates/baho-core/src/intent.rs";
         let old = "pub fn before() {}";
         let new = "pub fn after() {}";
-        let test_path = "crates/baho-core/tests/repair_regression.rs";
+        let test_path = "crates/baho-core/tests/repair_extra.rs";
         let Some((_dir, mut agents, model)) = stage_agents([
             MockTurn::tool_call(
                 "read",
@@ -2306,8 +3068,9 @@ mod tests {
             StageEditTool(tools.clone())
                 .call(edit(path, "a"))
                 .await
-                .is_err()
+                .is_ok()
         );
+        assert_eq!(draft.lock().unwrap().answer.edits.len(), 1);
         assert!(
             StageNewFileTool(tools.clone())
                 .call(NewFile {

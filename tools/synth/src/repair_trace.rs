@@ -23,7 +23,7 @@ use std::{
 
 use crate::anchored_edits::{Edit, NewFile};
 use crate::redaction::Redactor;
-use crate::repair_agents::{CheckArgs, ProbeArgs};
+use crate::repair_agents::{CheckArgs, ProbeArgs, StagedCheckArgs};
 use crate::repair_progress::RepairProgress;
 use crate::source_tools::{
     Exposed, OutlineArgs, ReadLinesArgs, SOURCE_TOOL_NAMES, SearchTextArgs, ToolErrorCode,
@@ -31,13 +31,20 @@ use crate::source_tools::{
 
 const MAX_ACTIVITY_EVENTS: u32 = 2000;
 /// V2 added the request and exposure ledger; v3 added normalized finish reasons
-/// and output-token caps; v4 identifies staged coding tools and safe projections.
-pub(crate) const TRACE_SCHEMA_VERSION: u32 = 4;
+/// and output-token caps; v4 identifies staged coding tools and safe projections;
+/// v5 identifies the investigation submission tool without persisting its text;
+/// v6 records the fixed suite and draft identity for staged checks.
+pub(crate) const TRACE_SCHEMA_VERSION: u32 = 6;
 const MAX_VERBATIM_CHARS: usize = 256;
 // A validated contract allows 200 search matches, each with an excerpt and
 // an enclosing item label exposure.
 const MAX_EXPOSED_PER_CALL: usize = 400;
-const CODING_TOOL_NAMES: [&str; 3] = ["stage_edit", "stage_new_file", "submit_staged"];
+const CODING_TOOL_NAMES: [&str; 4] = [
+    "stage_edit",
+    "stage_new_file",
+    "check_staged",
+    "submit_staged",
+];
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -210,8 +217,16 @@ impl State {
 }
 fn tool_name(name: &str) -> &str {
     match name {
-        "outline" | "read_lines" | "search_text" | "probe" | "run_checks" | "stage_edit"
-        | "stage_new_file" | "submit_staged" => name,
+        "outline"
+        | "read_lines"
+        | "search_text"
+        | "probe"
+        | "run_checks"
+        | "stage_edit"
+        | "stage_new_file"
+        | "check_staged"
+        | "submit_staged"
+        | "submit_investigation" => name,
         _ => "unknown",
     }
 }
@@ -320,6 +335,9 @@ fn project_args(tool: &str, args: &str, redactor: Option<&Redactor>) -> Value {
                 p.put("suite", json!(a.suite));
             })
             .is_ok(),
+        "check_staged" => serde_json::from_str::<StagedCheckArgs>(args)
+            .map(|a| p.put("suite", json!(a.suite)))
+            .is_ok(),
         "stage_edit" => serde_json::from_str::<Edit>(args)
             .map(|a| {
                 p.verbatim("path", &a.path);
@@ -337,6 +355,32 @@ fn project_args(tool: &str, args: &str, redactor: Option<&Redactor>) -> Value {
             })
             .is_ok(),
         "submit_staged" => args.trim() == "{}",
+        "submit_investigation" => serde_json::from_str::<Value>(args)
+            .map(|a| {
+                p.put(
+                    "result_ids_count",
+                    json!(a["result_ids"].as_array().map_or(0, Vec::len)),
+                );
+                p.put(
+                    "allowed_files_count",
+                    json!(a["allowed_files"].as_array().map_or(0, Vec::len)),
+                );
+                p.put(
+                    "compatibility_checks_count",
+                    json!(a["compatibility_checks"].as_array().map_or(0, Vec::len)),
+                );
+                for field in ["causal_hypothesis", "mechanism"] {
+                    if let Some(text) = a[field].as_str() {
+                        p.opaque(field, text);
+                    }
+                }
+                for field in ["csv", "prompt", "sql"] {
+                    if let Some(text) = a["reduction"][field].as_str() {
+                        p.opaque(field, text);
+                    }
+                }
+            })
+            .is_ok(),
         _ => false,
     };
     if !ok {
@@ -366,8 +410,27 @@ fn project_outcome(tool: &str, response: &Value) -> (Map<String, Value>, Vec<Exp
         "submitted",
         "edits",
         "new_files",
+        "passed",
+        "timed_out",
+        "draft_current",
     ] {
         copy(key);
+    }
+    if tool == "check_staged" {
+        for key in ["draft_sha256", "tree_sha256"] {
+            if let Some(hash) = response.get(key).and_then(Value::as_str)
+                && hash.len() == 64
+                && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                out.insert(key.into(), json!(hash));
+            }
+        }
+        if let Some(suite) = response.get("suite") {
+            out.insert("suite".into(), suite.clone());
+        }
+        if let Some(exit_code) = response.get("exit_code").filter(|v| v.is_i64()) {
+            out.insert("exit_code".into(), exit_code.clone());
+        }
     }
     if let Some(kind) = response
         .get("outline_kind")
@@ -1095,6 +1158,7 @@ mod tests {
     fn staged_tool_trace_identifies_calls_without_recording_patch_text() {
         assert_eq!(tool_name("stage_edit"), "stage_edit");
         assert_eq!(tool_name("stage_new_file"), "stage_new_file");
+        assert_eq!(tool_name("check_staged"), "check_staged");
         assert_eq!(tool_name("submit_staged"), "submit_staged");
         let args = json!({"path":"crates/baho-core/src/intent.rs","baseline_sha256":"abc","start_line":2,"end_line":3,"old":"private old text","new":"private new text"}).to_string();
         let projected = project_args("stage_edit", &args, Some(&Redactor::new(["zzz"]).unwrap()));
@@ -1106,6 +1170,29 @@ mod tests {
         assert!(!text.contains("private new text"));
         let submitted = project_args("submit_staged", "{}", None);
         assert_eq!(submitted, json!({}));
+        let check = project_args("check_staged", r#"{"suite":"additive_tests"}"#, None);
+        assert_eq!(check, json!({"suite":"additive_tests"}));
+        let hash = "a".repeat(64);
+        let (result, _) = project_outcome(
+            "check_staged",
+            &json!({"draft_sha256":hash,"tree_sha256":hash,"suite":"additive_tests","exit_code":101,"timed_out":false,"passed":false,"output_excerpt":"private compiler output"}),
+        );
+        assert_eq!(result["passed"], false);
+        assert_eq!(result["exit_code"], 101);
+        assert_eq!(result["draft_sha256"], hash);
+        assert!(!Value::Object(result).to_string().contains("private"));
+    }
+
+    #[test]
+    fn investigation_submission_trace_keeps_only_counts_and_hashes() {
+        assert_eq!(tool_name("submit_investigation"), "submit_investigation");
+        let args = json!({"result_ids":["result-1"],"causal_hypothesis":"private hypothesis","mechanism":"private mechanism","allowed_files":["crates/baho-core/src/intent.rs"],"compatibility_checks":["private check"],"reduction":{"csv":"Role\nprivate value\n","prompt":"private prompt","sql":"private sql"}}).to_string();
+        let projected = project_args("submit_investigation", &args, None);
+        assert_eq!(projected["result_ids_count"], 1);
+        assert_eq!(projected["allowed_files_count"], 1);
+        assert_eq!(projected["compatibility_checks_count"], 1);
+        assert_eq!(projected["csv"]["sha256"].as_str().unwrap().len(), 64);
+        assert!(!projected.to_string().contains("private"));
     }
 
     #[test]
@@ -1123,25 +1210,39 @@ mod tests {
         assert_eq!(
             read_event(&line, 1),
             Err(TraceReadError::UnsupportedSchema {
-                found: 4,
+                found: TRACE_SCHEMA_VERSION as u64,
                 supported: 1
             })
         );
         assert_eq!(
             read_event(&line, 2),
             Err(TraceReadError::UnsupportedSchema {
-                found: 4,
+                found: TRACE_SCHEMA_VERSION as u64,
                 supported: 2
             })
         );
         assert_eq!(
             read_event(&line, 3),
             Err(TraceReadError::UnsupportedSchema {
-                found: 4,
+                found: TRACE_SCHEMA_VERSION as u64,
                 supported: 3
             })
         );
-        assert!(read_event(&line, 4).is_ok());
+        assert_eq!(
+            read_event(&line, 4),
+            Err(TraceReadError::UnsupportedSchema {
+                found: TRACE_SCHEMA_VERSION as u64,
+                supported: 4
+            })
+        );
+        assert_eq!(
+            read_event(&line, 5),
+            Err(TraceReadError::UnsupportedSchema {
+                found: TRACE_SCHEMA_VERSION as u64,
+                supported: 5
+            })
+        );
+        assert!(read_event(&line, TRACE_SCHEMA_VERSION).is_ok());
         assert!(read_event(r#"{"schema_version":2,"name":"agent_finished"}"#, 2).is_ok());
         assert_eq!(read_event("not json", 3), Err(TraceReadError::Malformed));
     }

@@ -761,6 +761,7 @@ pub fn run_attempt(
     agents: &mut impl Agents,
 ) -> Result<Outcome, RepairError> {
     let mut frozen = contract.clone();
+    let mut check_failure_reason = None;
     let mut run = || -> Result<Outcome, RepairError> {
         record.advance(Stage::Baseline, "baseline_started")?;
         let baseline = match worker.baseline(&contract.baseline_revision) {
@@ -942,6 +943,9 @@ pub fn run_attempt(
                 serde_json::to_vec_pretty(&result)?,
             )?;
             if !result.passed(suite) {
+                check_failure_reason = Some(format!(
+                    "Check: {suite:?} failed (see protected/check-{suite:?}.json)"
+                ));
                 return Ok(Outcome::CheckFailure);
             }
         }
@@ -956,6 +960,7 @@ pub fn run_attempt(
     let reason = agents
         .failure_reason()
         .map(str::to_owned)
+        .or(check_failure_reason)
         .unwrap_or_else(|| format!("{:?}: {outcome:?}", record.manifest.stage));
     let reason = if agents.completed_after_budget_stages().is_empty() {
         reason
@@ -1305,6 +1310,18 @@ mod tests {
             assert_eq!(outcome, expected, "{worker_mode}/{agent_mode}");
             assert_eq!(record.manifest.stage, Stage::Terminal);
         }
+    }
+
+    #[test]
+    fn failing_suite_is_named_in_terminal_reason() {
+        let (outcome, record, _, _, _root) = attempt("check_fail", "ok");
+        assert_eq!(outcome, Outcome::CheckFailure);
+        assert_eq!(
+            record.manifest.reason.as_deref(),
+            Some(
+                "Check: ProtectedCompatibility failed (see protected/check-ProtectedCompatibility.json)"
+            )
+        );
     }
 
     #[test]
