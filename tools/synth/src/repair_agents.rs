@@ -37,10 +37,10 @@ enum ToolDenied {
     ReadBeforeEdit,
     #[error("draft_rejected: {0}")]
     DraftRejected(String),
-    #[error("staged_check_limit: at most four staged checks per coding attempt")]
+    #[error("staged_check_limit: at most six staged checks per coding attempt")]
     StagedCheckLimit,
     #[error(
-        "unchecked_draft: run check_staged(additive_tests) successfully on the current draft before submission"
+        "unchecked_draft: run check_staged(workspace_format) and check_staged(additive_tests) successfully on the current draft before submission"
     )]
     UncheckedDraft,
     #[error(
@@ -82,7 +82,8 @@ struct DraftState {
     answer: CodeAnswer,
     submitted: bool,
     additive_check_sha256: Option<String>,
-    require_additive_check: bool,
+    format_check_sha256: Option<String>,
+    require_staged_checks: bool,
 }
 
 impl DraftState {
@@ -91,16 +92,22 @@ impl DraftState {
             && serde_json::to_vec(&self.answer)
                 .ok()
                 .is_some_and(|bytes| digest(bytes) == sha256);
-        if current && passed && suite == SuiteId::AdditiveTests {
-            self.additive_check_sha256 = Some(sha256.to_owned());
+        if current && passed {
+            match suite {
+                SuiteId::AdditiveTests => self.additive_check_sha256 = Some(sha256.to_owned()),
+                SuiteId::WorkspaceFormat => self.format_check_sha256 = Some(sha256.to_owned()),
+                _ => {}
+            }
         }
         current
     }
 
     fn checked_current_draft(&self) -> bool {
-        !self.require_additive_check
+        !self.require_staged_checks
             || serde_json::to_vec(&self.answer).ok().is_some_and(|bytes| {
-                self.additive_check_sha256.as_deref() == Some(digest(bytes).as_str())
+                let hash = digest(bytes);
+                self.additive_check_sha256.as_deref() == Some(hash.as_str())
+                    && self.format_check_sha256.as_deref() == Some(hash.as_str())
             })
     }
 }
@@ -143,6 +150,7 @@ impl DraftTools {
         let result = json!({"staged_edits":proposed.edits.len(),"staged_new_files":proposed.new_files.len()});
         draft.answer = proposed;
         draft.additive_check_sha256 = None;
+        draft.format_check_sha256 = None;
         Ok(result)
     }
 }
@@ -156,7 +164,7 @@ impl PortableTool for SubmitStagedTool {
     type Output = Value;
     type Error = ToolDenied;
     fn description(&self) -> String {
-        "Submit the complete staged patch after check_staged(additive_tests) passes for this exact draft. The harness validates it before any checkout write. Call this once after all stage calls, or return {\"submit_staged\":true} as the final answer.".into()
+        "Submit the complete staged patch after check_staged(workspace_format) and check_staged(additive_tests) pass for this exact draft. The harness validates it before any checkout write. Call this once after all stage calls, or return {\"submit_staged\":true} as the final answer.".into()
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{},"additionalProperties":false})
@@ -363,7 +371,7 @@ impl PortableTool for CheckStagedTool {
     type Output = Value;
     type Error = ToolDenied;
     fn description(&self) -> String {
-        "Run one fixed check suite against a private confined copy of the current staged patch and frozen regression. The response identifies the exact draft and tree checked; later stage calls invalidate that result. At most four staged checks are allowed. No authoritative checkout files are changed.".into()
+        "Run one fixed check suite against a private confined copy of the current staged patch and frozen regression. The response identifies the exact draft and tree checked; later stage calls invalidate that result. At most six staged checks are allowed. No authoritative checkout files are changed.".into()
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"suite":{"type":"string","enum":["protected_compatibility","additive_tests","owning_crate","workspace_format","workspace_check","workspace_tests"]}},"required":["suite"],"additionalProperties":false})
@@ -447,6 +455,8 @@ struct SubmitInvestigationTool {
     tools: SourceTools,
     submitted: Arc<Mutex<Option<Value>>>,
     max_bytes: usize,
+    checkout: PathBuf,
+    target_result_id: String,
 }
 
 impl PortableTool for SubmitInvestigationTool {
@@ -474,8 +484,10 @@ impl PortableTool for SubmitInvestigationTool {
                 "handoff exceeds output byte limit".into(),
             ));
         }
-        serde_json::from_value::<InvestigationAnswer>(args.clone())
+        let answer = serde_json::from_value::<InvestigationAnswer>(args.clone())
             .map_err(|_| ToolDenied::DraftRejected("handoff fields are invalid".into()))?;
+        validate_investigation_handoff(&answer, &self.target_result_id, &self.checkout)
+            .map_err(|reason| ToolDenied::DraftRejected(reason.into()))?;
         let mut submitted = self.submitted.lock().map_err(|_| ToolDenied::Denied)?;
         if submitted.is_some() {
             return Err(ToolDenied::Denied);
@@ -518,6 +530,7 @@ pub struct RigRepairAgents {
     reduced_sql: String,
     hypothesis: Option<Investigation>,
     failure_reason: Option<String>,
+    investigation_target_result_id: Option<String>,
     completed_after_budget_stages: Vec<&'static str>,
     open_questions: Vec<String>,
     /// The verified edit plan applied by `code`, kept so review can show a diff.
@@ -548,6 +561,7 @@ impl RigRepairAgents {
             reduced_sql: String::new(),
             hypothesis: None,
             failure_reason: None,
+            investigation_target_result_id: None,
             completed_after_budget_stages: Vec::new(),
             open_questions: Vec::new(),
             applied: None,
@@ -643,6 +657,7 @@ impl RigRepairAgents {
         let recovery_draft = coding_draft.clone();
         let staged_worker = self.worker.clone();
         let investigation_handoff = submitted_investigation.clone();
+        let investigation_target_result_id = self.investigation_target_result_id.clone();
         let mut result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let snapshot = RequestSnapshot::default();
@@ -675,6 +690,8 @@ impl RigRepairAgents {
                         tools: tools.clone(),
                         submitted,
                         max_bytes: limits.max_bytes,
+                        checkout: root.clone(),
+                        target_result_id: investigation_target_result_id.unwrap_or_default(),
                     });
                 }
                 let agent = builder.build();
@@ -840,7 +857,7 @@ fn navigation_note(s: &AttemptSettings, stage: &str, paths: &str) -> String {
 /// Instruction for the reserved call made after the tool-enabled run ends at
 /// its turn limit. It grants no authority beyond the stage's normal answer.
 const FINAL_ANSWER_PROMPT: &str = "The turn budget is exhausted and tools are no longer available. Return the final JSON answer now, using only what you have already seen. If the evidence is insufficient, return {\"insufficient_evidence\":true,\"open_questions\":[up to 5 short strings without data values]} instead. Do not call tools.";
-const CODING_FINAL_ANSWER_PROMPT: &str = "The turn budget is exhausted. If the current staged patch is complete and check_staged(additive_tests) passed for this exact draft, return only {\"submit_staged\":true} to submit it. Otherwise return {\"insufficient_evidence\":true,\"open_questions\":[\"patch was not checked or complete\"]}. Do not call tools or repeat staged content.";
+const CODING_FINAL_ANSWER_PROMPT: &str = "The turn budget is exhausted. If the current staged patch is complete and check_staged(workspace_format) and check_staged(additive_tests) both passed for this exact draft, return only {\"submit_staged\":true} to submit it. Otherwise return {\"insufficient_evidence\":true,\"open_questions\":[\"patch was not checked or complete\"]}. Do not call tools or repeat staged content.";
 const MAX_OPEN_QUESTIONS: usize = 5;
 const MAX_QUESTION_CHARS: usize = 200;
 /// Reasoning models spend many output tokens before answering, so the
@@ -1245,6 +1262,45 @@ fn allowed(path: &Path, present: bool) -> bool {
             && text != "crates/baho-core/tests/repair_regression.rs")
 }
 
+fn validate_investigation_handoff(
+    answer: &InvestigationAnswer,
+    target_result_id: &str,
+    checkout: &Path,
+) -> Result<(), &'static str> {
+    if !answer.result_ids.iter().any(|id| id == target_result_id) {
+        return Err("handoff is missing the target result ID");
+    }
+    for name in &answer.allowed_files {
+        let path = Path::new(name);
+        if !investigation_path_allowed(path, checkout) {
+            return Err("handoff includes a path outside the repair scope or a protected file");
+        }
+    }
+    Ok(())
+}
+
+fn investigation_path_allowed(path: &Path, checkout: &Path) -> bool {
+    if !allowed(path, false) {
+        return false;
+    }
+    let mut current = checkout.to_path_buf();
+    let parts: Vec<_> = path.components().collect();
+    for (index, part) in parts.iter().enumerate() {
+        current.push(part.as_os_str());
+        let final_part = index + 1 == parts.len();
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if final_part => return meta.file_type().is_file() && allowed(path, true),
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Err(error) if final_part && error.kind() == std::io::ErrorKind::NotFound => {
+                // Existing tests are protected, including the emitted regression.
+                return path.to_string_lossy().starts_with(CORE_TESTS_SCOPE);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn verified_patch_hash(patch_sha256: &str, patch: &[PatchFile]) -> Result<(), Outcome> {
     let bytes = serde_json::to_vec(patch).map_err(|_| Outcome::ReviewIncomplete)?;
     (digest(&bytes) == patch_sha256)
@@ -1263,9 +1319,25 @@ impl Agents for RigRepairAgents {
         &self.open_questions
     }
     fn investigate(&mut self, target: &Observation) -> Result<Investigation, Outcome> {
+        self.investigation_target_result_id = Some(target.result_id.clone());
         let prompt = investigation_prompt(target, &self.target_prompt, &self.settings);
         let root = self.checkout.clone();
         let answer: InvestigationAnswer = self.ask("investigation", "You are the independent repair investigator. State one testable mechanism. Do not request scope expansion. Navigate source with outline, read_lines, and search_text; never request whole files. Return JSON only.", prompt, root, &[CORE_SCOPE], None)?;
+        let combined = format!(
+            "{}\n{}\n{}",
+            answer.reduction.csv, answer.reduction.prompt, answer.reduction.sql
+        );
+        if !self.redactor.scan(&combined).is_empty() {
+            self.failure_reason =
+                Some("investigation: reduction contains protected content".into());
+            return Err(Outcome::NeedsDesign);
+        }
+        if let Err(reason) =
+            validate_investigation_handoff(&answer, &target.result_id, &self.checkout)
+        {
+            self.failure_reason = Some(format!("investigation: {reason}"));
+            return Err(Outcome::NeedsDesign);
+        }
         let handoff = Investigation {
             result_ids: answer.result_ids,
             causal_hypothesis: answer.causal_hypothesis,
@@ -1274,21 +1346,6 @@ impl Agents for RigRepairAgents {
             compatibility_checks: answer.compatibility_checks,
             reduction: Some(answer.reduction.clone()),
         };
-        let combined = format!(
-            "{}\n{}\n{}",
-            answer.reduction.csv, answer.reduction.prompt, answer.reduction.sql
-        );
-        if !self.redactor.scan(&combined).is_empty() {
-            return Err(Outcome::NeedsDesign);
-        }
-        if !handoff.result_ids.contains(&target.result_id)
-            || handoff
-                .allowed_files
-                .iter()
-                .any(|p| !allowed(Path::new(p), true))
-        {
-            return Err(Outcome::NeedsDesign);
-        }
         self.reduced_csv = answer.reduction.csv;
         self.reduced_prompt = answer.reduction.prompt;
         self.reduced_sql = answer.reduction.sql;
@@ -1302,7 +1359,7 @@ impl Agents for RigRepairAgents {
         }
         let handoff = self.hypothesis.as_ref().ok_or(Outcome::NeedsDesign)?;
         let prompt = format!(
-            "Fix the frozen Role text-equality regression by anchored line-range edits; you never receive or return whole files. Read the lines you edit with read_lines first. Call stage_edit with {{\"path\":\"crates/baho-core/src/...\",\"baseline_sha256\":\"file_sha256 from read_lines\",\"start_line\":N,\"end_line\":M,\"old\":\"exact current text of lines N..M without the final line break\",\"new\":\"replacement text\"}} for each edit. Call stage_new_file with {{\"path\":\"crates/baho-core/tests/<name>.rs\",\"content\":\"...\"}} for each new test. You must get a passing check_staged({{\"suite\":\"additive_tests\"}}) for the exact current draft before submission; it checks the staged code in a confined copy and returns a draft hash. Fix compile errors by calling stage_edit again with the same anchor or stage_new_file again with the same path to replace staged content, then recheck the changed draft. Baseline run_checks results do not validate staged code. Once all edits and files are staged, call submit_staged({{}}), or return only {{\"submit_staged\":true}} as your final answer. Both submit the staged patch for harness validation. Lines are 1-based inclusive; edits in one file must not overlap. At most {MAX_EDITS} edits and {MAX_NEW_FILES} new files of {MAX_NEW_FILE_BYTES} bytes each. The harness rejects the whole patch if any hash, old text, or range differs. One submitted patch ends this stage. Hypothesis: {}. Mechanism: {}. Compatibility: {:?}. Allowed files: {:?}. Reduced CSV: {:?}. Prompt: {:?}. SQL: {:?}. {}",
+            "Fix the frozen Role text-equality regression by anchored line-range edits; you never receive or return whole files. Read the lines you edit with read_lines first. Call stage_edit with {{\"path\":\"crates/baho-core/src/...\",\"baseline_sha256\":\"file_sha256 from read_lines\",\"start_line\":N,\"end_line\":M,\"old\":\"exact current text of lines N..M without the final line break\",\"new\":\"replacement text\"}} for each edit. Call stage_new_file with {{\"path\":\"crates/baho-core/tests/<name>.rs\",\"content\":\"...\"}} for each new test. You must get passing check_staged({{\"suite\":\"workspace_format\"}}) and check_staged({{\"suite\":\"additive_tests\"}}) results for the exact current draft before submission; run the format check first, correct formatting with stage_edit or stage_new_file, and recheck after every change. The checks run staged code in a confined copy and return a draft hash. Fix compile errors by calling stage_edit again with the same anchor or stage_new_file again with the same path to replace staged content, then recheck the changed draft. Baseline run_checks results do not validate staged code. Once all edits and files are staged, call submit_staged({{}}), or return only {{\"submit_staged\":true}} as your final answer. Both submit the staged patch for harness validation. Lines are 1-based inclusive; edits in one file must not overlap. At most {MAX_EDITS} edits and {MAX_NEW_FILES} new files of {MAX_NEW_FILE_BYTES} bytes each. The harness rejects the whole patch if any hash, old text, or range differs. One submitted patch ends this stage. Hypothesis: {}. Mechanism: {}. Compatibility: {:?}. Allowed files: {:?}. Reduced CSV: {:?}. Prompt: {:?}. SQL: {:?}. {}",
             handoff.causal_hypothesis,
             handoff.mechanism,
             handoff.compatibility_checks,
@@ -1313,7 +1370,7 @@ impl Agents for RigRepairAgents {
             navigation_note(&self.settings, "coding", CORE_PATHS),
         );
         let draft = Arc::new(Mutex::new(DraftState {
-            require_additive_check: self.require_staged_check,
+            require_staged_checks: self.require_staged_check,
             ..DraftState::default()
         }));
         let answer: CodingAnswer = self.ask("coding", "You are the repair coder. Edit only the allowed core source files by anchored line ranges and add tests under crates/baho-core/tests/. Do not alter expectations or protected files. Navigate with outline, read_lines, and search_text; stage edits, use check_staged to test the current draft, and submit once complete. Return short JSON only.", prompt, checkout.to_path_buf(), &[CORE_SCOPE, CORE_TESTS_SCOPE], Some(draft.clone()))?;
@@ -1766,7 +1823,7 @@ mod tests {
     async fn failed_staged_check_can_be_corrected_before_submission() {
         let h = harness([]);
         let draft = Arc::new(Mutex::new(DraftState {
-            require_additive_check: true,
+            require_staged_checks: true,
             ..DraftState::default()
         }));
         let tools = DraftTools {
@@ -1820,6 +1877,25 @@ mod tests {
             SuiteId::AdditiveTests,
             true
         ));
+        // Compilation alone did not catch the unformatted test in the live attempt.
+        assert_eq!(
+            submit.call(json!({})).await.unwrap_err().to_string(),
+            ToolDenied::UncheckedDraft.to_string()
+        );
+        assert!(draft.lock().unwrap().record_staged_check(
+            &corrected_sha,
+            SuiteId::WorkspaceFormat,
+            false
+        ));
+        assert_eq!(
+            submit.call(json!({})).await.unwrap_err().to_string(),
+            ToolDenied::UncheckedDraft.to_string()
+        );
+        assert!(draft.lock().unwrap().record_staged_check(
+            &corrected_sha,
+            SuiteId::WorkspaceFormat,
+            true
+        ));
         assert_eq!(submit.call(json!({})).await.unwrap()["submitted"], true);
         let state = draft.lock().unwrap();
         assert_eq!(state.answer.new_files.len(), 1);
@@ -1840,7 +1916,7 @@ mod tests {
             .unwrap();
         let baseline_sha256 = digest(fs::read(h._dir.path().join(path)).unwrap());
         let draft = Arc::new(Mutex::new(DraftState {
-            require_additive_check: true,
+            require_staged_checks: true,
             ..DraftState::default()
         }));
         let stage = StageEditTool(DraftTools {
@@ -2592,6 +2668,7 @@ mod tests {
         // These mock turns exercise staging and final-answer mechanics without
         // a confined source build; staged-check behavior has separate tests.
         agents.require_staged_check = false;
+        agents.investigation_target_result_id = Some("result-1".into());
         agents.hypothesis = Some(Investigation {
             result_ids: vec!["r".into()],
             causal_hypothesis: "operator mismatch".into(),
@@ -2637,6 +2714,116 @@ mod tests {
                 .unwrap();
         assert!(trace.contains("submitted_investigation_used"));
         assert!(!trace.contains("operator recognition missed a phrase"));
+    }
+
+    #[test]
+    fn investigation_handoff_allows_only_additive_core_tests() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("crates/baho-core/src/intent.rs");
+        let tests = dir.path().join("crates/baho-core/tests");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(&tests).unwrap();
+        fs::write(&source, "existing source").unwrap();
+        fs::write(tests.join("existing.rs"), "protected test").unwrap();
+        let mut answer = InvestigationAnswer {
+            result_ids: vec!["target".into()],
+            causal_hypothesis: String::new(),
+            mechanism: String::new(),
+            allowed_files: vec![
+                "crates/baho-core/src/intent.rs".into(),
+                "crates/baho-core/tests/new_regression.rs".into(),
+            ],
+            compatibility_checks: vec![],
+            reduction: SyntheticReduction {
+                csv: String::new(),
+                prompt: String::new(),
+                sql: String::new(),
+            },
+        };
+        assert!(validate_investigation_handoff(&answer, "target", dir.path()).is_ok());
+        assert_eq!(
+            validate_investigation_handoff(&answer, "other", dir.path()),
+            Err("handoff is missing the target result ID")
+        );
+        for denied in [
+            "crates/baho-core/tests/existing.rs",
+            "crates/baho-core/tests/repair_regression.rs",
+            "crates/baho-core/tests/../src/intent.rs",
+            "crates/baho-core/src/missing.rs",
+            "tools/synth/src/repair.rs",
+        ] {
+            answer.allowed_files = vec![denied.into()];
+            assert_eq!(
+                validate_investigation_handoff(&answer, "target", dir.path()),
+                Err("handoff includes a path outside the repair scope or a protected file")
+            );
+        }
+        #[cfg(unix)]
+        {
+            let linked = dir.path().join("crates/baho-core/tests/linked");
+            std::os::unix::fs::symlink(&tests, &linked).unwrap();
+            answer.allowed_files = vec!["crates/baho-core/tests/linked/new.rs".into()];
+            assert!(validate_investigation_handoff(&answer, "target", dir.path()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_investigation_submission_can_be_corrected() {
+        let dir = tempfile::tempdir().unwrap();
+        let test_path = "crates/baho-core/tests/new_regression.rs";
+        fs::create_dir_all(dir.path().join(CORE_TESTS_SCOPE)).unwrap();
+        fs::write(
+            dir.path().join("crates/baho-core/tests/existing.rs"),
+            "protected",
+        )
+        .unwrap();
+        let tool = SubmitInvestigationTool {
+            tools: SourceTools {
+                nav: SourceSession::new(
+                    dir.path().to_path_buf(),
+                    &[CORE_SCOPE],
+                    SourceLimits::from_settings(
+                        &crate::repair_entry::RepairOptions::default_settings(),
+                    ),
+                ),
+            },
+            submitted: Arc::new(Mutex::new(None)),
+            max_bytes: 4096,
+            checkout: dir.path().to_path_buf(),
+            target_result_id: "target".into(),
+        };
+        let mut handoff = json!({
+            "result_ids":["other"],
+            "causal_hypothesis":"hypothesis",
+            "mechanism":"mechanism",
+            "allowed_files":[test_path],
+            "compatibility_checks":[],
+            "reduction":{"csv":"Role\nA\n","prompt":"Role is A","sql":"SELECT _row FROM data WHERE lower(\"Role\") = lower('A') ORDER BY _row"}
+        });
+        assert!(
+            tool.call(handoff.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("missing the target result ID")
+        );
+        assert!(tool.submitted.lock().unwrap().is_none());
+        handoff["result_ids"] = json!(["target"]);
+        handoff["allowed_files"] = json!(["crates/baho-core/tests/existing.rs"]);
+        assert!(
+            tool.call(handoff.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("protected file")
+        );
+        assert!(tool.submitted.lock().unwrap().is_none());
+        handoff["allowed_files"] = json!([test_path]);
+        assert_eq!(
+            tool.call(handoff.clone()).await.unwrap(),
+            json!({"submitted":true})
+        );
+        assert_eq!(*tool.submitted.lock().unwrap(), Some(handoff));
     }
 
     #[tokio::test(flavor = "multi_thread")]

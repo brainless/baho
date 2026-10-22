@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -305,6 +306,8 @@ pub enum RepairError {
     Io(#[from] std::io::Error),
     #[error("attempt serialization: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("could not format generated repair regression")]
+    RegressionFormat,
 }
 
 pub struct AttemptRecord {
@@ -648,6 +651,13 @@ fn frozen_role_equality_regression() {{
         case.expected_literal
     );
     fs::write(&path, source)?;
+    let status = Command::new("rustfmt")
+        .args(["--edition", "2024"])
+        .arg(&path)
+        .status()?;
+    if !status.success() {
+        return Err(RepairError::RegressionFormat);
+    }
     Ok(path)
 }
 
@@ -1468,6 +1478,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let contract = contract();
         let path = emit_regression(temp.path(), &contract.reduced, &contract.reduction).unwrap();
+        let status = Command::new("rustfmt")
+            .args(["--check", "--edition", "2024"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "generated regression must pass cargo fmt");
         let text = fs::read_to_string(path).unwrap();
         assert!(text.contains("[1]"));
         assert!(text.contains("PlanStep::Filter"));

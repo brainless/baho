@@ -86,7 +86,7 @@ pub struct LiveWorker {
     staged_checks: u32,
 }
 
-const MAX_STAGED_CHECKS: u32 = 4;
+const MAX_STAGED_CHECKS: u32 = 6;
 
 pub struct StagedCheckResult {
     pub tree_sha256: String,
