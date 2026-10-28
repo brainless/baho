@@ -1,7 +1,7 @@
 # Epic 018 implementation note: executable agent repair loop
 
 Date: 2026-10-09
-Status: Implemented in tooling; real-build smoke test and live trial remain blocked by worker confinement.
+Status: Abandoned; the agent tooling was removed. This note records historical implementation evidence.
 Related epic: [018 — Executable Investigation and Agent Repair Loop](../epics/018-executable-agent-repair-loop.md)
 
 ## Implemented workflow

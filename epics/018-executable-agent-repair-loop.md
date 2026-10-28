@@ -1,6 +1,6 @@
 # Epic 018: Executable Investigation and Agent Repair Loop
 
-Status: In progress — confined offline smoke passes; live agent trial pending.
+Status: Abandoned. The agent repair loop was retired and its `tools/synth` implementation removed; this epic remains as a historical record.
 
 Motivating run: `plan-1791532155115582000-44931`, evaluation
 `evaluation-1791470942646632000-53201-0`.

@@ -1,6 +1,6 @@
 # Epic 015: Synthetic Case Validation and Test Emission
 
-Status: Proposed
+Status: Abandoned. The synthetic NL/SQL case pipeline will not be continued.
 
 Motivating run: None. This development-process proposal follows Epic 014's Task 5 preflight and live-trial status note dated 2026-10-07. The completed live review is recorded in Epic 014; local records remain gitignored.
 

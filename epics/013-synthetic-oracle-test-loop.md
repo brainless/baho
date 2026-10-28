@@ -1,6 +1,6 @@
 # Epic 013: Synthetic Oracle Test Loop
 
-Status: In progress. Stage 1 (Epic 014) is complete; Epic 016 added evaluation and epic planning tooling. Stages 2-5 are not started.
+Status: Abandoned. The agent-driven parser expansion experiment was retired in favor of Codex-led, fixture-driven development. The `tools/synth` implementation was removed; this epic remains as a historical record.
 
 Motivating run: None. This is a development-process epic. It follows a design discussion about expanding the natural-language grammar of the deterministic planner in small, test-driven steps.
 

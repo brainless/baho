@@ -1,6 +1,6 @@
 # Epic 014: Synthetic Case Generator Agent (Agent 1)
 
-Status: Completed
+Status: Abandoned. The completed generator experiment was retired and its `tools/synth` implementation removed; this epic remains as a historical record.
 
 Motivating run: None. This is the first stage of Epic 013.
 

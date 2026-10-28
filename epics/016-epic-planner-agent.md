@@ -1,6 +1,6 @@
 # Epic 016: Epic Planner Agent (Agent 2)
 
-Status: Completed
+Status: Abandoned. The completed agent-planning experiment was retired and its `tools/synth` implementation removed; this epic remains as a historical record.
 
 Motivating run: `generation-1791425654630970000-3920`, the latest Agent 1 (Synthetic Case Generator) output, plus a manual probe of `baho-cli` against its five candidates on a small synthetic CSV. No `.baho/runs/` record motivates this epic.
 
@@ -238,7 +238,7 @@ Both chose the same increment (word operators `is`/`equals` plus trailing punctu
 
 ## Approved follow-up: investigate before drafting (2026-10-09)
 
-Status: Implemented; offline verified, manual quality comparison pending.
+Historical follow-up status (before abandonment): Implemented; offline verified, manual quality comparison pending.
 
 The user approved a workflow experiment after reviewing Epic 017. The draft had
 accessible but unexamined compatibility evidence, and the planner requested low

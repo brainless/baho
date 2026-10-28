@@ -1,7 +1,7 @@
 # Epic 016 implementation note: investigator proposal handoff
 
 Date: 2026-10-09
-Status: Implemented; generated Epic quality awaits a manual rerun.
+Status: Abandoned; the agent tooling was removed. This note records historical implementation evidence.
 Related epic: [016 — Epic Planner Agent](../epics/016-epic-planner-agent.md)
 
 ## Motivation

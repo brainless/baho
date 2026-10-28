@@ -1,6 +1,6 @@
 # Epic 019: Structural Source Outline and Bounded Range Reads
 
-Status: Implemented (live rerun diagnosed)
+Status: Abandoned. These repair-agent tools were retired and removed with `tools/synth`; this epic remains as a historical record.
 
 Motivating run: repair attempt `repair-1791610148027574000-14036-0` (Epic 018
 harness), evaluation `evaluation-1791470942646632000-53201-0`, case
